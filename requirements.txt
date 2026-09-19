@@ -1,0 +1,20 @@
+# Optional dependencies for better document parsing and API calls.
+# The core demo can start with Python standard library only.
+requests>=2.32.0
+PySide6>=6.7.0
+pypdf>=5.0.0
+PyMuPDF>=1.24.0
+
+# Optional memory vector database for Stage 2 P1.
+# Install manually if you want MEMORY_VECTOR_PROVIDER=chroma:
+#   python -m pip install "chromadb>=0.5.0"
+# RAG P1 也保留 Chroma provider 扩展位；当前小型个人知识库默认使用精确向量扫描，
+# 以避免额外磁盘占用。FTS5/BM25 使用 Python 自带 SQLite，无需安装依赖。
+
+# Optional browser automation for Stage 3 Playwright Search & Browser Reader.
+# If BROWSER_CHANNEL=chrome, DeskPilot can reuse local Chrome after this package is installed.
+# If BROWSER_CHANNEL=chromium, also run: python -m playwright install chromium
+playwright
+
+# Optional MCP stdio server for the email tools.
+mcp>=1.0.0

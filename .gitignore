@@ -1,0 +1,43 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments and secrets.
+.env
+.env.*
+!.env.example
+.conda/
+.venv/
+venv/
+
+# Runtime indexes, conversations, memories, reports and user artifacts.
+data/
+eval/runs/
+eval/reports/
+sess_*.md
+
+# Root-level design/debug documents are local working material. Keep README only.
+/*.md
+!/README.md
+/*.txt
+!/requirements.txt
+
+# Imported documents, generated attachments and local corpora may contain private data.
+*.docx
+*.pptx
+*.xlsx
+*.pdf
+/多模态/
+/*.png
+/*.jpg
+/*.jpeg
+/*.webp
+
+# Local databases, logs and transient files.
+*.sqlite3
+*.sqlite
+*.log
+*.tmp
+*.bak
