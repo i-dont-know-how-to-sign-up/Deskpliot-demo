@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable
+
+from ..core.json_utils import parse_json_value
 
 
 @dataclass(frozen=True)
@@ -73,12 +74,8 @@ class QueryAnalyzer:
             f"最近必要上下文：{recent_context[-1200:]}\n当前问题：{question}"
         )
         response = self.llm_call(prompt)
-        match = re.search(r"\{.*\}", response or "", flags=re.DOTALL)
-        if not match:
-            return None
-        try:
-            data = json.loads(match.group(0))
-        except (TypeError, ValueError, json.JSONDecodeError):
+        data = parse_json_value(response or "", dict)
+        if not isinstance(data, dict):
             return None
         standalone = str(data.get("standalone_question") or question).strip()[:500]
         sub_questions = tuple(

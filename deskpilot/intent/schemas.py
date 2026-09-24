@@ -20,6 +20,8 @@ class IntentDecision:
     explicit_local_retrieval: bool = False
     explicit_web_retrieval: bool = False
     requires_fresh_information: bool = False
+    # 用户要求答案依据哪类资料；用于阻止“根据知识库”被降级为无证据直接回答。
+    knowledge_scope: str = "general"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

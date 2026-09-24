@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 from concurrent.futures import ThreadPoolExecutor
+import time
 
 from .schemas import AgentResult, TaskPlan
 
@@ -19,6 +20,7 @@ class SupervisorAgent:
     """P0 顺序 DAG Supervisor，负责依赖、预算和人工确认状态。"""
 
     def execute(self, plan: TaskPlan, initial_values: dict[str, Any] | None = None, *, parallel: bool = True) -> SupervisorResult:
+        started = time.monotonic()
         values = dict(initial_values or {})
         results: list[AgentResult] = []
         completed: set[str] = set()
@@ -32,7 +34,7 @@ class SupervisorAgent:
             batch = ready if parallel and len(ready) > 1 else [ready[0]]
             def run_step(step: Any) -> tuple[Any, AgentResult]:
                 if step.handler is None:
-                    return step, AgentResult(step.agent, "pending", {"step_id": step.step_id, "requires_human": step.requires_human})
+                    return step, AgentResult(step.agent, "pending", {"requires_human": step.requires_human}, step_id=step.step_id)
                 last_error = ""
                 # 子 Agent 只接收初始任务状态和直接依赖节点的结构化输出，避免共享完整全局窗口。
                 step_values = dict(initial_values or {})
@@ -40,13 +42,19 @@ class SupervisorAgent:
                     step_values.update(outputs_by_step.get(dependency, {}))
                 for attempt in range(step.max_retries + 1):
                     try:
-                        output = step.handler(dict(step_values))
-                        return step, AgentResult(step.agent, "success", dict(output or {}))
+                        output = dict(step.handler(dict(step_values)) or {})
+                        status = "pending" if output.pop("_waiting_human", False) else "success"
+                        tool_calls = int(output.pop("_tool_calls", 0) or 0)
+                        tokens = int(output.pop("_tokens", 0) or 0)
+                        return step, AgentResult(
+                            step.agent, status, output, tool_calls=tool_calls,
+                            tokens=tokens, step_id=step.step_id,
+                        )
                     except Exception as exc:
                         last_error = str(exc)
                         if attempt < step.max_retries:
                             continue
-                return step, AgentResult(step.agent, "failed", error=last_error)
+                return step, AgentResult(step.agent, "failed", error=last_error, step_id=step.step_id)
 
             if len(batch) > 1:
                 with ThreadPoolExecutor(max_workers=len(batch)) as pool:
@@ -62,6 +70,8 @@ class SupervisorAgent:
             total_tokens += sum(item.tokens for _, item in batch_results)
             if total_tools > plan.max_tool_calls or total_tokens > plan.max_total_tokens:
                 return SupervisorResult("failed", values, results, "任务超过预算")
+            if time.monotonic() - started > plan.max_duration_seconds:
+                return SupervisorResult("failed", values, results, "任务超过最大执行时间")
             if any(item.status == "failed" for _, item in batch_results):
                 failure = next(item.error for _, item in batch_results if item.status == "failed")
                 return SupervisorResult("failed", values, results, failure)

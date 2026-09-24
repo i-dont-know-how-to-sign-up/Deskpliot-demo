@@ -12,6 +12,7 @@ from typing import Iterator
 
 from .memory_models import MemoryItem
 from .memory_vector_store import MemoryVectorStore, create_memory_vector_store
+from .policy import MemoryPolicy
 from ..core.api_clients import OpenAICompatibleClient, cosine_similarity
 from ..core.config import MEMORY_INDEX_DIR, MEMORY_VECTOR_DIR, MEMORY_WORKSPACE_DIR, ensure_dirs, load_config
 from ..core.encoding_utils import fix_mojibake
@@ -36,6 +37,7 @@ class MemoryStore:
         self.client = OpenAICompatibleClient(load_config())
         vector_base_dir = MEMORY_VECTOR_DIR if db_file == CATALOG_FILE else db_file.parent.parent / "vectors"
         self.vector_store = vector_store or create_memory_vector_store(vector_provider, vector_base_dir)
+        self.policy = MemoryPolicy()
         self._init_db()
         self.ensure_workspace_files()
 
@@ -82,7 +84,6 @@ class MemoryStore:
         if duplicate:
             return duplicate
         status = self._normalize_status(status, memory_type, confidence)
-        self._supersede_conflicts(memory_type, content, source_session_id)
         now = utc_now()
         item = MemoryItem(
             memory_id=f"mem_{uuid.uuid4().hex}",
@@ -96,9 +97,10 @@ class MemoryStore:
             tags=tags or [],
             created_at=now,
             updated_at=now,
-            expires_at=expires_at,
+            expires_at=expires_at or self.policy.default_expires_at(scope, memory_type, tags),
         )
         item.embedding = self._embed_text(content)
+        self._supersede_conflicts(item)
         with self._connect() as conn:
             conn.execute(
                 """
@@ -403,11 +405,8 @@ class MemoryStore:
             return "pending"
         return "active"
 
-    def _supersede_conflicts(self, memory_type: str, content: str, source_session_id: str | None) -> None:
-        if memory_type not in {"decision", "preference"}:
-            return
-        topic = self._conflict_topic(content)
-        if not topic:
+    def _supersede_conflicts(self, incoming: MemoryItem) -> None:
+        if incoming.memory_type not in {"decision", "preference"}:
             return
         with self._connect() as conn:
             rows = conn.execute(
@@ -415,25 +414,34 @@ class MemoryStore:
                 select * from memories
                 where memory_type = ? and status = 'active'
                 """,
-                (memory_type,),
+                (incoming.memory_type,),
             ).fetchall()
             for row in rows:
                 item = self._from_row(row)
-                if topic == self._conflict_topic(item.content):
+                if self._same_memory_topic(incoming, item):
                     conn.execute(
                         "update memories set status = 'superseded', updated_at = ? where memory_id = ?",
                         (utc_now(), item.memory_id),
                     )
                     self.vector_store.delete(item.memory_id)
 
-    def _conflict_topic(self, content: str) -> str:
-        lowered = content.lower()
-        if "第二阶段" in content:
-            return "stage_2"
-        if "下一阶段" in content:
-            return "next_stage"
-        if "回答风格" in content or "回答" in content and "风格" in content:
-            return "answer_style"
-        if "python" in lowered and "版本" in content:
-            return "python_version"
-        return ""
+    def _same_memory_topic(self, incoming: MemoryItem, existing: MemoryItem) -> bool:
+        incoming_topics = {str(tag) for tag in incoming.tags if str(tag).startswith("topic:")}
+        existing_topics = {str(tag) for tag in existing.tags if str(tag).startswith("topic:")}
+        if incoming_topics and existing_topics:
+            return bool(incoming_topics & existing_topics)
+        left = self._topic_terms(incoming.content)
+        right = self._topic_terms(existing.content)
+        overlap = len(left & right) / max(1, min(len(left), len(right)))
+        semantic = cosine_similarity(incoming.embedding, existing.embedding) if incoming.embedding and existing.embedding else 0.0
+        return overlap >= 0.65 or (overlap >= 0.35 and semantic >= 0.35)
+
+    @staticmethod
+    def _topic_terms(content: str) -> set[str]:
+        stop = {"用户", "偏好", "项目", "决策", "使用", "采用", "改为", "调整", "希望", "以后"}
+        lowered = content.casefold()
+        terms = set(re.findall(r"[a-zA-Z][a-zA-Z0-9_.+-]{2,}", lowered))
+        for span in re.findall(r"[\u4e00-\u9fff]{2,}", lowered):
+            terms.update(span[index:index + 2] for index in range(len(span) - 1))
+            terms.update(span[index:index + 3] for index in range(max(0, len(span) - 2)))
+        return {term for term in terms if term not in stop}

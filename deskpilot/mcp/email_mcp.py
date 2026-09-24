@@ -54,13 +54,6 @@ class EmailProvider(Protocol):
 
 def _decode(value: str | bytes | None) -> str:
     if value is None:
-        # 许多营销邮件只有 HTML 正文，不能因为没有 text/plain 就返回原始 HTML。
-        html_parts = [part for part in message.walk() if part.get_content_type() == "text/html"]
-        for part in html_parts:
-            payload = part.get_payload(decode=True)
-            if payload:
-                charset = part.get_content_charset() or "utf-8"
-                return _html_to_text(payload.decode(charset, errors="replace"))
         return ""
     if isinstance(value, bytes):
         value = value.decode("utf-8", errors="replace")
@@ -78,6 +71,14 @@ def _body(message: email.message.Message) -> str:
             if payload:
                 charset = part.get_content_charset() or "utf-8"
                 return payload.decode(charset, errors="replace")
+        # 许多营销邮件只有 HTML 正文；优先转换成纯文本，不能返回原始标签。
+        for part in message.walk():
+            if part.get_content_type() != "text/html":
+                continue
+            payload = part.get_payload(decode=True)
+            if payload:
+                charset = part.get_content_charset() or "utf-8"
+                return _html_to_text(payload.decode(charset, errors="replace"))
         return ""
     payload = message.get_payload(decode=True)
     if isinstance(payload, bytes):
@@ -90,11 +91,14 @@ def _body(message: email.message.Message) -> str:
 
 def _html_to_text(value: str) -> str:
     """将 HTML 邮件转换成适合展示和交给 LLM 的纯文本。"""
+    value = re.sub(r"(?s)<!--.*?-->", " ", value)
     value = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", value)
     value = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>|</li>|</h[1-6]>", "\n", value)
     value = re.sub(r"(?s)<[^>]+>", " ", value)
     value = html.unescape(value)
     lines = [re.sub(r"[ \t\r\f\v]+", " ", line).strip() for line in value.splitlines()]
+    # 超长带查询参数 URL 多为跟踪链接；保留短链接和正文中的可读地址。
+    lines = [line for line in lines if not (line.startswith(("http://", "https://")) and len(line) > 300)]
     return "\n".join(line for line in lines if line)
 
 

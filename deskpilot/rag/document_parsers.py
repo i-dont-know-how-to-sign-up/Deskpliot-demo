@@ -40,13 +40,20 @@ def parse_document(path: Path) -> Document:
     if not content.strip():
         content = f"[No extractable text found in {path.name}]"
 
+    aliases = sorted({
+        match.group(2).upper()
+        for match in re.finditer(
+            r"\b([A-Z][A-Za-z0-9-]*(?:\s+[A-Z][A-Za-z0-9-]*){1,8})\s*\(([A-Z][A-Z0-9-]{1,9})\)",
+            content[:6000],
+        )
+    })
     return Document(
         doc_id=make_doc_id(path, digest),
         path=str(path),
         title=path.name,
         source_type=suffix.replace(".", ""),
         content=content,
-        metadata={"sha256": digest, "size": path.stat().st_size},
+        metadata={"sha256": digest, "size": path.stat().st_size, "aliases": aliases},
     )
 
 

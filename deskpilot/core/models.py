@@ -53,6 +53,7 @@ class Evidence:
     source_label: str
     text: str
     score: float
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

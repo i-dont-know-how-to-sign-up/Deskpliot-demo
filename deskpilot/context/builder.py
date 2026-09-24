@@ -6,7 +6,6 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
-from .budget import estimate_tokens
 from .budget_manager import AdaptiveBudgetManager, RoleBudget
 from .compressor import ContextCompressor
 from .models import AssembledContext, ContextConfig, ContextPacket

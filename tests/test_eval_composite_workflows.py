@@ -87,11 +87,17 @@ class CompositeWorkflowTests(unittest.TestCase):
                 )
                 self.assertEqual(called[0][0], tool)
                 self.assertEqual(result["tool_name"], tool)
-                self.assertEqual(called[0][1]["confirm"], False)
+                self.assertNotIn("confirm", called[0][1])
                 self.assertIn("多云", called[0][1]["body"])
-                self.assertEqual([step.name for step in result["steps"]][-3:], [
-                    "research_topic", "compose_email_body", "request_email_confirmation",
-                ])
+                # Supervisor 接管执行后会在确认前写入节点级审计步骤；这里验证关键步骤
+                # 的先后关系，而不是把列表末尾位置绑定到旧执行器的内部实现。
+                names = [step.name for step in result["steps"]]
+                required = [
+                    "plan_executor", "research_topic", "compose_email_body",
+                    "supervisor:commit", "supervisor", "request_email_confirmation",
+                ]
+                positions = [names.index(name) for name in required]
+                self.assertEqual(positions, sorted(positions))
 
     def test_composite_scoring_needs_actual_pending_tool(self) -> None:
         case = {"id": "draft", "subset": "Composite-Workflow", "expected": {
@@ -109,7 +115,8 @@ class CompositeWorkflowTests(unittest.TestCase):
         for case_id, tool, subject in (("composite_006", "email.save_draft", "上海天气"),
                                        ("composite_007", "email.send", "上海天气"),
                                        ("multi_001", "email.send", "上海天气"),
-                                       ("multi_002", "email.save_draft", "test3")):
+                                       ("multi_002", "email.save_draft", "test3"),
+                                       ("multi_exec_001", "email.send", "天气提醒")):
             with self.subTest(case_id=case_id):
                 def chat(client, messages, **kwargs):
                     system = str(messages[0].get("content", ""))
@@ -174,7 +181,7 @@ class CompositeWorkflowTests(unittest.TestCase):
 
     def test_optional_local_pdf_cases_have_valid_schema(self) -> None:
         local = load_cases(DATASET.parent / "local_multimodal_cases.jsonl")
-        self.assertEqual(len(local), 2)
+        self.assertEqual(len(local), 3)
         for case in local:
             self.assertTrue(case["runtime"]["requires_local_files"])
             self.assertTrue(case["runtime"]["requires_llm"])

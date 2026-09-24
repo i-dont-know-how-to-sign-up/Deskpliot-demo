@@ -118,7 +118,8 @@ def test_retrieval_trace_records_candidates_and_selection() -> None:
         trace = index.last_trace.to_dict()
         assert found and trace["query"] == "什么是 RAG"
         stages = [event["stage"] for event in trace["events"]]
-        assert stages == ["metadata_filter", "rrf_fusion"]
+        assert stages[:2] == ["metadata_filter", "rrf_fusion"]
+        assert {"rerank", "relevance_threshold", "context_expansion", "final_mmr"}.issubset(stages)
         assert trace["selected_chunk_ids"] == [item.chunk_id for item in found]
 
 

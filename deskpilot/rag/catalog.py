@@ -328,6 +328,65 @@ class RagCatalog:
                 rows.extend((str(row["chunk_id"]), 1.0 / (1.0 + abs(float(row["rank"])))) for row in found)
         return sorted(rows, key=lambda item: item[1], reverse=True)[:limit]
 
+    def get_parent_chunk(self, parent_chunk_id: str) -> ParentChunk | None:
+        """按 ID 读取 parent；旧索引没有结构数据时返回 None，由调用方回退 child。"""
+        if not parent_chunk_id:
+            return None
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT parent_chunk_id, doc_id, parent_order, text, metadata_json "
+                "FROM parent_chunks WHERE parent_chunk_id=? LIMIT 1",
+                (parent_chunk_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ParentChunk(
+            parent_chunk_id=str(row["parent_chunk_id"]),
+            doc_id=str(row["doc_id"]),
+            text=str(row["text"]),
+            order=int(row["parent_order"]),
+            metadata=json.loads(str(row["metadata_json"])),
+        )
+
+    def get_sentence_window(self, sentence_ids: list[str], window_size: int = 2) -> list[SentenceNode]:
+        """在同一 parent 内扩展命中句，天然阻止跨页/标题/表格等结构边界。"""
+        ids = [str(value) for value in sentence_ids if str(value)]
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        with self.connect() as connection:
+            hits = connection.execute(
+                f"SELECT parent_chunk_id, MIN(sentence_order) AS first_order, "
+                f"MAX(sentence_order) AS last_order FROM sentence_nodes "
+                f"WHERE sentence_id IN ({placeholders}) GROUP BY parent_chunk_id",
+                ids,
+            ).fetchall()
+            if not hits:
+                return []
+            # 一个 child 正常只属于一个 parent；若旧数据异常，选择命中最多的首个 parent。
+            parent_id = str(hits[0]["parent_chunk_id"])
+            first_order = max(0, int(hits[0]["first_order"]) - max(0, window_size))
+            last_order = int(hits[0]["last_order"]) + max(0, window_size)
+            rows = connection.execute(
+                "SELECT sentence_id, doc_id, parent_chunk_id, sentence_order, text, "
+                "previous_ids_json, next_ids_json, metadata_json FROM sentence_nodes "
+                "WHERE parent_chunk_id=? AND sentence_order BETWEEN ? AND ? ORDER BY sentence_order",
+                (parent_id, first_order, last_order),
+            ).fetchall()
+        return [
+            SentenceNode(
+                sentence_id=str(row["sentence_id"]),
+                doc_id=str(row["doc_id"]),
+                parent_chunk_id=str(row["parent_chunk_id"]),
+                order=int(row["sentence_order"]),
+                text=str(row["text"]),
+                previous_sentence_ids=json.loads(str(row["previous_ids_json"])),
+                next_sentence_ids=json.loads(str(row["next_ids_json"])),
+                metadata=json.loads(str(row["metadata_json"])),
+            )
+            for row in rows
+        ]
+
     def clear_content(self) -> None:
         """保留 schema，清空索引内容；embedding cache 可复用。"""
         with self._lock, self.connect() as connection:

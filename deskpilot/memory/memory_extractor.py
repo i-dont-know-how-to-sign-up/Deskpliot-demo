@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import json
 import re
 
-from .memory_models import MemoryItem
 from ..core.api_clients import OpenAICompatibleClient
 from ..core.config import load_config
 from ..core.encoding_utils import fix_mojibake
+from ..core.json_utils import parse_json_value
 
 
 class MemoryExtractor:
@@ -43,9 +42,10 @@ class MemoryExtractor:
             "如果用户明确说不要记住、只是举例、临时假设、开玩笑或忽略这句话，请返回空数组。\n"
             "记忆类型只能是 fact、preference、decision、task、artifact。\n"
             "scope 只能是 session、workspace、user。用户稳定偏好用 user，项目阶段/技术决策用 workspace，临时事实用 session。\n"
+            "为 preference 和 decision 提取稳定的 topic（如 ui_framework、python_version、answer_style），用于冲突消解。\n"
             "只输出 JSON 数组，每项格式："
             "{\"scope\":\"workspace|user|session\",\"memory_type\":\"fact|preference|decision|task|artifact\","
-            "\"content\":\"一句中文记忆\",\"confidence\":0.0,\"tags\":[\"tag\"]}\n\n"
+            "\"content\":\"一句中文记忆\",\"confidence\":0.0,\"topic\":\"optional_topic\",\"tags\":[\"tag\"]}\n\n"
             "fact 只能抽取用户明确陈述的事实；不要把助手自行生成的知识性回答当作用户事实。\n"
             f"本轮助手回答是否有外部证据支持：{'是' if grounded else '否'}。"
             "无外部证据时，禁止从助手回答抽取 fact。\n"
@@ -60,12 +60,8 @@ class MemoryExtractor:
         )
         if not response:
             return []
-        match = re.search(r"\[.*\]", response, flags=re.DOTALL)
-        if not match:
-            return []
-        try:
-            raw_items = json.loads(match.group(0))
-        except json.JSONDecodeError:
+        raw_items = parse_json_value(response, list)
+        if not isinstance(raw_items, list):
             return []
         items: list[dict] = []
         for raw in raw_items if isinstance(raw_items, list) else []:
@@ -196,12 +192,16 @@ class MemoryExtractor:
         tags = raw.get("tags", [])
         if not isinstance(tags, list):
             tags = []
+        topic = re.sub(r"[^a-z0-9_:-]+", "_", str(raw.get("topic", "")).casefold()).strip("_")[:48]
+        normalized_tags = [str(tag) for tag in tags[:5]]
+        if topic and not any(tag.startswith("topic:") for tag in normalized_tags):
+            normalized_tags.append(f"topic:{topic}")
         return {
             "scope": scope,
             "memory_type": memory_type,
             "content": content,
             "confidence": max(0.0, min(confidence, 1.0)),
-            "tags": [str(tag) for tag in tags[:5]],
+            "tags": normalized_tags[:6],
             "status": "pending" if confidence < 0.6 else str(raw.get("status", "active")),
         }
 

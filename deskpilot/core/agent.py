@@ -1,21 +1,26 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import sys
+import threading
 from pathlib import Path
 
 from .api_clients import OpenAICompatibleClient
+from .approval import PendingActionStore
 from .config import LOG_DIR, load_config
 from .encoding_utils import fix_mojibake
 from .models import AgentStep, AnswerResult, Evidence
+from .json_utils import parse_json_value
 from .runtime import PlanAndExecuteRuntime, PlanStep
 from ..context import AssembledContext, ContextBuilder, UsageCostTracker
 from ..memory.memory_compactor import MemoryCompactor
 from ..memory.memory_extractor import MemoryExtractor
 from ..memory.memory_store import MemoryStore
 from ..memory.session_store import SessionStore
+from ..memory.turn_manager import MemoryTurnManager
 from ..intent.router import IntentRouter
 from ..intent.schemas import IntentDecision
 from ..rag.vector_index import DocumentIndex
@@ -25,6 +30,7 @@ from ..rag.retrieval import RetrievalFilters, RetrievalRequest
 from ..rag.web_research import ResearchResult, WebResearchAgent
 from ..tools.tool_registry import build_default_tool_registry
 from ..multi_agent.planner import PlannerAgent
+from ..multi_agent.plan_executor import PlanExecutor
 from ..multi_agent.router import MultiAgentRouter
 
 
@@ -61,12 +67,15 @@ class DocumentQAAgent:
         )
         self.usage_tracker = UsageCostTracker(LOG_DIR / "context_usage.jsonl")
         self.web_research_agent = WebResearchAgent(index)
+        self._operation_lock = threading.RLock()
         self._turn_usage_start = self.usage_tracker.snapshot(self._combined_usage())
         self.workspace_root = Path.cwd().resolve()
         self.tool_registry = build_default_tool_registry(index, self.web_research_agent, workspace_root=self.workspace_root)
+        self.pending_actions = PendingActionStore()
         self.runtime = PlanAndExecuteRuntime(default_max_retries=1)
         self.intent_router = IntentRouter(self.client)
-        # 多智能体 P0 的 Planner/Router 仅负责计划预览和复杂度判断，旧任务仍走原有稳定链路。
+        # Planner/Router 负责计划与复杂度判断；已迁移的邮件复合任务由
+        # PlanExecutor + Supervisor 执行，其余任务暂走兼容执行链。
         self.multi_agent_router = MultiAgentRouter(
             PlannerAgent(
                 llm_call=lambda prompt: self.client.chat(
@@ -174,6 +183,11 @@ class DocumentQAAgent:
         return self.tool_registry.call(name, **kwargs).to_dict()
 
     def answer(self, question: str, top_k: int = 5, session_id: str | None = None) -> AnswerResult:
+        """串行执行一次问答，隔离共享的 Client、Index trace 和 usage 快照。"""
+        with self._operation_lock:
+            return self._answer_unlocked(question, top_k=top_k, session_id=session_id)
+
+    def _answer_unlocked(self, question: str, top_k: int = 5, session_id: str | None = None) -> AnswerResult:
         if hasattr(self, "usage_tracker"):
             self._turn_usage_start = self.usage_tracker.snapshot(self._combined_usage())
         session = self.session_store.get_or_create(session_id)
@@ -216,9 +230,7 @@ class DocumentQAAgent:
                 )
             # 仅当文件产物计划无效或缺少可执行的前置资料/写入工具时，再尝试一次语义重规划。
             # 不绕过权限检查，也不在无资料时直接写入空文件。
-            wants_output = decision.requires_file_output or (
-                self._is_file_write_instruction(question) and bool(self._extract_file_write_request(question))
-            )
+            wants_output = decision.requires_file_output
             if wants_output:
                 actions = [tool for item in plan_preview.get("steps", []) if isinstance(item, dict)
                            for tool in item.get("allowed_tools", [])]
@@ -250,7 +262,10 @@ class DocumentQAAgent:
             steps.append(AgentStep("context_policy", "success", "；".join(memory_context.debug_lines)))
             planned_targets = self._planned_document_targets(plan_preview)
             has_commit = any(
-                isinstance(item, dict) and item.get("id") == "commit"
+                isinstance(item, dict) and any(
+                    tool in {"email.send", "email.save_draft", "files.write_file"}
+                    for tool in item.get("allowed_tools", [])
+                )
                 for item in plan_preview.get("steps", [])
             )
             if len(planned_targets) >= 2 and not has_commit:
@@ -322,7 +337,7 @@ class DocumentQAAgent:
                     user_message.message_id, memory_context,
                 )
             if any(
-                isinstance(item, dict) and item.get("id") == "commit"
+                isinstance(item, dict)
                 and any(tool in {"email.send", "email.save_draft"} for tool in item.get("allowed_tools", []))
                 for item in plan_preview.get("steps", [])
             ):
@@ -342,6 +357,19 @@ class DocumentQAAgent:
                 if needs_file and not report_request["write_report"]:
                     steps.append(AgentStep("repair_plan", "success", "检索计划漏掉文件提交，按确认的文件产物需求补齐写入步骤。"))
                     report_request["write_report"] = True
+                if not report_request["write_report"]:
+                    return self._answer_rag_request(
+                        question=question,
+                        query=str(report_request.get("query") or question),
+                        top_k=top_k,
+                        steps=steps,
+                        session_id=session.session_id,
+                        user_message_id=user_message.message_id,
+                        memory_context=memory_context,
+                        collection=True,
+                        context_expansion="parent",
+                        doc_ids=[str(item) for item in report_request.get("doc_ids", [])],
+                    )
                 return self._answer_index_report(
                     question, report_request, steps, session.session_id, user_message.message_id, memory_context
                 )
@@ -355,6 +383,38 @@ class DocumentQAAgent:
                                "doc_ids": [], "path": "", "write_report": True},
                     steps, session.session_id, user_message.message_id, memory_context,
                 )
+            # Router 可能正确识别为复杂只读汇总，却漏填 needs_index_catalog；Planner
+            # 也可能只给 communication 空节点。只要计划无副作用、没有其他工具，且
+            # 路由前探测已有强索引候选，就恢复为 collection RAG。
+            plan_tools = {
+                str(tool)
+                for item in plan_preview.get("steps", []) if isinstance(item, dict)
+                for tool in item.get("allowed_tools", [])
+            }
+            strong_index_candidates = any(
+                item.get("strong_match") is True for item in index_hint
+            )
+            if (
+                not wants_file
+                and not has_commit
+                and strong_index_candidates
+                and not (plan_tools - {"knowledge.search"})
+            ):
+                steps.append(AgentStep(
+                    "repair_plan", "success",
+                    "只读索引计划缺少可执行检索节点；已根据强索引候选恢复为 collection RAG。",
+                ))
+                return self._answer_rag_request(
+                    question=question,
+                    query=str(decision.arguments.get("query") or question),
+                    top_k=top_k,
+                    steps=steps,
+                    session_id=session.session_id,
+                    user_message_id=user_message.message_id,
+                    memory_context=memory_context,
+                    collection=True,
+                    context_expansion="parent",
+                )
             if wants_file or has_commit or decision.needs_index_catalog:
                 return self._finalize_answer(
                     answer="任务规划缺少可执行的资料获取或提交步骤；本次没有创建文件或生成可信的索引汇总。",
@@ -362,96 +422,16 @@ class DocumentQAAgent:
                     session_id=session.session_id, user_message_id=user_message.message_id,
                     question=question, memory_context=memory_context,
                 )
+            return self._finalize_answer(
+                answer="Planner 已生成计划，但当前执行器没有找到受支持的可执行节点；本次未执行外部操作。",
+                evidences=[], steps=steps, used_llm=False,
+                session_id=session.session_id, user_message_id=user_message.message_id,
+                question=question, memory_context=memory_context,
+            )
         else:
             memory_context = self.context_assembler.for_role(memory_context, "answer", complexity=2)
-        local_document_targets = self._extract_local_document_targets(question)
-        if len(local_document_targets) >= 2:
-            return self._answer_local_documents(
-                question, local_document_targets, steps, session.session_id,
-                user_message.message_id, memory_context,
-            )
-        routed = self._route_with_intent(
+        return self._route_with_intent(
             question, memory_context, steps, session.session_id, user_message.message_id, decision=decision
-        )
-        if routed is not None:
-            return routed
-        test_execution_request = self._extract_test_execution_request(question)
-        if test_execution_request:
-            return self._answer_test_execution(
-                question=question,
-                test_execution_request=test_execution_request,
-                steps=steps,
-                session_id=session.session_id,
-                user_message_id=user_message.message_id,
-                memory_context=memory_context,
-            )
-        file_write_request = self._extract_file_write_request(question)
-        if file_write_request:
-            return self._answer_file_write(
-                question=question,
-                file_write_request=file_write_request,
-                steps=steps,
-                session_id=session.session_id,
-                user_message_id=user_message.message_id,
-                memory_context=memory_context,
-            )
-        local_document_target = self._extract_local_document_target(question)
-        if local_document_target:
-            local_result = self._answer_local_document(
-                question=question,
-                local_document_target=local_document_target,
-                steps=steps,
-                session_id=session.session_id,
-                user_message_id=user_message.message_id,
-                memory_context=memory_context,
-            )
-            if local_result is not None:
-                return local_result
-        web_research_topic = self._extract_web_research_request(question)
-        if web_research_topic:
-            return self._answer_web_research_request(
-                question=question,
-                topic=web_research_topic,
-                steps=steps,
-                session_id=session.session_id,
-                user_message_id=user_message.message_id,
-                memory_context=memory_context,
-            )
-        intent, reason = self._classify_intent(question)
-        steps.append(AgentStep("classify_intent", "success", f"意图：{intent}。原因：{reason}"))
-        if intent == "direct_answer":
-            answer = self._direct_answer(question, memory_context)
-            used_llm = bool(answer)
-            if not answer:
-                if self.client.config.llm_api_key and self.client.last_error:
-                    steps.append(AgentStep("llm_api_call", "failed", self.client.last_error))
-                answer = self._direct_fallback_answer(question, memory_context)
-            steps.append(
-                AgentStep(
-                    "direct_answer",
-                    "success",
-                    "已判断为通用问题，跳过文档检索。" if used_llm else "未调用 LLM API，已基于会话记忆和规则生成回答。",
-                )
-            )
-            return self._finalize_answer(
-                answer=answer,
-                evidences=[],
-                steps=steps,
-                used_llm=used_llm,
-                session_id=session.session_id,
-                user_message_id=user_message.message_id,
-                question=question,
-                memory_context=memory_context,
-            )
-
-        return self._answer_rag_request(
-            question=question,
-            query=question,
-            top_k=top_k,
-            steps=steps,
-            session_id=session.session_id,
-            user_message_id=user_message.message_id,
-            memory_context=memory_context,
         )
 
     def _answer_rag_request(
@@ -464,6 +444,8 @@ class DocumentQAAgent:
         user_message_id: str,
         memory_context: AssembledContext,
         collection: bool = False,
+        context_expansion: str | None = None,
+        doc_ids: list[str] | None = None,
     ) -> AnswerResult:
         # Router 生成的 tool query 可能为了某个对象擅自加入专属术语。P1 始终保留
         # 用户原问题，并让 Query Analyzer 只为复杂任务增加互补查询，避免单路改写覆盖原意。
@@ -477,6 +459,10 @@ class DocumentQAAgent:
             index_version=index_version,
             complex_task=complex_retrieval,
         )
+        # Router 可复用本轮语义判断选择扩展策略；执行层只做枚举校验，不按问句关键词路由。
+        expansion_strategy = str(context_expansion or analysis.context_expansion)
+        if expansion_strategy not in {"sentence_window", "parent", "none"}:
+            expansion_strategy = analysis.context_expansion
         rewritten = self.query_optimizer.rewrite(analysis.standalone_question)
         queries = [rewritten.rewritten]
         if analysis.needs_multi_query:
@@ -495,12 +481,13 @@ class DocumentQAAgent:
                 "must_terms": analysis.must_terms,
                 "queries": queries,
                 "hyde_enabled": bool(hyde_text),
+                "context_expansion": expansion_strategy,
             }, ensure_ascii=False),
         ))
         steps.append(AgentStep("rewrite_query", "success", f"method={rewritten.method}; query={rewritten.rewritten}"))
         # 查询明确点名多份索引文档时，为每份文档保留证据配额。比较类问题若直接做
         # 全局 Top-K，标题相近或篇幅更长的单篇文档很容易占满所有候选。
-        title_doc_ids = original_title_doc_ids or self.index.matching_title_doc_ids(query)
+        title_doc_ids = set(doc_ids or []) or original_title_doc_ids or self.index.matching_title_doc_ids(query)
         balanced_document_search = len(title_doc_ids) >= 2
         hybrid_enabled = os.getenv("RAG_HYBRID_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
         if hybrid_enabled:
@@ -513,6 +500,7 @@ class DocumentQAAgent:
                 dense_k=max(20, evidence_limit * 5),
                 sparse_k=max(20, evidence_limit * 5),
                 top_k=evidence_limit,
+                context_expansion=expansion_strategy,
             )
             evidences = self.index.search_hybrid(request)
         elif balanced_document_search:
@@ -521,7 +509,10 @@ class DocumentQAAgent:
                 chunks_per_doc=max(2, min(3, top_k)), diversify_positions=False,
             )
         elif collection:
-            evidences = self.index.search_collection(rewritten.rewritten)
+            evidences = self.index.search_collection(
+                rewritten.rewritten,
+                doc_ids=sorted(title_doc_ids) if title_doc_ids else None,
+            )
         else:
             evidences = self.index.search(rewritten.rewritten, top_k=top_k)
         steps.append(
@@ -535,16 +526,47 @@ class DocumentQAAgent:
         )
         if self.index.last_trace:
             trace_data = self.index.last_trace.to_dict()
+            trace_events = trace_data.get("events", [])
+            event_by_name = {
+                str(event.get("stage")): event for event in trace_events if isinstance(event, dict)
+            }
+            rerank_event = event_by_name.get("rerank", {})
+            rerank_detail = rerank_event.get("detail", {}) if isinstance(rerank_event, dict) else {}
+            steps.append(AgentStep(
+                "rerank_evidence",
+                "success",
+                f"requested={rerank_detail.get('requested_provider', 'disabled')}；"
+                f"effective={rerank_detail.get('effective_provider', 'disabled')}；"
+                f"candidates={rerank_event.get('input_count', 0)}->{rerank_event.get('output_count', 0)}；"
+                f"fallback={bool(rerank_detail.get('fallback'))}。",
+            ))
+            expansion_event = event_by_name.get("context_expansion", {})
+            expansion_detail = expansion_event.get("detail", {}) if isinstance(expansion_event, dict) else {}
+            steps.append(AgentStep(
+                "expand_evidence", "success",
+                f"strategy={expansion_detail.get('strategy', 'none')}；"
+                f"candidates={expansion_event.get('input_count', 0)}->{expansion_event.get('output_count', 0)}；"
+                f"fallback_count={expansion_detail.get('fallback_count', 0)}。",
+            ))
+            selection_event = event_by_name.get("final_mmr", {})
+            selection_detail = selection_event.get("detail", {}) if isinstance(selection_event, dict) else {}
+            steps.append(AgentStep(
+                "select_evidence", "success",
+                f"method=coverage_aware_mmr；lambda={selection_detail.get('mmr_lambda', 'n/a')}；"
+                f"candidates={selection_event.get('input_count', 0)}->{selection_event.get('output_count', 0)}。",
+            ))
             steps.append(AgentStep(
                 "retrieval_trace", "success",
                 json.dumps({
                     "mode": trace_data.get("mode"),
-                    "events": trace_data.get("events", []),
+                    "events": trace_events,
                     "candidates": trace_data.get("candidates", [])[:10],
                     "selected_chunk_ids": trace_data.get("selected_chunk_ids", []),
                 }, ensure_ascii=False),
             ))
-        covered, query_entities = self._evidence_covers_query_entities(query, evidences)
+        # query 可能是 Router/Query Analyzer 为召回生成的英文改写。证据门禁只能检查
+        # 用户原问题中的实体，否则 trade-off/workflow 等扩展词会错误淘汰有效证据。
+        covered, query_entities = self._evidence_covers_query_entities(question, evidences)
         if evidences and not covered:
             names = "、".join(query_entities)
             steps.append(AgentStep(
@@ -653,6 +675,21 @@ class DocumentQAAgent:
             )
             answer = self._fallback_answer(question, evidences, reason=reason)
             steps.append(AgentStep("generate_answer", "success", "已使用本地高相关证据摘要生成降级答案。"))
+        citation_support_enabled = os.getenv("RAG_CITATION_SUPPORT_ENABLED", "false").lower() in {
+            "1", "true", "yes", "on",
+        }
+        if citation_support_enabled and used_llm:
+            supported, support_detail = self._verify_citation_support(answer, evidences)
+            steps.append(AgentStep(
+                "verify_citation_support",
+                "success" if supported else "failed",
+                support_detail,
+            ))
+            if not supported:
+                answer = self._fallback_answer(
+                    question, evidences, reason="高可靠引用支持校验未通过",
+                )
+                used_llm = False
         answer = self._append_source_list(answer, evidences)
         steps.append(AgentStep(
             "attach_citations",
@@ -694,22 +731,8 @@ class DocumentQAAgent:
         steps: list[AgentStep],
         session_id: str,
         user_message_id: str,
-        decision: IntentDecision | None = None,
-    ) -> AnswerResult | None:
-        if decision is None:
-            self.intent_router.client = self.client
-            router_context = self.context_assembler.for_role(
-                memory_context, "router", complexity=memory_context.complexity
-            )
-            steps.append(AgentStep("router_context", "success", "；".join(router_context.debug_lines)))
-            decision = self.intent_router.route(
-                question, self.tool_registry, router_context.text,
-                index_hint=self.index.retrieval_hint(question),
-            )
-        if decision.mode == "direct_answer" and self.client.last_error:
-            steps.append(AgentStep("route_intent", "failed", f"意图路由器不可用：{self.client.last_error}"))
-            return None
-
+        decision: IntentDecision,
+    ) -> AnswerResult:
         steps.append(
             AgentStep(
                 "route_intent",
@@ -725,6 +748,24 @@ class DocumentQAAgent:
                 if self.client.config.llm_api_key and self.client.last_error:
                     steps.append(AgentStep("llm_api_call", "failed", self.client.last_error))
                 answer = self._direct_fallback_answer(question, memory_context)
+            elif self._needs_enumeration_review(answer):
+                reviewed = self.client.chat(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "你是回答一致性审核器。检查总数、编号列表、分类口径和例外是否自洽；"
+                                "发现冲突时直接输出修正后的完整中文回答，没有冲突则原样输出。"
+                            ),
+                        },
+                        {"role": "user", "content": f"问题：{question}\n\n待审核回答：\n{answer}"},
+                    ],
+                    temperature=0.0,
+                    max_tokens=memory_context.output_budget or None,
+                )
+                if reviewed:
+                    answer = reviewed
+                    steps.append(AgentStep("review_enumeration", "success", "已复核枚举数量和统计口径。"))
             steps.append(
                 AgentStep(
                     "direct_answer",
@@ -770,7 +811,18 @@ class DocumentQAAgent:
                 memory_context=memory_context,
             )
 
-        return None
+        return self._finalize_answer(
+            answer="意图路由结果无法执行；本次未调用工具。",
+            evidences=[], steps=steps, used_llm=False,
+            session_id=session_id, user_message_id=user_message_id,
+            question=question, memory_context=memory_context,
+        )
+
+    @staticmethod
+    def _needs_enumeration_review(answer: str) -> bool:
+        numbered = re.findall(r"(?m)^\s*\d+[.、]\s+", answer)
+        total_claim = re.search(r"(?:共有|共计|总共|一共|合计).{0,10}\d+", answer)
+        return len(numbered) >= 3 and bool(total_claim)
 
     def _handle_intent_tool_call(
         self,
@@ -783,10 +835,6 @@ class DocumentQAAgent:
     ) -> AnswerResult:
         tool_name = decision.tool_name
         arguments = dict(decision.arguments)
-
-        # LLM 不能自行授予发送权限；首次调用必须进入人工确认流程。
-        if tool_name in {"email.send", "email.save_draft"}:
-            arguments["confirm"] = False
 
         if tool_name.startswith("files.write_") or tool_name == "files.write_file":
             file_write_request = self._normalize_file_write_request(question, arguments)
@@ -810,12 +858,11 @@ class DocumentQAAgent:
                 user_message_id=user_message_id,
                 memory_context=memory_context,
                 collection=arguments.get("scope") == "collection",
+                context_expansion=str(arguments.get("context_expansion") or "") or None,
             )
 
         if tool_name in {"files.resolve_document", "files.read_document"}:
             local_target = str(arguments.get("target") or arguments.get("path") or "").strip()
-            if not local_target:
-                local_target = self._extract_local_document_target(question) or ""
             if not local_target:
                 return self._finalize_answer(
                     answer=self._build_clarification_answer(
@@ -838,6 +885,7 @@ class DocumentQAAgent:
             return self._answer_local_document(
                 question=question,
                 local_document_target=local_target,
+                read_mode=str(arguments.get("read_mode") or "").strip(),
                 steps=steps,
                 session_id=session_id,
                 user_message_id=user_message_id,
@@ -927,27 +975,6 @@ class DocumentQAAgent:
                 normalized["unread_only"] = True
         return normalized
 
-    def _extract_research_email_request(self, question: str) -> dict[str, str] | None:
-        """识别“先获取实时资料，再发送邮件”的复合任务。"""
-        if "邮件" not in question or not re.search(r"(?:发送|发给|发一封|邮件草稿|保存到草稿)", question, flags=re.IGNORECASE):
-            return None
-        if not any(marker in question for marker in ("天气", "气温", "天气预报", "实时信息", "最新信息")):
-            return None
-        # 邮箱地址只允许 ASCII 字符，避免 Python 的 \w 把前面的中文一起吞进地址。
-        recipient_match = re.search(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", question)
-        if not recipient_match:
-            return None
-        subject_match = re.search(r"(?:标题|主题)\s*(?:为|是|：|:)?\s*(.+?)(?:，|,|；|;|\s+(?:内容|正文))", question)
-        body_match = re.search(r"(?:内容|正文)\s*(?:为|是|：|:)?\s*(.+)$", question)
-        # 用户只指定“搜索天气并发邮件”时，正文由搜索结果生成，标题使用可追踪的默认值。
-        request = body_match.group(1).strip(" 。") if body_match else "明天上海各区天气情况"
-        subject = subject_match.group(1).strip() if subject_match else "上海明日天气"
-        return {
-            "to": recipient_match.group(1),
-            "subject": subject,
-            "request": request,
-        }
-
     def _answer_research_email_request(
         self,
         question: str,
@@ -956,48 +983,49 @@ class DocumentQAAgent:
         session_id: str,
         user_message_id: str,
         memory_context: AssembledContext,
+        plan_preview: dict[str, object] | None = None,
     ) -> AnswerResult:
-        """执行网页调研 -> 报告产物 -> 邮件简介 -> 人工审批发送的有序计划。"""
-        attach_report = bool(request.get("attach_report", False))
-        email_tool = str(request.get("email_tool") or "email.send")
-        plan_detail = "复合任务：先生成调研报告，再生成邮件简介，最后携带报告附件请求发送确认。" if attach_report else "复合任务：先调研资料，再生成邮件正文，最后请求邮件提交确认。"
-        steps.append(AgentStep("plan_task", "success", plan_detail))
-
-        def research_topic(values: dict[str, object]) -> dict[str, object]:
-            result = self.web_research_agent.research(str(request["request"]))
-            if not result.report.strip():
-                raise RuntimeError("网页调研没有生成可用报告")
-            return {
-                "research_report": result.report,
-                "artifact_path": result.artifact_path,
-                "research_used_llm": result.used_llm,
-            }
-
-        def compose_body(values: dict[str, object]) -> dict[str, object]:
-            source_text = str(values.get("research_report", ""))
-            body = self.client.chat(
-                [
-                    {"role": "system", "content": "你是邮件助手。请根据调研报告撰写简洁的邮件正文，概括主要发现；说明详细内容见附件时不得编造附件中没有的信息。"},
-                    {"role": "user", "content": f"邮件主题：{request['subject']}\n用户要求：{request['request']}\n是否附带报告：{attach_report}\n调研报告：\n{source_text}"},
-                ],
-                temperature=0.2,
-            )
-            if not body:
-                body = source_text[:3000]
-            if not body:
-                raise RuntimeError("无法根据调研报告生成邮件正文")
-            return {"body": body}
-
-        execution = self.runtime.run(
-            [
-                PlanStep("research_topic", research_topic, "已完成网页调研并生成报告文件。", max_retries=1),
-                PlanStep("compose_email_body", compose_body, "已根据调研报告生成邮件正文。", max_retries=1),
+        """通过统一 PlanExecutor + Supervisor 执行资料、生成和审批准备节点。"""
+        effective_plan = dict(plan_preview or {})
+        if not effective_plan.get("steps"):
+            effective_plan["steps"] = [
+                {"id": "knowledge", "agent": "knowledge", "allowed_tools": ["web.research"]},
+                {"id": "communication", "agent": "communication", "depends_on": ["knowledge"]},
+                {"id": "commit", "agent": "communication", "depends_on": ["communication"],
+                 "allowed_tools": [str(request.get("email_tool") or "email.send")], "requires_human": True},
             ]
+        steps.append(AgentStep("plan_task", "success", "统一执行器开始执行 Planner 生成的 DAG。"))
+        steps.append(AgentStep("plan_executor", "success", "已将 Planner 节点绑定到领域 handler。"))
+        executor = PlanExecutor(
+            tool_call=self.tool_registry.call,
+            research=self.web_research_agent.research,
+            llm_call=lambda prompt: self.client.chat(
+                [
+                    {"role": "system", "content": "你是邮件助手，只根据给定资料生成邮件正文。"},
+                    {"role": "user", "content": prompt},
+                ], temperature=0.2,
+            ),
         )
-        steps.extend(execution.agent_steps[1:])
-        if execution.failed:
+        execution = executor.execute_email_plan(effective_plan, request)
+        for result in execution.supervisor.results:
+            legacy_name = None
+            if result.agent == "knowledge":
+                legacy_name = "research_topic"
+            elif result.agent == "communication" and "body" in result.output:
+                legacy_name = "compose_email_body"
+            if legacy_name:
+                steps.append(AgentStep(legacy_name, result.status, f"由 Supervisor 节点 {result.step_id} 执行。"))
+            steps.append(AgentStep(
+                f"supervisor:{result.step_id}", result.status,
+                result.error or f"agent={result.agent}; tool_calls={result.tool_calls}; tokens={result.tokens}",
+            ))
+        steps.append(AgentStep(
+            "supervisor", execution.supervisor.status,
+            execution.supervisor.error or f"已处理 {len(execution.supervisor.results)} 个计划节点。",
+        ))
+        if execution.supervisor.status == "failed":
             return self._finalize_answer(
-                answer=f"无法准备邮件：{execution.failure}",
+                answer=f"无法准备邮件：{execution.supervisor.error}",
                 evidences=[],
                 steps=steps,
                 used_llm=False,
@@ -1006,28 +1034,21 @@ class DocumentQAAgent:
                 question=question,
                 memory_context=memory_context,
             )
-
-        attachment_paths = [str(execution.values["artifact_path"])] if attach_report else []
-        result = self.tool_registry.call(
-            email_tool,
-            to=[str(request["to"])],
-            subject=str(request["subject"]),
-            body=str(execution.values["body"]),
-            attachment_paths=attachment_paths,
-            confirm=False,
-        )
-        steps.append(AgentStep("request_email_confirmation", "success" if result.ok else "failed", "邮件已准备完成，等待人工确认。" if result.ok else (result.error or "邮件工具调用失败")))
+        if execution.tool_result is None:
+            return self._finalize_answer(
+                answer="Supervisor 未生成可提交的邮件操作。", evidences=[], steps=steps,
+                used_llm=False, session_id=session_id, user_message_id=user_message_id,
+                question=question, memory_context=memory_context,
+            )
+        steps.append(AgentStep(
+            "request_email_confirmation", "waiting_human",
+            "Supervisor 已准备邮件提交，等待人工确认。",
+        ))
         return self._finalize_generic_tool_result(
             question=question,
-            tool_name=email_tool,
-            tool_result=result,
-            call_arguments={
-                "to": [str(request["to"])],
-                "subject": str(request["subject"]),
-                "body": str(execution.values["body"]),
-                "attachment_paths": attachment_paths,
-                "confirm": False,
-            },
+            tool_name=execution.tool_name,
+            tool_result=execution.tool_result,
+            call_arguments=execution.call_arguments,
             steps=steps,
             session_id=session_id,
             user_message_id=user_message_id,
@@ -1040,7 +1061,7 @@ class DocumentQAAgent:
     ) -> AnswerResult:
         """按 Planner 输出的节点参数执行，不再由问题文本决定是否是天气邮件任务。"""
         plan_steps = plan_preview.get("steps", [])
-        email_tools = {tool for item in plan_steps if isinstance(item, dict) and item.get("id") == "commit"
+        email_tools = {tool for item in plan_steps if isinstance(item, dict)
                        for tool in item.get("allowed_tools", []) if tool in {"email.send", "email.save_draft"}}
         if len(email_tools) > 1:
             return self._finalize_answer(
@@ -1076,9 +1097,9 @@ class DocumentQAAgent:
                 user_message_id=user_message_id, question=question, memory_context=memory_context,
             )
         attach_report = bool(arguments.get("attach_report") or arguments.get("as_attachment"))
-        # 这里只补齐附件槽位，不参与是否进入复合任务的路由判断。
-        if not attach_report and "附件" in question:
-            attach_report = True
+        attachment_paths = arguments.get("attachment_paths") or []
+        if isinstance(attachment_paths, str):
+            attachment_paths = [attachment_paths]
         return self._answer_research_email_request(
             question=question,
             request={
@@ -1086,10 +1107,11 @@ class DocumentQAAgent:
                 "subject": subject,
                 "request": request,
                 "attach_report": attach_report,
+                "attachment_paths": [str(item) for item in attachment_paths if str(item).strip()],
                 "email_tool": email_tool,
             },
             steps=steps, session_id=session_id, user_message_id=user_message_id,
-            memory_context=memory_context,
+            memory_context=memory_context, plan_preview=plan_preview,
         )
 
     def _build_clarification_answer(self, decision: IntentDecision) -> str:
@@ -1176,26 +1198,12 @@ class DocumentQAAgent:
     ) -> AnswerResult:
         command = arguments.get("command")
         timeout_seconds = arguments.get("timeout_seconds")
-        confirm = bool(arguments.get("confirm", False))
         cwd = str(arguments.get("cwd", "") or "")
 
         if tool_name == "shell.execute_command" and not command:
             test_request = self._extract_test_execution_request(question)
             if test_request:
                 steps.append(AgentStep("route_test_execution", "success", f"意图路由到测试执行：{test_request['script']}"))
-                return self._answer_test_execution(
-                    question=question,
-                    test_execution_request=test_request,
-                    steps=steps,
-                    session_id=session_id,
-                    user_message_id=user_message_id,
-                    memory_context=memory_context,
-                )
-
-        if tool_name == "shell.execute_command" and not command:
-            test_request = self._extract_test_execution_request(question)
-            if test_request:
-                steps.append(AgentStep("route_test_execution", "success", f"鎰忓浘璺敱鍒版祴璇曟墽琛岋細{test_request['script']}"))
                 return self._answer_test_execution(
                     question=question,
                     test_execution_request=test_request,
@@ -1236,7 +1244,6 @@ class DocumentQAAgent:
                 tool_name,
                 command=command,
                 timeout_seconds=int(timeout_seconds) if timeout_seconds is not None else 10,
-                confirm=confirm,
                 cwd=cwd,
             )
         else:
@@ -1244,7 +1251,6 @@ class DocumentQAAgent:
                 tool_name,
                 code=str(arguments.get("code", "")),
                 timeout_seconds=int(timeout_seconds) if timeout_seconds is not None else 10,
-                confirm=confirm,
                 cwd=cwd,
             )
         steps.append(AgentStep("execute_tool", "success" if result.ok else "failed", f"已调用工具：{tool_name}"))
@@ -1256,7 +1262,6 @@ class DocumentQAAgent:
                 "command": command,
                 "code": arguments.get("code", ""),
                 "timeout_seconds": timeout_seconds,
-                "confirm": confirm,
                 "cwd": cwd,
             },
             steps=steps,
@@ -1275,13 +1280,15 @@ class DocumentQAAgent:
         user_message_id: str,
         memory_context: AssembledContext,
     ) -> AnswerResult:
-        result = self.tool_registry.call(tool_name, **arguments)
+        # confirm 不属于模型权限。即使旧 Router 或恶意模型返回该字段，也在工具边界前丢弃。
+        safe_arguments = {key: value for key, value in arguments.items() if key != "confirm"}
+        result = self.tool_registry.call(tool_name, **safe_arguments)
         steps.append(AgentStep("execute_tool", "success" if result.ok else "failed", f"已调用工具：{tool_name}"))
         return self._finalize_generic_tool_result(
             question=question,
             tool_name=tool_name,
             tool_result=result,
-            call_arguments=arguments,
+            call_arguments=safe_arguments,
             steps=steps,
             session_id=session_id,
             user_message_id=user_message_id,
@@ -1363,8 +1370,12 @@ class DocumentQAAgent:
                         continue
                     subject = str(item.get("subject", "（无标题）")).strip() or "（无标题）"
                     body = str(item.get("body", "")).strip() or "（无正文）"
-                    message_lines.extend([f"\n{index}. {subject}", body])
+                    if len(body) > 1200:
+                        body = body[:1200].rstrip() + "\n[正文预览已截断，可继续要求读取该邮件全文]"
+                    message_lines.extend([f"\n{index}. 标题：{subject}", f"   内容：{body}"])
                 answer = "\n".join(message_lines)
+            elif tool_name in {"shell.execute_command", "code.execute_python"} and payload.get("executed"):
+                answer = self._present_execution_result(question, payload)
             else:
                 answer = json.dumps(payload, ensure_ascii=False, indent=2)
         else:
@@ -1391,6 +1402,24 @@ class DocumentQAAgent:
             memory_context=memory_context,
             pending_action=pending_action,
         )
+
+    def _present_execution_result(self, question: str, output: dict[str, object]) -> str:
+        """将命令结果作为数据呈现；常见标量查询不向用户暴露内部 JSON。"""
+        stdout = self._clip_tool_output(str(output.get("stdout", "")))
+        stderr = self._clip_tool_output(str(output.get("stderr", "")))
+        returncode = output.get("returncode")
+        if returncode == 0 and re.fullmatch(r"[-+]?\d+(?:\.\d+)?", stdout.strip()) and re.search(
+            r"(?:多少|几个|数量|计数|count)", question, re.IGNORECASE,
+        ):
+            return f"查询完成，结果是 **{stdout.strip()}**。"
+        lines = [f"命令执行完成，退出码：{returncode}。"]
+        if stdout:
+            lines.extend(["", "stdout：", stdout])
+        if stderr:
+            lines.extend(["", "stderr：", stderr])
+        if not stdout and not stderr:
+            lines.extend(["", "命令没有输出 stdout/stderr。"])
+        return "\n".join(lines)
 
     def _finalize_answer(
         self,
@@ -1425,37 +1454,50 @@ class DocumentQAAgent:
                     f"p50={usage['p50_total_tokens']}; p95={usage['p95_total_tokens']}"
                 ),
             ))
+        if pending_action:
+            pending_action = self.pending_actions.create(session_id, pending_action)
         assistant_message = self.session_store.append_message(session_id, "assistant", answer)
-        candidates = self.memory_extractor.extract(
-            user_message=question,
-            assistant_message=answer,
-            session_id=session_id,
+        memory_result = MemoryTurnManager(
+            self.memory_extractor, self.memory_store, self.session_store, self.memory_compactor,
+        ).process(
+            user_message=question, assistant_message=answer, session_id=session_id,
             source_message_ids=[user_message_id, assistant_message.message_id],
-            grounded=bool(evidences),
+            grounded=bool(evidences), steps=steps, pending_action=pending_action,
         )
-        new_memories = []
-        for item in candidates:
-            memory = self.memory_store.add_memory(**item)
-            if memory:
-                new_memories.append(memory)
-                self.session_store.append_session_item(session_id, memory.memory_type, memory.to_dict())
         steps.append(
             AgentStep(
                 "extract_memory",
-                "success",
-                f"本轮抽取并保存 {len(new_memories)} 条结构化记忆。",
+                "skipped" if memory_result.skipped else "success",
+                (f"记忆 Gate 跳过本轮抽取：{memory_result.reason}。" if memory_result.skipped else
+                 f"本轮抽取并保存 {memory_result.extracted} 条结构化记忆；gate={memory_result.reason}。"),
             )
-        )
-        compacted, _summary = self.memory_compactor.compact_if_needed(
-            session_id,
-            memories=self.memory_store.list_memories(session_id=session_id, limit=50),
         )
         steps.append(
             AgentStep(
                 "compact_memory",
                 "success",
-                "会话达到阈值，已更新滚动摘要。" if compacted else "当前会话未达到压缩阈值，暂不更新摘要。",
+                "会话达到阈值，已更新滚动摘要。" if memory_result.compacted else "当前会话未达到压缩阈值，暂不更新摘要。",
             )
+        )
+        # 将本轮可观测信息绑定到对应 assistant 消息。这样切换历史会话或导出时
+        # 仍能恢复 Steps/Evidence，而不是只在当前进程的内存面板中短暂存在。
+        self.session_store.update_message_metadata(
+            session_id,
+            assistant_message.message_id,
+            {
+                "steps": [
+                    {"name": step.name, "status": step.status, "detail": step.detail[:12000]}
+                    for step in steps
+                ],
+                "evidences": [
+                    {
+                        "source": item.source_label,
+                        "score": float(item.score),
+                        "text": item.text[:4000],
+                    }
+                    for item in evidences[:12]
+                ],
+            },
         )
         return AnswerResult(
             answer=answer,
@@ -1497,17 +1539,24 @@ class DocumentQAAgent:
         return totals
 
     def approve_pending_action(self, pending_action: dict, session_id: str | None = None) -> AnswerResult:
+        with self._operation_lock:
+            return self._approve_pending_action_unlocked(pending_action, session_id=session_id)
+
+    def _approve_pending_action_unlocked(
+        self, pending_action: dict, session_id: str | None = None,
+    ) -> AnswerResult:
         session = self.session_store.get_or_create(session_id)
-        question = f"用户确认执行工具：{pending_action.get('tool_name', '')}"
+        action_id = str(pending_action.get("action_id", ""))
+        approved = self.pending_actions.consume(action_id, session.session_id)
+        question = f"用户确认执行工具：{approved.tool_name}"
         user_message = self.session_store.append_message(session.session_id, "user", question)
         memory_context = self._load_memory_context(question, session.session_id)
         steps = [
-            AgentStep("approve_pending_action", "success", f"用户已确认：{pending_action.get('description', '')}"),
+            AgentStep("approve_pending_action", "success", f"用户已确认：{approved.description}"),
         ]
-        tool_name = str(pending_action.get("tool_name", ""))
-        kwargs = dict(pending_action.get("kwargs", {}))
-        kwargs["confirm"] = True
-        result = self.tool_registry.call(tool_name, **kwargs)
+        tool_name = approved.tool_name
+        kwargs = dict(approved.kwargs)
+        result = self.tool_registry.call_approved(tool_name, **kwargs)
         if not result.ok:
             steps.append(AgentStep("execute_approved_action", "failed", result.error or "工具执行失败"))
             answer = f"已获得确认，但工具执行失败：{tool_name}\n\n原因：{result.error or '未知错误'}"
@@ -1525,7 +1574,9 @@ class DocumentQAAgent:
         output = result.output or {}
         email_success = tool_name == "email.save_draft" and output.get("status") == "draft_saved"
         send_success = tool_name == "email.send" and output.get("status") == "sent"
-        if output.get("written") or email_success or send_success:
+        execution_success = bool(output.get("executed"))
+        move_success = tool_name == "files.apply_move" and bool(output.get("confirmed"))
+        if output.get("written") or email_success or send_success or execution_success or move_success:
             path = str(output.get("path", kwargs.get("path", "")))
             size = output.get("size", 0)
             steps.append(AgentStep("execute_approved_action", "success", f"已执行工具：{tool_name}"))
@@ -1539,6 +1590,16 @@ class DocumentQAAgent:
                     names = "、".join(Path(str(path)).name for path in attachment_paths)
                     attachment_status = f"\n\n已附加文件：{names}"
                 answer = f"已确认并发送邮件。\n\n{copy_status}{attachment_status}"
+            elif execution_success:
+                answer = json.dumps({
+                    "returncode": output.get("returncode"),
+                    "timed_out": output.get("timed_out", False),
+                    "duration_seconds": output.get("duration_seconds", 0),
+                    "stdout": self._clip_tool_output(str(output.get("stdout", ""))),
+                    "stderr": self._clip_tool_output(str(output.get("stderr", ""))),
+                }, ensure_ascii=False, indent=2)
+            elif move_success:
+                answer = f"已确认并移动文件：\n{output.get('source', '')}\n-> {output.get('destination', '')}"
             else:
                 answer = f"已确认并完成文件写入：{path}\n\n文件大小：{size} bytes。"
         else:
@@ -1548,7 +1609,18 @@ class DocumentQAAgent:
         self.session_store.append_message(
             session.session_id,
             "tool",
-            json.dumps({"tool_name": tool_name, "kwargs": kwargs, "output": output}, ensure_ascii=False),
+            json.dumps({
+                "tool_name": tool_name,
+                "argument_names": sorted(kwargs),
+                "result": {
+                    "status": output.get("status", ""),
+                    "path": output.get("path", ""),
+                    "returncode": output.get("returncode"),
+                    "timed_out": output.get("timed_out", False),
+                    "written": output.get("written", False),
+                    "executed": output.get("executed", False),
+                },
+            }, ensure_ascii=False),
             metadata={"tool_name": tool_name, "approved": True},
         )
         return self._finalize_answer(
@@ -1561,6 +1633,11 @@ class DocumentQAAgent:
             question=question,
             memory_context=memory_context,
         )
+
+    def cancel_pending_action(self, pending_action: dict, session_id: str | None = None) -> bool:
+        """取消一次性审批请求，避免同一 action_id 之后被重放。"""
+        session = self.session_store.get_or_create(session_id)
+        return self.pending_actions.cancel(str(pending_action.get("action_id", "")), session.session_id)
 
     def _extract_test_execution_request(self, question: str) -> dict[str, object] | None:
         normalized = question.lower()
@@ -1613,121 +1690,6 @@ class DocumentQAAgent:
         user_message_id: str,
         memory_context: AssembledContext,
     ) -> AnswerResult:
-        return self._answer_test_execution_with_runtime(
-            question=question,
-            test_execution_request=test_execution_request,
-            steps=steps,
-            session_id=session_id,
-            user_message_id=user_message_id,
-            memory_context=memory_context,
-        )
-        script = str(test_execution_request["script"])
-        timeout_seconds = int(test_execution_request.get("timeout_seconds", 120))
-        script_path = (self.workspace_root / script).resolve(strict=False)
-        steps.append(AgentStep("route_test_execution", "success", f"检测到测试执行请求：{script}"))
-
-        if not self._is_path_inside_workspace(script_path) or script_path.suffix.lower() != ".py":
-            steps.append(AgentStep("validate_test_target", "failed", f"测试脚本不在工作区内：{script_path}"))
-            return self._finalize_answer(
-                answer=f"未执行测试：{script_path}\n\n原因：当前只允许自动执行工作区内的 Python 测试脚本。",
-                evidences=[],
-                steps=steps,
-                used_llm=False,
-                session_id=session_id,
-                user_message_id=user_message_id,
-                question=question,
-                memory_context=memory_context,
-            )
-        if not script_path.exists():
-            steps.append(AgentStep("validate_test_target", "failed", f"测试脚本不存在：{script_path}"))
-            return self._finalize_answer(
-                answer=f"未执行测试：{script_path}\n\n原因：文件不存在，请确认测试脚本路径。",
-                evidences=[],
-                steps=steps,
-                used_llm=False,
-                session_id=session_id,
-                user_message_id=user_message_id,
-                question=question,
-                memory_context=memory_context,
-            )
-
-        steps.append(AgentStep("validate_test_target", "success", f"测试脚本已通过校验：{script_path}"))
-        result = self.tool_registry.call(
-            "shell.execute_command",
-            command=[sys.executable, str(script_path)],
-            timeout_seconds=timeout_seconds,
-            confirm=True,
-            cwd=str(self.workspace_root),
-        )
-        if not result.ok:
-            steps.append(AgentStep("execute_test", "failed", result.error or "测试执行工具调用失败"))
-            return self._finalize_answer(
-                answer=f"测试执行工具调用失败：{script_path}\n\n原因：{result.error or '未知错误'}",
-                evidences=[],
-                steps=steps,
-                used_llm=False,
-                session_id=session_id,
-                user_message_id=user_message_id,
-                question=question,
-                memory_context=memory_context,
-            )
-
-        output = result.output or {}
-        executed = bool(output.get("executed"))
-        returncode = output.get("returncode")
-        timed_out = bool(output.get("timed_out"))
-        stdout = str(output.get("stdout", ""))
-        stderr = str(output.get("stderr", ""))
-        duration = output.get("duration_seconds", 0)
-        status = "failed" if timed_out or returncode not in (0, None) else "success"
-        steps.append(
-            AgentStep(
-                "execute_test",
-                status,
-                f"测试执行完成：executed={executed}, returncode={returncode}, duration={duration}s",
-            )
-        )
-        tool_summary = self._format_test_execution_answer_v2(
-            script_path=script_path,
-            executed=executed,
-            timed_out=timed_out,
-            returncode=returncode,
-            stdout=stdout,
-            stderr=stderr,
-            duration=duration,
-        )
-        self.session_store.append_message(
-            session_id,
-            "tool",
-            tool_summary,
-            metadata={
-                "tool_name": "shell.execute_command",
-                "script": str(script_path),
-                "returncode": returncode,
-                "timed_out": timed_out,
-                "duration_seconds": duration,
-            },
-        )
-        return self._finalize_answer(
-            answer=tool_summary,
-            evidences=[],
-            steps=steps,
-            used_llm=False,
-            session_id=session_id,
-            user_message_id=user_message_id,
-            question=question,
-            memory_context=memory_context,
-        )
-
-    def _answer_test_execution_with_runtime(
-        self,
-        question: str,
-        test_execution_request: dict[str, object],
-        steps: list[AgentStep],
-        session_id: str,
-        user_message_id: str,
-        memory_context: AssembledContext,
-    ) -> AnswerResult:
         script = str(test_execution_request["script"])
         timeout_seconds = int(test_execution_request.get("timeout_seconds", 120))
         script_path = (self.workspace_root / script).resolve(strict=False)
@@ -1745,7 +1707,6 @@ class DocumentQAAgent:
                 "shell.execute_command",
                 command=[sys.executable, str(script_path)],
                 timeout_seconds=timeout_seconds,
-                confirm=True,
                 cwd=str(self.workspace_root),
             )
             if not result.ok:
@@ -1755,7 +1716,7 @@ class DocumentQAAgent:
         execution = self.runtime.run(
             [
                 PlanStep("validate_test_target", validate_target, "Validated test path and extension.", max_retries=0),
-                PlanStep("execute_test", execute_test, "Executed test command through the shell tool.", max_retries=1),
+                PlanStep("prepare_test", execute_test, "Prepared test command through the shell tool.", max_retries=1),
             ],
             {"script": script, "timeout_seconds": timeout_seconds},
         )
@@ -1775,6 +1736,23 @@ class DocumentQAAgent:
             )
 
         output = result.output or {}
+        permission = output.get("permission", {}) if isinstance(output, dict) else {}
+        if isinstance(permission, dict) and permission.get("requires_confirmation") and not output.get("executed"):
+            steps.append(AgentStep("request_test_confirmation", "waiting_human", "测试命令已准备，等待人工确认。"))
+            return self._finalize_generic_tool_result(
+                question=question,
+                tool_name="shell.execute_command",
+                tool_result=result,
+                call_arguments={
+                    "command": [sys.executable, str(script_path)],
+                    "timeout_seconds": timeout_seconds,
+                    "cwd": str(self.workspace_root),
+                },
+                steps=steps,
+                session_id=session_id,
+                user_message_id=user_message_id,
+                memory_context=memory_context,
+            )
         executed = bool(output.get("executed"))
         returncode = output.get("returncode")
         timed_out = bool(output.get("timed_out"))
@@ -1789,7 +1767,7 @@ class DocumentQAAgent:
                 f"executed={executed}, returncode={returncode}, duration={duration}s",
             )
         )
-        tool_summary = self._format_test_execution_answer_v2(
+        tool_summary = self._format_test_execution_answer(
             script_path=script_path,
             executed=executed,
             timed_out=timed_out,
@@ -1828,35 +1806,6 @@ class DocumentQAAgent:
         except ValueError:
             return False
 
-    def _format_test_execution_answer_v2(
-        self,
-        script_path: Path,
-        executed: bool,
-        timed_out: bool,
-        returncode: object,
-        stdout: str,
-        stderr: str,
-        duration: object,
-    ) -> str:
-        if not executed:
-            return f"测试未执行：{script_path}"
-        result_text = "通过" if returncode == 0 and not timed_out else "失败"
-        lines = [
-            f"测试执行结果：{result_text}",
-            "",
-            f"- 脚本：{script_path}",
-            f"- returncode：{returncode}",
-            f"- timed_out：{timed_out}",
-            f"- duration_seconds：{duration}",
-        ]
-        if stdout.strip():
-            lines.extend(["", "stdout：", self._clip_tool_output(stdout)])
-        if stderr.strip():
-            lines.extend(["", "stderr：", self._clip_tool_output(stderr)])
-        if not stdout.strip() and not stderr.strip():
-            lines.extend(["", "该测试没有输出 stdout/stderr。"])
-        return "\n".join(lines)
-
     def _format_test_execution_answer(
         self,
         script_path: Path,
@@ -1891,45 +1840,6 @@ class DocumentQAAgent:
         if len(text) <= limit:
             return text
         return text[:limit] + "\n... [output truncated]"
-
-    def _extract_local_document_target(self, question: str) -> str | None:
-        if self._is_file_write_instruction(question):
-            return None
-        patterns = [
-            r"([^\s\"'`]+?\.(?:md|markdown|txt|pdf|docx|pptx|xlsx|csv))",
-            r"[“\"]([^“”\"]+?\.(?:md|markdown|txt|pdf|docx|pptx|xlsx|csv))[”\"]",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, question, flags=re.IGNORECASE)
-            if match:
-                return self._clean_document_target(match.group(1))
-        return None
-
-    def _extract_local_document_targets(self, question: str) -> list[str]:
-        """提取多个文档目标，并将常见自然语言别名解析为工作区文件名。"""
-        # 目标文件不属于“要读取的多份文档”；“生成对比摘要”则仍允许多文档读取。
-        if re.search(r"(?:创建|新建|写入|写到|保存到|导出).{0,40}\.(?:md|markdown|txt|pdf|docx|pptx|xlsx|csv)", question, re.IGNORECASE):
-            return []
-        targets = re.findall(
-            r"[\"'`“”‘’]?([^\s\"'`“”‘’，,；;、]+?\.(?:md|markdown|txt|pdf|docx|pptx|xlsx|csv))[\"'`“”‘’]?",
-            question,
-            flags=re.IGNORECASE,
-        )
-        return list(dict.fromkeys(self._clean_document_target(target) for target in targets if target.strip()))
-
-    def _clean_document_target(self, target: str) -> str:
-        """去除紧贴文件名前的中文动作词，避免“请读取文件.md”被当成文件名。"""
-        cleaned = str(target or "").strip().strip('"\'`“”‘’')
-        cleaned = re.sub(
-            r"^(?:请你?|请帮我|麻烦(?:帮我)?|帮我|当前目录下的|本目录下的|目录下的)?"
-            r"(?:读取|阅读|打开|查看|访问|总结|分析|概括|说明|提取|介绍)",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-        # 文件扩展名之间的“和、与、以及”等是自然语言分隔词，不属于后一个文件名。
-        cleaned = re.sub(r"^(?:和|与|及|以及|还有|、)+", "", cleaned)
-        return cleaned.strip().strip('"\'`“”‘’')
 
     def _planned_document_targets(self, plan_preview: dict[str, object]) -> list[str]:
         """从 Planner 结构化参数读取多个文档，不维护业务文档别名表。"""
@@ -1995,18 +1905,28 @@ class DocumentQAAgent:
     @staticmethod
     def _planned_web_file_request(plan_preview: dict[str, object]) -> dict[str, str] | None:
         """仅从 Planner 的依赖节点识别网页检索后写文件。"""
-        knowledge = None
-        commit = None
+        knowledge: dict[str, object] | None = None
+        commits: list[dict[str, object]] = []
         for step in plan_preview.get("steps", []):
             if not isinstance(step, dict):
                 continue
             tools = step.get("allowed_tools", [])
-            if step.get("id") == "knowledge" and "web.search" in tools:
+            if "web.search" in tools:
                 knowledge = step
-            if step.get("id") == "commit" and "files.write_file" in tools:
-                commit = step
-        if not knowledge or not commit:
+            if "files.write_file" in tools:
+                commits.append(step)
+        if not knowledge or not commits:
             return None
+        paths = []
+        for commit in commits:
+            arguments = commit.get("arguments") if isinstance(commit.get("arguments"), dict) else {}
+            path = str(arguments.get("path") or "").strip()
+            if path:
+                paths.append(path)
+        unique_paths = list(dict.fromkeys(paths))
+        if len(unique_paths) > 1:
+            return {"error": "任务中出现多个不同的目标文件：" + "、".join(unique_paths)}
+        commit = next((item for item in commits if knowledge.get("id") in item.get("depends_on", [])), commits[-1])
         source = knowledge.get("arguments") if isinstance(knowledge.get("arguments"), dict) else {}
         destination = commit.get("arguments") if isinstance(commit.get("arguments"), dict) else {}
         return {"query": str(source.get("query") or "").strip(),
@@ -2054,6 +1974,8 @@ class DocumentQAAgent:
         session_id: str, user_message_id: str, memory_context: AssembledContext,
     ) -> AnswerResult:
         try:
+            if request.get("error"):
+                raise ValueError(str(request["error"]) + "。请确认搜索结果最终应写入哪个文件，本次未创建文件。")
             target = self._planned_output_path(question, request.get("path", ""))
             query = request.get("query", "").strip()
             if not query:
@@ -2138,12 +2060,10 @@ class DocumentQAAgent:
             if not isinstance(step, dict):
                 continue
             tools = step.get("allowed_tools", [])
-            if step.get("id") == "knowledge" and "knowledge.search" in tools:
+            if "knowledge.search" in tools:
                 knowledge = step
-            if step.get("id") == "commit" and "files.write_file" in tools:
+            if "files.write_file" in tools:
                 commit = step
-            elif step.get("id") == "commit":
-                return None
         if knowledge is None:
             return None
         source = knowledge.get("arguments") if isinstance(knowledge.get("arguments"), dict) else {}
@@ -2456,10 +2376,6 @@ class DocumentQAAgent:
         if not self._should_generate_file_write_content(requested_content):
             return requested_content, False, "literal"
 
-        local_content = self._local_generated_file_content(requested_content)
-        if local_content:
-            return local_content, True, "local_knowledge"
-
         response = self.client.chat(
             [
                 {
@@ -2485,7 +2401,9 @@ class DocumentQAAgent:
         )
         if response:
             return fix_mojibake(response).strip(), True, "llm"
-        return requested_content, False, "fallback_literal_no_generator"
+        raise RuntimeError(
+            "请求内容需要生成，但当前 LLM 未返回可写入正文；为避免把内容描述原样写入文件，本次停止写入。"
+        )
 
     def _should_generate_file_write_content(self, requested_content: str) -> bool:
         normalized = requested_content.lower()
@@ -2501,121 +2419,7 @@ class DocumentQAAgent:
         )
         return any(marker in normalized for marker in generation_markers)
 
-    def _local_generated_file_content(self, requested_content: str) -> str:
-        normalized = requested_content.lower()
-        if "静夜思" in normalized and "李白" in normalized:
-            return (
-                "静夜思\n\n"
-                "李白\n\n"
-                "床前明月光，\n"
-                "疑是地上霜。\n"
-                "举头望明月，\n"
-                "低头思故乡。\n"
-            )
-        return ""
-
     def _answer_file_write(
-        self,
-        question: str,
-        file_write_request: dict[str, object],
-        steps: list[AgentStep],
-        session_id: str,
-        user_message_id: str,
-        memory_context: AssembledContext,
-    ) -> AnswerResult:
-        return self._answer_file_write_with_runtime(
-            question=question,
-            file_write_request=file_write_request,
-            steps=steps,
-            session_id=session_id,
-            user_message_id=user_message_id,
-            memory_context=memory_context,
-        )
-        target_path = str(file_write_request["path"])
-        requested_content = str(file_write_request.get("content", ""))
-        overwrite = bool(file_write_request.get("overwrite", False))
-        steps.append(AgentStep("route_file_write", "success", f"检测到文件写入请求：{target_path}"))
-        content, generated_content, generation_method = self._materialize_file_write_content(
-            question=question,
-            target_path=target_path,
-            requested_content=requested_content,
-        )
-        if generated_content:
-            steps.append(AgentStep("generate_file_content", "success", f"已生成待写入内容：{generation_method}"))
-        result = self.tool_registry.call("files.write_file", path=target_path, content=content, overwrite=overwrite)
-        if not result.ok:
-            steps.append(AgentStep("write_file", "failed", result.error or "文件写入失败"))
-            answer = f"创建文件失败：{target_path}。原因：{result.error or '未知错误'}"
-            return self._finalize_answer(
-                answer=answer,
-                evidences=[],
-                steps=steps,
-                used_llm=False,
-                session_id=session_id,
-                user_message_id=user_message_id,
-                question=question,
-                memory_context=memory_context,
-            )
-
-        output = result.output or {}
-        if output.get("written"):
-            path = str(output.get("path", target_path))
-            size = output.get("size", 0)
-            steps.append(AgentStep("write_file", "success", f"已写入文件：{path}"))
-            if overwrite:
-                answer = f"已将内容写入文件：{path}\n\n文件大小：{size} bytes。"
-            else:
-                answer = f"已在当前工作目录创建文件：{path}\n\n文件大小：{size} bytes。"
-        else:
-            steps.append(AgentStep("write_file", "failed", str(output.get("message", "文件未写入"))))
-            permission = output.get("permission", {})
-            reasons = permission.get("reasons", []) if isinstance(permission, dict) else []
-            reason_text = "；".join(str(item) for item in reasons) if reasons else str(output.get("message", "文件未写入"))
-            if isinstance(permission, dict) and permission.get("requires_confirmation"):
-                pending_action = {
-                    "tool_name": "files.write_file",
-                    "kwargs": {
-                        "path": target_path,
-                        "content": content,
-                        "overwrite": overwrite,
-                    },
-                    "description": f"写入文件：{target_path}",
-                    "risk_level": permission.get("risk_level", "high"),
-                    "reasons": reasons,
-                }
-                answer = (
-                    f"该操作需要人工确认：{target_path}\n\n"
-                    f"原因：{reason_text}\n\n"
-                    "请在弹出的确认框中选择是否继续执行。"
-                )
-                return self._finalize_answer(
-                    answer=answer,
-                    evidences=[],
-                    steps=steps,
-                    used_llm=False,
-                    session_id=session_id,
-                    user_message_id=user_message_id,
-                    question=question,
-                    memory_context=memory_context,
-                    pending_action=pending_action,
-                )
-            answer = (
-                f"文件没有被创建：{target_path}\n\n"
-                f"原因：{output.get('message', '文件未写入')}\n"
-                f"权限判断：{reason_text}"
-            )
-        return self._finalize_answer(
-            answer=answer,
-            evidences=[],
-            steps=steps,
-            used_llm=False,
-            session_id=session_id,
-            user_message_id=user_message_id,
-            question=question,
-            memory_context=memory_context,
-        )
-
-    def _answer_file_write_with_runtime(
         self,
         question: str,
         file_write_request: dict[str, object],
@@ -2786,7 +2590,7 @@ class DocumentQAAgent:
             title = str(payload.get("title", target))
             contents.append((title, content))
             evidences.append(Evidence(
-                chunk_id=f"local_{abs(hash(str(resolved.output))) & 0xFFFFFFFF:x}",
+                chunk_id=f"local_{hashlib.sha256(str(resolved.output).encode('utf-8')).hexdigest()[:12]}",
                 doc_id=str(resolved.output), source_label=f"file:{title}",
                 text=content[:1800], score=1.0,
             ))
@@ -2813,6 +2617,7 @@ class DocumentQAAgent:
         session_id: str,
         user_message_id: str,
         memory_context: AssembledContext,
+        read_mode: str = "",
     ) -> AnswerResult | None:
         steps.append(AgentStep("route_local_document", "success", f"检测到本地文档请求：{local_document_target}"))
         resolved = self.tool_registry.call("files.resolve_document", target=local_document_target)
@@ -2851,23 +2656,41 @@ class DocumentQAAgent:
         document_path = str(payload.get("path", resolved_path))
         steps.append(AgentStep("read_local_document", "success", f"已读取文档内容：{document_path}"))
         evidence_text = content if len(content) <= 1800 else content[:1800] + "..."
-        doc_hash = abs(hash(document_path)) & 0xFFFFFFFF
+        doc_hash = hashlib.sha256(document_path.encode("utf-8")).hexdigest()[:12]
         evidences = [
             Evidence(
-                chunk_id=f"local_{doc_hash:x}",
-                doc_id=f"local_{doc_hash:x}",
+                chunk_id=f"local_{doc_hash}",
+                doc_id=f"local_{doc_hash}",
                 source_label=f"file:{title}",
                 text=evidence_text,
                 score=1.0,
             )
         ]
+        normalized_mode = self._local_document_read_mode(question, read_mode)
+        if normalized_mode == "verbatim":
+            if len(content) <= 12000:
+                answer = f"文件 `{title}` 的内容如下：\n\n{content}"
+            else:
+                answer = (
+                    f"文件 `{title}` 较长，以下显示前 12000 个字符：\n\n{content[:12000]}\n\n"
+                    f"[内容已截断，文件总字符数：{len(content)}]"
+                )
+            steps.append(AgentStep("present_local_document", "success", "按用户要求展示文件原文。"))
+            return self._finalize_answer(
+                answer=answer, evidences=evidences, steps=steps, used_llm=False,
+                session_id=session_id, user_message_id=user_message_id,
+                question=question, memory_context=memory_context,
+            )
         summary, used_llm = self._summarize_local_document(
             title=title,
             path=document_path,
             content=content,
             question=question,
+            read_mode=normalized_mode,
         )
-        steps.append(AgentStep("summarize_local_document", "success", "已基于本地文档内容生成总结。"))
+        step_name = "summarize_local_document" if normalized_mode == "summary" else "answer_local_document"
+        detail = "已基于本地文档内容生成总结。" if normalized_mode == "summary" else "已严格根据本地文档回答问题。"
+        steps.append(AgentStep(step_name, "success", detail))
         return self._finalize_answer(
             answer=summary,
             evidences=evidences,
@@ -2879,8 +2702,25 @@ class DocumentQAAgent:
             memory_context=memory_context,
         )
 
-    def _summarize_local_document(self, title: str, path: str, content: str, question: str) -> tuple[str, bool]:
+    @staticmethod
+    def _local_document_read_mode(question: str, requested: str) -> str:
+        if requested in {"verbatim", "summary", "question_answer"}:
+            return requested
+        if re.search(r"(?:总结|概括|摘要|提炼|要点)", question):
+            return "summary"
+        if re.search(r"(?:内容是什么|有哪些内容|显示内容|查看内容|原文|全文)", question):
+            return "verbatim"
+        return "question_answer"
+
+    def _summarize_local_document(
+        self, title: str, path: str, content: str, question: str, read_mode: str = "summary",
+    ) -> tuple[str, bool]:
         preview = content[:12000]
+        task_instruction = (
+            "请直接回答用户针对文件提出的问题；不要擅自改写成全文摘要。"
+            if read_mode == "question_answer" else
+            "请先给出 3-6 条要点总结，再给出一段简短整体概括；有章节时按章节组织。"
+        )
         response = self.client.chat(
             [
                 {
@@ -2897,11 +2737,8 @@ class DocumentQAAgent:
                         f"文件名：{title}\n"
                         f"文件路径：{path}\n"
                         f"用户问题：{question}\n\n"
-                        "请总结文件内容，要求：\n"
-                        "1. 先给出 3-6 条要点总结。\n"
-                        "2. 再给出一段简短整体概括。\n"
-                        "3. 如果文档里包含结构化章节，请尽量按章节组织。\n"
-                        "4. 不要编造文件中没有的信息。\n\n"
+                        f"任务要求：{task_instruction}\n"
+                        "不要编造文件中没有的信息。\n\n"
                         f"文件内容：\n{preview}"
                     ),
                 },
@@ -2926,6 +2763,12 @@ class DocumentQAAgent:
         return "\n".join(lines)
 
     def research(self, topic: str, session_id: str | None = None, max_results: int | None = None) -> ResearchResult:
+        with self._operation_lock:
+            return self._research_unlocked(topic, session_id=session_id, max_results=max_results)
+
+    def _research_unlocked(
+        self, topic: str, session_id: str | None = None, max_results: int | None = None,
+    ) -> ResearchResult:
         session = self.session_store.get_or_create(session_id)
         user_message = self.session_store.append_message(session.session_id, "user", f"网页调研：{topic}")
         memory_context = self._load_memory_context(topic, session.session_id)
@@ -2954,62 +2797,24 @@ class DocumentQAAgent:
         )
         if artifact_memory:
             self.session_store.append_session_item(session.session_id, artifact_memory.memory_type, artifact_memory.to_dict())
-        candidates = self.memory_extractor.extract(
-            user_message=f"网页调研：{topic}",
-            assistant_message=assistant_content,
+        memory_result = MemoryTurnManager(
+            self.memory_extractor, self.memory_store, self.session_store, self.memory_compactor,
+        ).process(
+            user_message=f"网页调研：{topic}", assistant_message=assistant_content,
             session_id=session.session_id,
             source_message_ids=[user_message.message_id, assistant_message.message_id],
+            grounded=bool(result.evidences), steps=result.steps,
         )
-        saved_count = 1 if artifact_memory else 0
-        for item in candidates:
-            memory = self.memory_store.add_memory(**item)
-            if memory:
-                saved_count += 1
-                self.session_store.append_session_item(session.session_id, memory.memory_type, memory.to_dict())
+        saved_count = memory_result.extracted + (1 if artifact_memory else 0)
         result.steps.append(AgentStep("extract_memory", "success", f"调研任务抽取并保存 {saved_count} 条结构化记忆。"))
-        compacted, _summary = self.memory_compactor.compact_if_needed(
-            session.session_id,
-            memories=self.memory_store.list_memories(session_id=session.session_id, limit=50),
-        )
         result.steps.append(
             AgentStep(
                 "compact_memory",
                 "success",
-                "会话达到阈值，已更新滚动摘要。" if compacted else "当前会话未达到压缩阈值，暂不更新摘要。",
+                "会话达到阈值，已更新滚动摘要。" if memory_result.compacted else "当前会话未达到压缩阈值，暂不更新摘要。",
             )
         )
         return result
-
-    def _extract_web_research_request(self, question: str) -> str | None:
-        normalized = question.strip()
-        lowered = normalized.lower()
-        markers = (
-            "网上搜索",
-            "联网搜索",
-            "网页搜索",
-            "搜索一下",
-            "查一下",
-            "帮我搜索",
-            "帮我查",
-            "网上查",
-            "联网查",
-            "调研一下",
-            "生成调研报告",
-            "web search",
-            "search web",
-            "online search",
-        )
-        if not any(marker in lowered for marker in markers):
-            return None
-        topic = re.sub(
-            r"^(请|麻烦|帮我|给我|帮忙)?\s*(在网上|联网|网页|web|online)?\s*(搜索|查找|查询|查一下|搜索一下|调研一下|调研)\s*",
-            "",
-            normalized,
-            flags=re.IGNORECASE,
-        )
-        topic = re.sub(r"(的)?相关信息$", "", topic).strip()
-        topic = topic.strip(" ，。；;:：")
-        return topic or normalized
 
     def _answer_web_research_request(
         self,
@@ -3036,65 +2841,6 @@ class DocumentQAAgent:
             question=question,
             memory_context=memory_context,
         )
-
-    def _classify_intent(self, question: str) -> tuple[str, str]:
-        prompt = (
-            "判断用户问题是否需要检索本地文档后再回答。\n"
-            "如果问题询问当前导入文档、论文、材料、PDF、PPT、表格、报告里的内容，返回 document_qa。\n"
-            "如果问题是通用知识、闲聊、写作建议、编程概念、普通解释，返回 direct_answer。\n"
-            "只输出 JSON：{\"intent\":\"document_qa|direct_answer\",\"reason\":\"简短原因\"}\n\n"
-            f"用户问题：{question}"
-        )
-        response = self.client.chat(
-            [
-                {"role": "system", "content": "你是 DeskPilot 的意图识别器，只输出 JSON。"},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.0,
-        )
-        if response:
-            parsed = self._parse_intent_json(response)
-            if parsed:
-                return parsed
-        return self._heuristic_intent(question)
-
-    def _parse_intent_json(self, response: str) -> tuple[str, str] | None:
-        match = re.search(r"\{.*\}", response, flags=re.DOTALL)
-        if not match:
-            return None
-        try:
-            data = json.loads(match.group(0))
-        except json.JSONDecodeError:
-            return None
-        intent = str(data.get("intent", "")).strip()
-        if intent not in {"document_qa", "direct_answer"}:
-            return None
-        reason = str(data.get("reason", "")).strip() or "LLM 判断"
-        return intent, reason
-
-    def _heuristic_intent(self, question: str) -> tuple[str, str]:
-        doc_markers = (
-            "文档",
-            "材料",
-            "论文",
-            "pdf",
-            "ppt",
-            "表格",
-            "报告",
-            "这批",
-            "这个文件",
-            "上述",
-            "里面",
-            "提到",
-            "根据",
-            "总结这",
-            "引用",
-            "证据",
-        )
-        normalized = question.lower()
-        if any(marker in normalized for marker in doc_markers):
-            return "document_qa", "命中文档相关关键词，使用本地文档检索。"
-        return "direct_answer", "未命中文档相关关键词，作为通用问题直接回答。"
 
     def _direct_answer(self, question: str, memory_context: AssembledContext) -> str:
         return self.client.chat(
@@ -3173,6 +2919,46 @@ class DocumentQAAgent:
             preview = " | ".join(line[:100] for line in uncovered[:2])
             reasons.append(f"有 {len(uncovered)} 个事实段落或列表项缺少引用：{preview}")
         return not reasons, reasons
+
+    def _verify_citation_support(self, answer: str, evidences: list[Evidence]) -> tuple[bool, str]:
+        """可选的高可靠校验：判断被引用结论是否真的由对应 Evidence 支持。
+
+        默认关闭，避免普通问答增加一次模型调用。校验器异常时保留确定性引用检查的
+        结果，不把网络或 JSON 格式故障误判为回答不可信。
+        """
+        evidence_text = "\n\n".join(
+            f"[{index}] {item.source_label}\n{item.text[:1800]}"
+            for index, item in enumerate(evidences[:8], start=1)
+        )
+        response = self.client.chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是引用支持审计器。逐条核对回答中的事实和引用证据，只输出 JSON："
+                        '{"supported":true|false,"unsupported_claims":["..."]}。'
+                        "不得使用常识、历史会话或外部知识。"
+                    ),
+                },
+                {"role": "user", "content": f"Evidence:\n{evidence_text}\n\n回答：\n{answer[:6000]}"},
+            ],
+            temperature=0.0,
+            max_tokens=500,
+        )
+        if not response:
+            return True, f"校验器调用失败，已沿用确定性引用检查：{self.client.last_error or '无返回'}"
+        try:
+            payload = parse_json_value(response, dict)
+            if not isinstance(payload, dict):
+                raise ValueError("引用校验器没有返回合法 JSON 对象")
+            supported = bool(payload.get("supported"))
+            unsupported = payload.get("unsupported_claims", [])
+            detail = "引用事实支持检查通过。" if supported else (
+                "存在未被证据支持的结论：" + "；".join(str(value) for value in unsupported[:5])
+            )
+            return supported, detail
+        except (ValueError, TypeError, AttributeError) as exc:
+            return True, f"校验器返回无法解析，已沿用确定性引用检查：{type(exc).__name__}"
 
     def _is_citation_exempt_line(self, line: str) -> bool:
         """识别标题和组织句；这些文本不承载独立事实，不要求单独引用。"""

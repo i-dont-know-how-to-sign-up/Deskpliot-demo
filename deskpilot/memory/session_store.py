@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import uuid
 import shutil
+import re
 from pathlib import Path
+from typing import Any
 
 from .memory_models import SessionInfo, SessionMessage
 from ..core.config import MEMORY_SESSIONS_DIR, ensure_dirs
@@ -97,6 +99,17 @@ class SessionStore:
         for message in self.read_messages(session_id):
             role = "用户" if message.role == "user" else "DeskPilot"
             lines.extend([f"## {role}", "", message.content, ""])
+            steps = message.metadata.get("steps", []) if isinstance(message.metadata, dict) else []
+            if message.role == "assistant" and isinstance(steps, list) and steps:
+                lines.extend(["### Steps", ""])
+                for index, step in enumerate(steps, start=1):
+                    if not isinstance(step, dict):
+                        continue
+                    lines.extend([
+                        f"{index}. [{step.get('status', '')}] {step.get('name', '')}",
+                        f"   {step.get('detail', '')}",
+                    ])
+                lines.append("")
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text("\n".join(lines), encoding="utf-8")
         return output_path
@@ -107,12 +120,32 @@ class SessionStore:
             message_id=f"msg_{uuid.uuid4().hex}",
             session_id=info.session_id,
             role=role,
-            content=fix_mojibake(content),
-            metadata=metadata or {},
+            content=_redact_value(fix_mojibake(content), max_text=12000),
+            metadata=_redact_value(metadata or {}),
         )
         self._append_jsonl(self._session_dir(info.session_id) / "messages.jsonl", message.to_dict())
         self._touch_session(info.session_id, content if role == "user" else None)
         return message
+
+    def update_message_metadata(self, session_id: str, message_id: str, metadata: dict) -> None:
+        """原子更新单条消息元数据，用于持久化本轮 Steps 和 Evidence。"""
+        path = self._session_dir(session_id) / "messages.jsonl"
+        rows = self._read_jsonl(path)
+        updated = False
+        for row in rows:
+            if str(row.get("message_id")) == message_id:
+                current = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+                row["metadata"] = _redact_value({**current, **metadata})
+                updated = True
+                break
+        if not updated:
+            return
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        temporary.replace(path)
 
     def append_session_item(self, session_id: str, kind: str, payload: dict) -> None:
         file_map = {
@@ -125,7 +158,7 @@ class SessionStore:
         filename = file_map.get(kind)
         if not filename:
             return
-        self._append_jsonl(self._session_dir(session_id) / filename, payload)
+        self._append_jsonl(self._session_dir(session_id) / filename, _redact_value(payload))
 
     def read_messages(self, session_id: str) -> list[SessionMessage]:
         return [
@@ -218,3 +251,32 @@ class SessionStore:
     def _write_json(self, path: Path, payload: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+_SENSITIVE_KEY = re.compile(r"(?:api[_-]?key|password|passwd|authorization|access[_-]?token|refresh[_-]?token|secret)", re.I)
+_INLINE_SECRET = re.compile(
+    r"(?i)\b(api[_-]?key|password|passwd|authorization|access[_-]?token|refresh[_-]?token|secret)"
+    r"\s*[:=]\s*([^\s,;]+)"
+)
+
+
+def _redact_sensitive(text: str) -> str:
+    return _INLINE_SECRET.sub(lambda match: f"{match.group(1)}=[REDACTED]", str(text))
+
+
+def _redact_value(value: Any, *, max_text: int = 12000) -> Any:
+    """递归脱敏持久化数据，并限制工具正文、代码和输出的磁盘体积。"""
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            result[key_text] = "[REDACTED]" if _SENSITIVE_KEY.search(key_text) else _redact_value(item, max_text=max_text)
+        return result
+    if isinstance(value, list):
+        return [_redact_value(item, max_text=max_text) for item in value[:200]]
+    if isinstance(value, tuple):
+        return [_redact_value(item, max_text=max_text) for item in value[:200]]
+    if isinstance(value, str):
+        redacted = _redact_sensitive(value)
+        return redacted if len(redacted) <= max_text else redacted[:max_text] + "\n... [persisted value truncated]"
+    return value

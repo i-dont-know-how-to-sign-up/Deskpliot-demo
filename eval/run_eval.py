@@ -169,7 +169,17 @@ def run_case(case: dict[str, Any], mode: str) -> dict[str, Any]:
                     result = agent.answer(str(message), session_id=session_id)
                     session_id = result.session_id
             assert result is not None
-            scored = score_case(case, result, workspace=temp_root / "workspace")
+            pending_arguments = None
+            pending = result.pending_action or {}
+            if pending.get("action_id"):
+                item = agent.pending_actions.inspect(str(pending["action_id"]), result.session_id)
+                pending_arguments = dict(item.kwargs) if item is not None else {}
+            scored = score_case(
+                case,
+                result,
+                workspace=temp_root / "workspace",
+                pending_arguments=pending_arguments,
+            )
             scored["latency_ms"] = round((time.perf_counter() - started) * 1000)
             clients = (agent.client, agent.index.client)
             usages = [client.token_usage for client in clients]

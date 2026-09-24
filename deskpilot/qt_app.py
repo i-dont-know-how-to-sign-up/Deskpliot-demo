@@ -22,7 +22,12 @@ except ImportError as exc:  # pragma: no cover - 给未安装 GUI 依赖时提�
 
 
 def _step_dict(step: Any) -> dict[str, str]:
-    return {"name": str(step.name), "status": str(step.status), "detail": str(step.detail)}
+    detail = str(step.detail)
+    # retrieval_trace 可能包含数万字符。UI 保留足够的审计信息并限制布局成本，
+    # 完整内容仍会持久化到会话 metadata 和导出文件中。
+    if len(detail) > 6000:
+        detail = detail[:6000] + "\n... [UI detail truncated; export session for the persisted trace]"
+    return {"name": str(step.name), "status": str(step.status), "detail": detail}
 
 
 def _evidence_dict(item: Any) -> dict[str, Any]:
@@ -81,6 +86,7 @@ class DeskPilotBridge(QObject):
     memoriesChanged = Signal()
     statsChanged = Signal()
     statusChanged = Signal()
+    busyChanged = Signal()
     contextChanged = Signal()
     confirmRequested = Signal(str, str, str)
     errorRaised = Signal(str)
@@ -102,6 +108,7 @@ class DeskPilotBridge(QObject):
         self._memories: list[dict[str, Any]] = []
         self._stats: dict[str, Any] = {}
         self._status = "就绪"
+        self._busy = False
         self._context = ""
         self._stream_base: list[dict[str, str]] = []
         self._stream_text = ""
@@ -112,7 +119,7 @@ class DeskPilotBridge(QObject):
         # 所有后台任务都通过 signal 回到 Qt 主线程，再更新 QML 属性。
         self._resultReady.connect(self._start_stream)
         self._indexReady.connect(self._index_finished)
-        self._errorReady.connect(self.errorRaised)
+        self._errorReady.connect(self._background_failed)
         self._refresh_all()
         self._load_session_messages()
 
@@ -126,11 +133,31 @@ class DeskPilotBridge(QObject):
     memories = Property("QVariantList", lambda self: self._get("memories"), notify=memoriesChanged)
     stats = Property("QVariantMap", lambda self: self._get("stats"), notify=statsChanged)
     status = Property("QString", lambda self: self._get("status"), notify=statusChanged)
+    busy = Property(bool, lambda self: self._busy, notify=busyChanged)
     context = Property("QString", lambda self: self._get("context"), notify=contextChanged)
 
     def _set_status(self, value: str) -> None:
         self._status = value
         self.statusChanged.emit()
+
+    def _begin_operation(self, status: str) -> bool:
+        """共享 Agent 和索引采用单任务串行策略，避免跨线程状态串扰。"""
+        if self._busy:
+            return False
+        self._busy = True
+        self.busyChanged.emit()
+        self._set_status(status)
+        return True
+
+    def _end_operation(self) -> None:
+        if self._busy:
+            self._busy = False
+            self.busyChanged.emit()
+
+    def _background_failed(self, message: str) -> None:
+        self._end_operation()
+        self._set_status("操作失败")
+        self.errorRaised.emit(message)
 
     def _refresh_all(self) -> None:
         self._refresh_sessions()
@@ -176,11 +203,27 @@ class DeskPilotBridge(QObject):
         self.memoriesChanged.emit()
 
     def _load_session_messages(self) -> None:
+        messages = self.agent.session_store.read_messages(self.current_session_id)
         self._messages = [
             {"role": item.role, "content": item.content}
-            for item in self.agent.session_store.read_messages(self.current_session_id)
+            for item in messages
         ]
         self._message_model.reset_messages(self._messages)
+        assistant = next((item for item in reversed(messages) if item.role == "assistant"), None)
+        metadata = assistant.metadata if assistant and isinstance(assistant.metadata, dict) else {}
+        raw_steps = metadata.get("steps", [])
+        raw_evidences = metadata.get("evidences", [])
+        self._steps = [dict(item) for item in raw_steps if isinstance(item, dict)]
+        self._evidences = [
+            {
+                "source": str(item.get("source", "")),
+                "score": f"{float(item.get('score', 0.0)):.4f}",
+                "text": str(item.get("text", "")),
+            }
+            for item in raw_evidences if isinstance(item, dict)
+        ]
+        self.stepsChanged.emit()
+        self.evidencesChanged.emit()
 
     def _set_messages(self, messages: list[dict[str, str]]) -> None:
         self._messages = list(messages)
@@ -215,6 +258,9 @@ class DeskPilotBridge(QObject):
         self._stream_generation += 1
         generation = self._stream_generation
         self._set_status("正在生成")
+        # Agent 已经完成执行，Steps/Evidence 应立即可见，无需等待最多约 6 秒的
+        # 逐字动画结束。聊天文本仍保持增量显示。
+        self._set_result_panels(result)
         # 流开始时只重置一次，后续每一帧只更新最后一个 delegate。
         self._set_messages(self._stream_base + [{"role": "assistant", "content": ""}])
         self._stream_tick(generation)
@@ -233,9 +279,9 @@ class DeskPilotBridge(QObject):
         result = self._stream_result
         self._stream_result = None
         if result is not None:
-            self._set_result_panels(result)
             self._set_status("回答完成")
             self._maybe_request_confirmation(result)
+        self._end_operation()
 
     def _maybe_request_confirmation(self, result: Any) -> None:
         pending = getattr(result, "pending_action", None)
@@ -256,10 +302,13 @@ class DeskPilotBridge(QObject):
     @Slot(str)
     def ask(self, question: str) -> None:
         question = question.strip()
-        if not question:
+        if not question or not self._begin_operation("正在处理"):
             return
         session_id = self.current_session_id
-        self._set_status("正在处理")
+        self._steps = []
+        self._evidences = []
+        self.stepsChanged.emit()
+        self.evidencesChanged.emit()
         self._set_messages(self._messages + [{"role": "user", "content": question}, {"role": "assistant", "content": "正在处理..."}])
         threading.Thread(target=self._run_answer, args=(question, session_id), daemon=True).start()
 
@@ -273,10 +322,9 @@ class DeskPilotBridge(QObject):
     @Slot(str, int)
     def research(self, topic: str, limit: int = 5) -> None:
         topic = topic.strip()
-        if not topic:
+        if not topic or not self._begin_operation("正在调研"):
             return
         session_id = self.current_session_id
-        self._set_status("正在调研")
         self._set_messages(self._messages + [{"role": "user", "content": f"网页调研：{topic}"}, {"role": "assistant", "content": "正在搜索网页..."}])
         threading.Thread(target=self._run_research, args=(topic, session_id, max(1, min(limit, 10))), daemon=True).start()
 
@@ -360,17 +408,25 @@ class DeskPilotBridge(QObject):
 
     @Slot()
     def chooseIndexFile(self) -> None:
+        if not self._begin_operation("正在建立索引"):
+            return
         path, _ = QFileDialog.getOpenFileName(
             None, "选择文档", str(ROOT_DIR), "Documents (*.pdf *.docx *.pptx *.xlsx *.csv *.md *.txt);;All files (*)"
         )
         if path:
             threading.Thread(target=self._index_file, args=(Path(path),), daemon=True).start()
+        else:
+            self._end_operation()
 
     @Slot()
     def chooseIndexFolder(self) -> None:
+        if not self._begin_operation("正在建立索引"):
+            return
         path = QFileDialog.getExistingDirectory(None, "选择文件夹", str(ROOT_DIR))
         if path:
             threading.Thread(target=self._index_folder, args=(Path(path),), daemon=True).start()
+        else:
+            self._end_operation()
 
     def _index_file(self, path: Path) -> None:
         try:
@@ -388,6 +444,7 @@ class DeskPilotBridge(QObject):
             self._errorReady.emit(str(exc))
 
     def _index_finished(self, detail: str) -> None:
+        self._end_operation()
         self._set_status("索引完成")
         self._refresh_stats()
         self._steps = [{"name": "index_documents", "status": "success", "detail": detail}]
@@ -395,17 +452,18 @@ class DeskPilotBridge(QObject):
 
     @Slot()
     def clearIndex(self) -> None:
+        if self._busy:
+            return
         self.index.clear()
         self._refresh_stats()
         self._set_status("索引已清空")
 
     @Slot(str)
     def approveAction(self, note: str = "") -> None:
-        if not self._pending_action:
+        if not self._pending_action or not self._begin_operation("正在执行已确认操作"):
             return
         pending = self._pending_action
         self._pending_action = None
-        self._set_status("正在执行已确认操作")
         threading.Thread(
             target=self._run_approved_action,
             args=(pending, self.current_session_id),
@@ -415,7 +473,10 @@ class DeskPilotBridge(QObject):
     @Slot()
     def cancelAction(self) -> None:
         """取消聊天中的待审批动作，不执行任何外部副作用。"""
+        pending = self._pending_action
         self._pending_action = None
+        if pending:
+            self.agent.cancel_pending_action(pending, session_id=self.current_session_id)
         if self._messages and self._messages[-1].get("role") == "confirmation":
             cancelled = dict(self._messages[-1])
             cancelled["role"] = "assistant"

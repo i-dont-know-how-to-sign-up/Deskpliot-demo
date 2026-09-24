@@ -268,7 +268,18 @@ class DocumentIndex:
             compact_title = normalized_title.replace(" ", "")
             exact_phrase = len(normalized_title) >= 4 and f" {normalized_title} " in padded_query
             compact_variant = len(compact_title) >= 4 and compact_title in query_tokens
-            if exact_phrase or compact_variant:
+            aliases = {
+                str(item).casefold() for item in document.metadata.get("aliases", [])
+                if str(item).strip()
+            }
+            # 兼容旧索引：无需重新导入即可从文档开头的“全称 (缩写)”提取别名。
+            for match in re.finditer(
+                r"\b([A-Z][A-Za-z0-9-]*(?:\s+[A-Z][A-Za-z0-9-]*){1,8})\s*\(([A-Z][A-Z0-9-]{1,9})\)",
+                document.content[:6000],
+            ):
+                aliases.add(match.group(2).casefold())
+            alias_match = any(alias in query_tokens for alias in aliases)
+            if exact_phrase or compact_variant or alias_match:
                 matches.add(doc_id)
         return matches
 

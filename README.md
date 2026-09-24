@@ -47,8 +47,10 @@ DeskPilot 是一个本地优先、面向个人办公场景的桌面 Agent。它�
   -> Embedding 与 SQLite Catalog
   -> Query Analyzer / Query Rewrite
   -> Dense + SQLite FTS5/BM25
-  -> RRF 融合与正文覆盖重排
-  -> 文档覆盖和参考文献过滤
+  -> RRF 融合
+  -> Lexical / Cross-Encoder / ColBERT / API Reranker
+  -> Sentence Window / Parent 上下文扩展
+  -> 相关性阈值 + 覆盖感知 MMR
   -> Evidence 上下文
   -> LLM 回答
   -> 引用完整性校验与来源列表
@@ -61,7 +63,9 @@ DeskPilot 是一个本地优先、面向个人办公场景的桌面 Agent。它�
 - SQLite Catalog 保存文档版本、Chunk、Parent、Sentence Window、元数据、Embedding Cache 和 FTS5 索引。
 - 小型个人知识库默认使用精确向量扫描，稀疏检索使用 SQLite FTS5/BM25。
 - 多查询检索只在复杂任务触发；HyDE 已实现但默认关闭。
-- RRF 后根据正文对查询实词的覆盖进行轻量重排，避免标题、表格和参考文献占据 Top-K。
+- RRF 后通过统一 Reranker 接口重排有界 child 候选；默认 `lexical` 零依赖实现，真实 Cross-Encoder 和 API provider 按配置启用，provider 故障自动回退 RRF。
+- 事实/步骤问题使用 Sentence Window，总结/比较问题使用 Parent expansion；扩展不跨结构 parent，并受单条 Evidence token 预算约束。
+- 最终以相关性阈值、显式文档覆盖、子查询覆盖和 MMR 选择证据，同 parent 窗口会合并。
 - 回答必须引用真实 Evidence；会话记忆不能冒充文档证据。引用失败会尝试一次受限修订，仍失败才降级为本地证据摘要。
 - API 不可用时可使用本地 hash embedding 和抽取式摘要维持基础 Demo。
 
@@ -71,7 +75,9 @@ DeskPilot 是一个本地优先、面向个人办公场景的桌面 Agent。它�
 
 - 原始消息以会话形式持久化，支持最近对话窗口和滚动摘要。
 - 从对话中提取事实、偏好、决策、待办和产物等结构化记忆。
+- Memory Gate 会跳过低价值的简单问答抽取，减少额外模型延迟；工具副作用、明确偏好/决策和有证据结果仍会进入抽取。
 - 记忆具有 `pending`、`active`、`superseded`、`deleted` 等生命周期状态。
+- 偏好与决策按稳定 `topic:*` 标签优先消解冲突；任务、产物和事实按类型与作用域设置默认 TTL，过期项不再参与检索。
 - 低置信度信息进入待审批区；“不要记住”“只是举例”等内容会被过滤。
 - 支持 SQLite 内置向量存储，也可选择 Chroma。
 - Context Builder 按角色为 Router、Planner、Answer、Memory 等组件装配不同上下文。
@@ -111,7 +117,7 @@ DeskPilot 内部 Tool Registry 直接复用邮件 MCP 业务层，因此启动�
 - 文档定位、读取、文件夹扫描、分类和整理计划。
 - 写入 TXT、Markdown、DOCX、PDF，支持覆盖和附件产物。
 - 本地知识库检索和文件夹批量建索引。
-- Python 代码执行，带超时和人工确认。
+- Python 代码执行，带超时、明显危险语法静态检查和人工确认；静态检查不是安全沙箱。
 - Windows PowerShell / Linux Shell 命令执行，带白名单、风险分级、超时和工作目录限制。
 - 获取活动窗口标题、打开文件/目录、打开 URL。
 - 网页搜索、网页读取和主题调研。
@@ -122,8 +128,8 @@ DeskPilot 内部 Tool Registry 直接复用邮件 MCP 业务层，因此启动�
 - 工作区安全目录内的新文件写入通常属于低风险。
 - 覆盖文件、移动文件、修改安全目录外内容属于中高风险，需要确认。
 - C 盘或工作区外写入会请求显式确认。
-- Python 与高风险命令执行必须确认。
-- 明确的破坏性命令会被直接阻断，不能靠确认绕过。
+- Python 与高风险命令执行必须通过应用生成的一次性审批请求确认；LLM 工具参数不能自行授予权限。
+- Shell 中明确的破坏性命令，以及 Python 中已识别的删除、子进程、动态执行和网络调用会被阻断；任意 Python 的完整隔离仍需容器或低权限执行环境。
 
 实现入口：`deskpilot/tools/`。
 
@@ -132,7 +138,8 @@ DeskPilot 内部 Tool Registry 直接复用邮件 MCP 业务层，因此启动�
 - Planner 先生成结构化执行计划和步骤依赖。
 - MultiAgentRouter 根据任务复杂度、预计耗时、外部工具依赖和结果质量要求决定执行方式。
 - 当前使用知识、执行和提交等较粗粒度角色，避免 Agent 划分过细。
-- Supervisor 校验计划、控制允许工具、检查中间产物并处理有限重试。
+- 邮件类“资料获取 → 正文生成 → 发送/草稿审批”复合任务已由 PlanExecutor 绑定节点 handler，并通过 Supervisor 执行依赖、重试、工具/Token/时间预算和人工确认状态。
+- 其他计划任务仍由 Orchestrator 兼容执行链处理，将按工作流逐步迁移，避免一次性替换造成已有文件和 RAG 功能回归。
 - 简单或实时任务不使用 Reflection；高质量、低实时性任务为后续 Reflection Agent 预留接口。
 - 外部副作用仍由统一权限层和人工确认控制。
 
@@ -150,7 +157,7 @@ DeskPilot 内部 Tool Registry 直接复用邮件 MCP 业务层，因此启动�
 | 记忆存储 | JSONL、SQLite、可选 Chroma |
 | 浏览器 | Playwright，可复用 Chrome/Chromium |
 | 邮件 | IMAP、SMTP、可选 MCP stdio Server |
-| 测试与评测 | Python 回归脚本、DeskPilotBench、RAG P0/P1 检索评测 |
+| 测试与评测 | Python 回归脚本、152 条 DeskPilotBench、RAG P0/P1/P2 检索评测、GitHub Actions CI |
 
 当前核心实现没有引入 LangChain、LlamaIndex 或 LangGraph，以便直接观察路由、检索、上下文和 Agent Loop 的内部行为。
 
@@ -243,6 +250,8 @@ ALLOW_LOCAL_FALLBACK=true
 
 也兼容通用的 `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`、`EMBEDDING_API_KEY`、`EMBEDDING_BASE_URL` 和 `EMBEDDING_MODEL`。
 
+模型 HTTP 请求对 429、502、503、504 和瞬时网络错误默认最多尝试 3 次，并使用指数退避。可通过 `LLM_API_MAX_ATTEMPTS`（1-5）和 `LLM_API_RETRY_BASE_SECONDS` 调整。
+
 未配置 API Key 时，文档索引可降级为本地 hash embedding，RAG 回答降级为证据摘要；通用知识问答仍需要可用 LLM。
 
 ### RAG 与记忆配置
@@ -256,11 +265,18 @@ RAG_MULTI_QUERY_ENABLED=true
 RAG_HYDE_ENABLED=false
 RAG_DENSE_PROVIDER=exact
 RAG_DENSE_MIN_SCORE=0.08
+RAG_P2_ENABLED=true
+RAG_RERANK_PROVIDER=lexical
+RAG_CONTEXT_EXPANSION_ENABLED=true
+RAG_FINAL_TOP_K=6
+RAG_MMR_LAMBDA=0.72
 ```
 
 - `MEMORY_VECTOR_PROVIDER` 可设为 `auto`、`sqlite` 或 `chroma`。
 - `RAG_HYBRID_ENABLED=false` 可回退到旧检索路径。
 - 当前 Dense Provider 为小规模知识库的精确扫描，不是 ANN 向量数据库。
+- `RAG_P2_ENABLED=false` 可回退到 P1 RRF；`RAG_RERANK_PROVIDER=disabled` 只关闭精排。
+- `cross_encoder` 不会自动下载模型，必须在 `RAG_RERANK_MODEL` 配置本地模型目录。
 - 完整分块、窗口、批处理和 RRF 参数见 `.env.example`。
 
 ### 网页搜索配置
@@ -373,6 +389,7 @@ RAG 检索层消融：
 ```powershell
 .\.conda\deskpilot-py311\python.exe -m eval.run_rag_p0_eval --count 8
 .\.conda\deskpilot-py311\python.exe -m eval.run_rag_p1_eval --mode offline --strategy all
+.\.conda\deskpilot-py311\python.exe -m eval.run_rag_p2_eval --count 12 --mode offline --provider auto --expansion auto
 ```
 
 评测报告默认写入 `eval/reports/`，逐用例明细写入 `eval/runs/`。报告和运行结果属于生成产物，不应提交。
@@ -381,6 +398,7 @@ RAG 检索层消融：
 
 - `.env`、邮箱密码、授权码和 API Key 不得提交。
 - `data/` 包含本地索引、会话、记忆和用户文档派生产物，不得提交。
+- 会话持久化会脱敏常见密码、Token、API Key 字段，审批审计只保存参数名称和有限结果摘要；邮件正文、命令和文件内容仍可能出现在普通对话中，应按敏感本地数据保护 `data/`。
 - `eval/runs/`、`eval/reports/` 和会话导出可能包含用户问题、绝对路径或模型输出，不得提交。
 - 高风险工具虽然有权限控制，但仍应在隔离目录和非重要账号上验证。
 - LLM 生成的计划、命令、邮件正文和文件内容在确认前仍需人工检查。
@@ -389,19 +407,19 @@ RAG 检索层消融：
 
 - 尚未支持图片输入、图像向量索引和图文问答。
 - 当前精确 Dense 扫描适合个人小型知识库，文档规模增大后性能会下降。
-- 尚未接入 Cross-Encoder、ColBERT 或成熟 ANN Provider 进行最终精排。
+- Cross-Encoder 仅提供可选本地 provider，未随项目分发模型；当前 ColBERT 是用于接口和消融的 hash MaxSim 实验实现，不等同于训练版 ColBERT。
 - PDF 如果缺少正确的 Unicode 字体映射，仍可能出现无法恢复的乱码。
 - 网页搜索受网络、搜索引擎页面变化和反爬策略影响。
 - 邮箱目前一次只加载一个账号，Outlook OAuth、多账号隔离和账号切换尚未完成。
 - 多智能体目前主要覆盖结构化规划和工具协作，Reflection Agent 尚未正式启用。
+- Python 静态策略只能阻断明显危险语法，不能替代进程、账号或容器级沙箱。
 - UI 的渐进显示基于完整结果播放，并非模型服务端原生 Token Streaming。
 - 本地 fallback 只能提供基础检索摘要，不能替代真实 LLM 的综合推理。
 - 当前没有 SFT、RLHF/DPO、Agentic RL 训练、vLLM 推理优化或端侧模型部署。
 
 ## 后续工作
 
-- RAG P2：MMR、多样性选择、Cross-Encoder/ColBERT 精排和 hard-negative 评测。
-- RAG P3：大规模向量 Provider、索引迁移、缓存和延迟优化。
+- RAG：校准各 reranker 阈值，使用真实中英文 Cross-Encoder 做消融，并在知识库规模增长后接入成熟 ANN Provider。
 - 多模态：图片解析、图像 Embedding、图文混合检索、图片记忆与视觉问答。
 - Agent：按任务质量要求启用 Reflection，并完善失败恢复、预算和人工接管。
 - 邮件：多账号、OAuth、模板管理、附件策略和更完整的邮箱文件夹兼容。

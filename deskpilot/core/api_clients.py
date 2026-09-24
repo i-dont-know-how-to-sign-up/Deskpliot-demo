@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import random
 import re
+import time
 import urllib.error
 import urllib.request
 from hashlib import sha256
@@ -92,12 +95,23 @@ class OpenAICompatibleClient:
             },
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                return json.loads(response.read().decode("utf-8-sig"))
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(f"API request failed: {exc.code} {body}") from exc
+        attempts = _bounded_env_int("LLM_API_MAX_ATTEMPTS", 3, 1, 5)
+        base_delay = _bounded_env_float("LLM_API_RETRY_BASE_SECONDS", 0.5, 0.05, 5.0)
+        for attempt in range(1, attempts + 1):
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    return json.loads(response.read().decode("utf-8-sig"))
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="ignore")
+                if exc.code not in {429, 502, 503, 504} or attempt >= attempts:
+                    raise RuntimeError(f"API request failed: {exc.code} {body}") from exc
+                retry_after = _retry_after_seconds(exc.headers.get("Retry-After"))
+                _sleep_before_retry(attempt, base_delay, retry_after)
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+                if attempt >= attempts:
+                    raise RuntimeError(f"API request failed after {attempts} attempts: {exc}") from exc
+                _sleep_before_retry(attempt, base_delay)
+        raise RuntimeError("API request failed without a response")
 
     def _record_usage(self, response: dict) -> None:
         usage = response.get("usage")
@@ -143,3 +157,31 @@ def _is_dashscope_qwen(config: ModelConfig) -> bool:
     base_url = config.llm_base_url.lower()
     model = config.llm_model.lower()
     return "dashscope" in base_url or model.startswith("qwen")
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    try:
+        return max(0.0, min(float(value), 10.0)) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def _bounded_env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def _sleep_before_retry(attempt: int, base_delay: float, retry_after: float | None = None) -> None:
+    delay = retry_after if retry_after is not None else base_delay * (2 ** (attempt - 1))
+    time.sleep(min(10.0, delay + random.uniform(0.0, base_delay * 0.25)))

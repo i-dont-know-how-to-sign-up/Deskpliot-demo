@@ -153,6 +153,36 @@ def test_multi_document_collection_is_not_downgraded_to_simple_search() -> None:
     assert DocumentQAAgent._planned_simple_index_query("比较论文", preview, decision, hint) is None
 
 
+def test_readonly_index_summary_recovers_from_non_executable_plan() -> None:
+    with tempfile.TemporaryDirectory() as folder:
+        root = Path(folder)
+        index = DocumentIndex(root / "index.json")
+        content = "Aurora Cache 使用版本租约；节点重启后加载快照并回放日志；限制是传播延迟。"
+        document = Document("aurora", str(root / "aurora.md"), "Aurora Cache.md", "md", content)
+        chunk = Chunk("aurora_1", "aurora", content, "aurora.md#设计", 1)
+        chunk.embedding = local_hash_embedding(content)
+        index.documents[document.doc_id] = document
+        index.chunks[chunk.chunk_id] = chunk
+        agent = DocumentQAAgent(index)
+        decision = IntentDecision(
+            mode="plan_task", needs_index_catalog=False,
+            arguments={"query": "Aurora Cache 一致性、恢复和限制"},
+        )
+        preview = {"route": "single_agent", "score": 5, "valid": True, "steps": [
+            {"id": "communication", "allowed_tools": [], "arguments": {}},
+        ]}
+        hint = [{"doc_id": "aurora", "strong_match": True}]
+        with patch.object(agent.memory_store, "search", return_value=[]), patch.object(
+            agent.intent_router, "route", return_value=decision
+        ), patch.object(agent.intent_router, "requires_output_file", return_value=False
+        ), patch.object(agent.index, "retrieval_hint", return_value=hint), patch.object(
+            agent, "plan_task", return_value=preview
+        ), patch.object(agent, "_answer_rag_request", return_value="recovered") as rag:
+            assert agent.answer("总结 Aurora Cache 的一致性、恢复和限制") == "recovered"
+        assert rag.call_args.kwargs["collection"] is True
+        assert rag.call_args.kwargs["context_expansion"] == "parent"
+
+
 if __name__ == "__main__":
     test_simple_requests_skip_planner()
     test_document_candidates_are_bounded()
@@ -162,4 +192,5 @@ if __name__ == "__main__":
     test_complex_email_plan_does_not_list_files()
     test_single_index_question_recovers_from_empty_plan()
     test_multi_document_collection_is_not_downgraded_to_simple_search()
+    test_readonly_index_summary_recovers_from_non_executable_plan()
     print("Planner gate tests passed.")

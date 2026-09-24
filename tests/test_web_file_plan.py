@@ -51,7 +51,6 @@ def test_both_word_orders_dispatch_search_then_write() -> None:
             with patch.object(agent, "_desktop_directory", return_value=desktop), patch.object(
                 agent.tool_registry, "call", side_effect=call
             ), patch.object(agent, "_finalize_answer", side_effect=lambda **kwargs: kwargs):
-                assert agent._extract_local_document_targets(question) == []
                 plan = preview()
                 plan["steps"][1]["arguments"]["path"] = str(root / "weather.txt")
                 request = agent._planned_web_file_request(plan)
@@ -126,19 +125,13 @@ def test_answer_routes_composite_before_document_resolution() -> None:
                 assert execute.call_count == 1
 
 
-def test_generating_comparison_does_not_hide_readable_documents() -> None:
-    agent = DocumentQAAgent.__new__(DocumentQAAgent)
-    targets = agent._extract_local_document_targets("读取A.md和B.md，生成一份对比摘要")
-    assert len(targets) == 2
-
-
 def test_single_write_refuses_destination_phrase_as_content() -> None:
     with tempfile.TemporaryDirectory() as folder:
         agent = DocumentQAAgent(DocumentIndex(Path(folder) / "index.json"))
         with patch.object(agent.tool_registry, "call", side_effect=AssertionError("should not write")), patch.object(
             agent, "_finalize_answer", side_effect=lambda **kwargs: kwargs
         ):
-            result = agent._answer_file_write_with_runtime(
+            result = agent._answer_file_write(
                 QUERIES[0], {"path": str(Path(folder) / "weather.txt"), "content": "到整个文件中"},
                 [], "s", "m", object(),
             )
@@ -192,7 +185,6 @@ if __name__ == "__main__":
     test_empty_search_does_not_write()
     test_actual_file_write_stays_pending_until_approval()
     test_answer_routes_composite_before_document_resolution()
-    test_generating_comparison_does_not_hide_readable_documents()
     test_single_write_refuses_destination_phrase_as_content()
     test_existing_desktop_file_is_not_overwritten()
     test_semantic_router_and_planner_accept_web_file_dependencies()

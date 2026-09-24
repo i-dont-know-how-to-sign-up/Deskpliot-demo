@@ -9,7 +9,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
 
-from .permissions import assess_command, require_permission
+from .permissions import assess_command, assess_python_code, require_permission
 from ..core.config import ROOT_DIR
 
 
@@ -19,7 +19,7 @@ def execute_python_code(
     confirm: bool = False,
     cwd: str | Path | None = None,
 ) -> dict[str, Any]:
-    decision = assess_command("python code", operation="python_code_execution")
+    decision = assess_python_code(code)
     permission = require_permission(decision, confirm=confirm)
     if not permission["permitted"]:
         return {

@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -107,6 +108,8 @@ def test_registry_exposes_expected_tools(base: Path) -> None:
         "desktop.open_url",
         "files.workspace_root",
     }.issubset(tool_names)
+    knowledge = next(tool for tool in registry.list_tools() if tool["name"] == "knowledge.search")
+    assert any(parameter["name"] == "context_expansion" for parameter in knowledge["parameters"])
 
 
 def test_web_tools_and_file_tools_call_paths(base: Path) -> None:
@@ -146,7 +149,10 @@ def test_web_tools_and_file_tools_call_paths(base: Path) -> None:
     assert move_result.output["confirmed"] is False
     assert move_source.exists()
 
-    confirm_result = registry.call("files.apply_move", source=move_source, destination=move_destination, confirm=True)
+    spoofed = registry.call("files.apply_move", source=move_source, destination=move_destination, confirm=True)
+    assert spoofed.ok and spoofed.output["confirmed"] is False
+    assert move_source.exists()
+    confirm_result = registry.call_approved("files.apply_move", source=move_source, destination=move_destination)
     assert confirm_result.ok
     assert move_destination.exists()
 
@@ -279,7 +285,9 @@ def test_execution_tools_require_confirmation_and_block_dangerous_commands(base:
     assert dry_python.output["executed"] is False
     assert dry_python.output["permission"]["requires_confirmation"] is True
 
-    run_python = registry.call("code.execute_python", code="print(1 + 1)", confirm=True)
+    spoofed_python = registry.call("code.execute_python", code="print(1 + 1)", confirm=True)
+    assert spoofed_python.output["executed"] is False
+    run_python = registry.call_approved("code.execute_python", code="print(1 + 1)")
     assert run_python.ok
     assert run_python.output["executed"] is True
     assert run_python.output["stdout"].strip() == "2"
@@ -288,16 +296,15 @@ def test_execution_tools_require_confirmation_and_block_dangerous_commands(base:
     assert dry_shell.ok
     assert dry_shell.output["executed"] is False
 
-    run_shell = registry.call(
+    run_shell = registry.call_approved(
         "shell.execute_command",
         command=[sys.executable, "-c", "print('shell-ok')"],
-        confirm=True,
     )
     assert run_shell.ok
     assert run_shell.output["executed"] is True
     assert run_shell.output["stdout"].strip() == "shell-ok"
 
-    blocked = registry.call("shell.execute_command", command="git reset --hard", confirm=True)
+    blocked = registry.call_approved("shell.execute_command", command="git reset --hard")
     assert not blocked.ok
 
     decision = assess_command("Remove-Item -Recurse C:/Temp/demo")
@@ -308,11 +315,10 @@ def test_execution_tools_ignore_extra_kwargs_during_approval_replay(base: Path) 
     index = DocumentIndex(base / "index" / "index.json")
     registry = build_default_tool_registry(index, FakeWebResearchAgent(), workspace_root=base)
 
-    result = registry.call(
+    result = registry.call_approved(
         "code.execute_python",
         code="print(1 + 1)",
         command="ignored-by-schema",
-        confirm=True,
     )
 
     assert result.ok
@@ -361,7 +367,9 @@ def test_document_agent_keeps_absolute_directory_hint_for_file_creation(base: Pa
     assert r"C:\Users\TestUser\Desktop\test1.docx" in result.answer
     assert result.pending_action is not None
     assert result.pending_action["tool_name"] == "files.write_file"
-    assert result.pending_action["kwargs"]["path"].lower() == r"c:\users\testuser\desktop\test1.docx"
+    assert result.pending_action["action_id"].startswith("act_")
+    assert "kwargs" not in result.pending_action
+    assert result.pending_action["tool_name"] == "files.write_file"
     assert "\u4eba\u5de5\u786e\u8ba4" in result.answer or "Permission required" in result.answer
     assert any(step.name == "route_file_write" for step in result.steps)
     assert any(step.name == "plan_task" for step in result.steps)
@@ -397,9 +405,11 @@ def test_document_agent_generates_public_domain_full_text_before_writing(base: P
     try:
         index = DocumentIndex(base / "index" / "index.json")
         agent = DocumentQAAgent(index)
-        result = agent.answer(
-            "\u5728test.txt\u4e2d\u5199\u5165\u674e\u767d\u7684\u9759\u591c\u601d\u5168\u6587"
-        )
+        generated = "静夜思\n\n李白\n\n床前明月光，\n疑是地上霜。\n举头望明月，\n低头思故乡。"
+        with patch.object(agent.client, "chat", return_value=generated):
+            result = agent.answer(
+                "\u5728test.txt\u4e2d\u5199\u5165\u674e\u767d\u7684\u9759\u591c\u601d\u5168\u6587"
+            )
     finally:
         os.chdir(previous_cwd)
 
@@ -429,12 +439,14 @@ def test_document_agent_executes_python_test_and_reports_output(base: Path) -> N
     finally:
         os.chdir(previous_cwd)
 
-    assert "\u6d4b\u8bd5\u6267\u884c\u7ed3\u679c" in result.answer
-    assert "returncode" in result.answer
-    assert "sample test passed" in result.answer
+    assert result.pending_action and result.pending_action["action_id"].startswith("act_")
+    approved = agent.approve_pending_action(result.pending_action, session_id=result.session_id)
+    assert "returncode" in approved.answer
+    assert "sample test passed" in approved.answer
     assert any(step.name == "route_test_execution" for step in result.steps)
     assert any(step.name == "plan_task" for step in result.steps)
-    assert any(step.name == "execute_test" and step.status == "success" for step in result.steps)
+    assert any(step.name == "request_test_confirmation" for step in result.steps)
+    assert any(step.name == "execute_approved_action" and step.status == "success" for step in approved.steps)
     assert not any(step.name == "retrieve_evidence" for step in result.steps)
 
 

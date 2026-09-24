@@ -14,6 +14,7 @@ class AgentResult:
     error: str = ""
     tool_calls: int = 0
     tokens: int = 0
+    step_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

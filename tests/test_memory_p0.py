@@ -42,6 +42,17 @@ def test_session_store_roundtrip(base: Path) -> None:
     store.write_summary(session.session_id, "# 摘要\n\n- 第二阶段先做会话记忆系统。")
     assert "会话记忆系统" in store.read_summary(session.session_id)
 
+    store.update_message_metadata(
+        session.session_id,
+        second.message_id,
+        {"steps": [{"name": "route_intent", "status": "success", "detail": "direct_answer"}]},
+    )
+    restored = store.read_messages(session.session_id)[1]
+    assert restored.metadata["steps"][0]["detail"] == "direct_answer"
+    exported = store.export_session(session.session_id, base / "session.md")
+    assert "### Steps" in exported.read_text(encoding="utf-8")
+    assert "route_intent" in exported.read_text(encoding="utf-8")
+
 
 def test_memory_store_search_and_delete(base: Path) -> None:
     store = MemoryStore(base / "indexes" / "memory.sqlite", base / "workspace")

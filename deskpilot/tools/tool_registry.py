@@ -40,6 +40,8 @@ class ToolSpec:
     description: str
     parameters: list[ToolParameter]
     handler: ToolHandler
+    # 审批入口不进入 LLM 可见 schema，只能由 Agent 的服务端审批状态机调用。
+    approval_handler: ToolHandler | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -122,6 +124,20 @@ class ToolRegistry:
         except Exception as exc:
             return ToolResult(ok=False, tool_name=name, error=str(exc))
 
+    def call_approved(self, name: str, **kwargs: Any) -> ToolResult:
+        """执行已经由一次性审批状态确认的调用，禁止普通路由触达此入口。"""
+        spec = self._tools.get(name)
+        if not spec:
+            return ToolResult(ok=False, tool_name=name, error=f"Unknown tool: {name}")
+        if spec.approval_handler is None:
+            return ToolResult(ok=False, tool_name=name, error=f"Tool does not support approved execution: {name}")
+        try:
+            allowed_keys = {parameter.name for parameter in spec.parameters}
+            filtered_kwargs = {key: value for key, value in kwargs.items() if key in allowed_keys}
+            return ToolResult(ok=True, tool_name=name, output=spec.approval_handler(**filtered_kwargs))
+        except Exception as exc:
+            return ToolResult(ok=False, tool_name=name, error=str(exc))
+
 
 def build_default_tool_registry(
     index,
@@ -151,10 +167,12 @@ def build_default_tool_registry(
             ToolParameter("subject", "string", True, "Subject"),
             ToolParameter("body", "string", True, "Body"),
             ToolParameter("attachment_paths", "array", False, "Absolute paths of local attachments", []),
-            ToolParameter("confirm", "boolean", False, "Human confirmation", False),
         ],
-        lambda to, subject, body, attachment_paths=None, confirm=False: email.save_draft(
-            to, str(subject), str(body), attachment_paths or [], bool(confirm)
+        lambda to, subject, body, attachment_paths=None: email.save_draft(
+            to, str(subject), str(body), attachment_paths or [], False
+        ),
+        approval_handler=lambda to, subject, body, attachment_paths=None: email.save_draft(
+            to, str(subject), str(body), attachment_paths or [], True
         ),
     ))
     registry.register(ToolSpec(
@@ -166,10 +184,12 @@ def build_default_tool_registry(
             ToolParameter("subject", "string", True, "Subject"),
             ToolParameter("body", "string", True, "Body"),
             ToolParameter("attachment_paths", "array", False, "Absolute paths of local attachments", []),
-            ToolParameter("confirm", "boolean", False, "Human confirmation", False),
         ],
-        lambda to, subject, body, attachment_paths=None, confirm=False: email.send(
-            to, str(subject), str(body), attachment_paths or [], bool(confirm)
+        lambda to, subject, body, attachment_paths=None: email.send(
+            to, str(subject), str(body), attachment_paths or [], False
+        ),
+        approval_handler=lambda to, subject, body, attachment_paths=None: email.send(
+            to, str(subject), str(body), attachment_paths or [], True
         ),
     ))
 
@@ -248,14 +268,16 @@ def build_default_tool_registry(
         ToolSpec(
             name="files.apply_move",
             category="files",
-            description="在用户确认后执行单个文件移动，默认要求显式 confirm=true。",
+            description="准备单个文件移动；实际执行必须经过应用内人工审批。",
             parameters=[
                 ToolParameter("source", "string", True, "源文件路径"),
                 ToolParameter("destination", "string", True, "目标路径"),
-                ToolParameter("confirm", "boolean", False, "是否确认执行", False),
             ],
-            handler=lambda source, destination, confirm=False: apply_file_move(
-                Path(source), Path(destination), confirm=bool(confirm)
+            handler=lambda source, destination: apply_file_move(
+                Path(source), Path(destination), confirm=False, safe_roots=write_safe_roots
+            ),
+            approval_handler=lambda source, destination: apply_file_move(
+                Path(source), Path(destination), confirm=True, safe_roots=write_safe_roots
             ),
         )
     )
@@ -273,13 +295,22 @@ def build_default_tool_registry(
             ToolSpec(
                 name="knowledge.search",
                 category="knowledge",
-                description="检索已经建立的本地知识库并返回带来源的相关证据。只读。",
+                description=(
+                    "检索已经建立的本地知识库并返回带来源的相关证据。只读。"
+                    "context_expansion：事实/错误码/步骤用 sentence_window，总结/比较/跨段推理用 parent，"
+                    "无需扩展用 none。"
+                ),
                 parameters=[
                     ToolParameter("query", "string", True, "知识库查询"),
                     ToolParameter("top_k", "integer", False, "证据数量", 5),
                     ToolParameter("scope", "string", False, "单问题用 search，跨多文档汇总用 collection", "search"),
+                    ToolParameter(
+                        "context_expansion", "string", False,
+                        "事实、错误码和步骤使用 sentence_window；总结、比较和跨段推理使用 parent；无需扩展用 none",
+                        "sentence_window",
+                    ),
                 ],
-                handler=lambda query, top_k=5, scope="search": [
+                handler=lambda query, top_k=5, scope="search", context_expansion="sentence_window": [
                     evidence.__dict__ for evidence in (
                         index.search_collection(str(query)) if scope == "collection" else index.search(str(query), int(top_k))
                     )
@@ -316,21 +347,24 @@ def build_default_tool_registry(
         ToolSpec(
             name="files.write_file",
             category="files",
-            description="Write a local file in text, Markdown, Word docx, or PDF format. Risky paths require confirm=true.",
+            description="Write a local file in text, Markdown, Word docx, or PDF format. Risky paths require app approval.",
             parameters=[
                 ToolParameter("path", "string", True, "Output file path"),
-                ToolParameter("content", "string", True, "File content"),
+                ToolParameter("content", "string", False, "File content; empty creates an empty file", ""),
                 ToolParameter("file_format", "string", False, "Optional format override, e.g. md, txt, docx, pdf", ""),
                 ToolParameter("overwrite", "boolean", False, "Allow replacing an existing file", False),
-                ToolParameter("confirm", "boolean", False, "Human confirmation for high-risk writes", False),
             ],
-            handler=lambda path, content, file_format="", overwrite=False, confirm=False: write_file(
+            handler=lambda path, content, file_format="", overwrite=False: write_file(
                 path,
                 str(content),
                 file_format=str(file_format) if file_format else None,
                 overwrite=bool(overwrite),
-                confirm=bool(confirm),
+                confirm=False,
                 safe_roots=write_safe_roots,
+            ),
+            approval_handler=lambda path, content, file_format="", overwrite=False: write_file(
+                path, str(content), file_format=str(file_format) if file_format else None,
+                overwrite=bool(overwrite), confirm=True, safe_roots=write_safe_roots,
             ),
         )
     )
@@ -338,15 +372,17 @@ def build_default_tool_registry(
         ToolSpec(
             name="files.write_markdown",
             category="files",
-            description="Write a Markdown file. Existing files require overwrite=true; risky paths require confirm=true.",
+            description="Write a Markdown file. Existing files require overwrite=true; risky paths require app approval.",
             parameters=[
                 ToolParameter("path", "string", True, "Output Markdown path"),
                 ToolParameter("content", "string", True, "Markdown content"),
                 ToolParameter("overwrite", "boolean", False, "Allow replacing an existing file", False),
-                ToolParameter("confirm", "boolean", False, "Human confirmation for high-risk writes", False),
             ],
-            handler=lambda path, content, overwrite=False, confirm=False: write_markdown(
-                path, str(content), overwrite=bool(overwrite), confirm=bool(confirm), safe_roots=write_safe_roots
+            handler=lambda path, content, overwrite=False: write_markdown(
+                path, str(content), overwrite=bool(overwrite), confirm=False, safe_roots=write_safe_roots
+            ),
+            approval_handler=lambda path, content, overwrite=False: write_markdown(
+                path, str(content), overwrite=bool(overwrite), confirm=True, safe_roots=write_safe_roots
             ),
         )
     )
@@ -359,10 +395,12 @@ def build_default_tool_registry(
                 ToolParameter("path", "string", True, "Output text path"),
                 ToolParameter("content", "string", True, "Text content"),
                 ToolParameter("overwrite", "boolean", False, "Allow replacing an existing file", False),
-                ToolParameter("confirm", "boolean", False, "Human confirmation for high-risk writes", False),
             ],
-            handler=lambda path, content, overwrite=False, confirm=False: write_text(
-                path, str(content), overwrite=bool(overwrite), confirm=bool(confirm), safe_roots=write_safe_roots
+            handler=lambda path, content, overwrite=False: write_text(
+                path, str(content), overwrite=bool(overwrite), confirm=False, safe_roots=write_safe_roots
+            ),
+            approval_handler=lambda path, content, overwrite=False: write_text(
+                path, str(content), overwrite=bool(overwrite), confirm=True, safe_roots=write_safe_roots
             ),
         )
     )
@@ -375,10 +413,12 @@ def build_default_tool_registry(
                 ToolParameter("path", "string", True, "Output docx path"),
                 ToolParameter("content", "string", True, "Document content"),
                 ToolParameter("overwrite", "boolean", False, "Allow replacing an existing file", False),
-                ToolParameter("confirm", "boolean", False, "Human confirmation for high-risk writes", False),
             ],
-            handler=lambda path, content, overwrite=False, confirm=False: write_docx(
-                path, str(content), overwrite=bool(overwrite), confirm=bool(confirm), safe_roots=write_safe_roots
+            handler=lambda path, content, overwrite=False: write_docx(
+                path, str(content), overwrite=bool(overwrite), confirm=False, safe_roots=write_safe_roots
+            ),
+            approval_handler=lambda path, content, overwrite=False: write_docx(
+                path, str(content), overwrite=bool(overwrite), confirm=True, safe_roots=write_safe_roots
             ),
         )
     )
@@ -391,10 +431,12 @@ def build_default_tool_registry(
                 ToolParameter("path", "string", True, "Output PDF path"),
                 ToolParameter("content", "string", True, "Document content"),
                 ToolParameter("overwrite", "boolean", False, "Allow replacing an existing file", False),
-                ToolParameter("confirm", "boolean", False, "Human confirmation for high-risk writes", False),
             ],
-            handler=lambda path, content, overwrite=False, confirm=False: write_pdf(
-                path, str(content), overwrite=bool(overwrite), confirm=bool(confirm), safe_roots=write_safe_roots
+            handler=lambda path, content, overwrite=False: write_pdf(
+                path, str(content), overwrite=bool(overwrite), confirm=False, safe_roots=write_safe_roots
+            ),
+            approval_handler=lambda path, content, overwrite=False: write_pdf(
+                path, str(content), overwrite=bool(overwrite), confirm=True, safe_roots=write_safe_roots
             ),
         )
     )
@@ -426,17 +468,20 @@ def build_default_tool_registry(
         ToolSpec(
             name="code.execute_python",
             category="code",
-            description="Execute Python code with timeout. Always requires confirm=true and blocks dangerous policy violations.",
+            description="Prepare Python code execution with timeout. Execution requires app approval and policy checks.",
             parameters=[
                 ToolParameter("code", "string", True, "Python code to execute"),
                 ToolParameter("timeout_seconds", "integer", False, "Execution timeout", 10),
-                ToolParameter("confirm", "boolean", False, "Human confirmation", False),
                 ToolParameter("cwd", "string", False, "Working directory", ""),
             ],
-            handler=lambda code, timeout_seconds=10, confirm=False, cwd="": execute_python_code(
+            handler=lambda code, timeout_seconds=10, cwd="": execute_python_code(
                 str(code),
                 timeout_seconds=int(timeout_seconds),
-                confirm=bool(confirm),
+                confirm=False,
+                cwd=Path(cwd) if cwd else None,
+            ),
+            approval_handler=lambda code, timeout_seconds=10, cwd="": execute_python_code(
+                str(code), timeout_seconds=int(timeout_seconds), confirm=True,
                 cwd=Path(cwd) if cwd else None,
             ),
         )
@@ -449,14 +494,17 @@ def build_default_tool_registry(
             parameters=[
                 ToolParameter("command", "string|array", True, "Command text or argument list"),
                 ToolParameter("timeout_seconds", "integer", False, "Execution timeout", None),
-                ToolParameter("confirm", "boolean", False, "Human confirmation", False),
                 ToolParameter("cwd", "string", False, "Working directory", ""),
             ],
-            handler=lambda command, timeout_seconds=None, confirm=False, cwd="": execute_command(
+            handler=lambda command, timeout_seconds=None, cwd="": execute_command(
                 command,
                 timeout_seconds=int(timeout_seconds) if timeout_seconds is not None else None,
-                confirm=bool(confirm),
+                confirm=False,
                 cwd=Path(cwd) if cwd else None,
+            ),
+            approval_handler=lambda command, timeout_seconds=None, cwd="": execute_command(
+                command, timeout_seconds=int(timeout_seconds) if timeout_seconds is not None else None,
+                confirm=True, cwd=Path(cwd) if cwd else None,
             ),
         )
     )

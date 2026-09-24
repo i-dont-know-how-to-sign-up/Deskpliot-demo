@@ -84,6 +84,24 @@ def test_intent_router_prefers_direct_answer() -> None:
     assert "通用问题" in decision.reason
 
 
+def test_offline_fallback_routes_structural_file_write() -> None:
+    decision = IntentRouter(FakeClient("")).route(
+        "在当前目录创建 note.txt",
+        [{"name": "files.write_file", "parameters": []}],
+    )
+    assert decision.mode == "tool_call"
+    assert decision.tool_name == "files.write_file"
+
+
+def test_offline_fallback_routes_structural_python_execution() -> None:
+    decision = IntentRouter(FakeClient("")).route(
+        "运行 tests/test_sample.py",
+        [{"name": "shell.execute_command", "parameters": []}],
+    )
+    assert decision.mode == "tool_call"
+    assert decision.tool_name == "shell.execute_command"
+
+
 def test_index_hint_is_injected_but_does_not_force_generic_question() -> None:
     router = IntentRouter(
         FakeClient('{"mode":"direct_answer","reason":"通用定义无需检索","confidence":0.93,"arguments":{},"missing_slots":[]}')
@@ -93,6 +111,33 @@ def test_index_hint_is_injected_but_does_not_force_generic_question() -> None:
     decision = router.route("什么是 RAG", [], index_hint=hint)
     assert decision.mode == "direct_answer"
     assert "通用定义" in decision.reason
+
+
+def test_repeated_domain_question_with_strong_entities_still_uses_rag() -> None:
+    router = IntentRouter(FakeClient(
+        '{"mode":"direct_answer","reason":"上轮已经回答，无需再次检索",'
+        '"confidence":0.9,"arguments":{},"missing_slots":[]}'
+    ))
+    tools = [{
+        "name": "knowledge.search",
+        "description": "Search indexed knowledge.",
+        "parameters": [{"name": "query", "type": "string", "required": True}],
+    }]
+    hint = [{
+        "source": "falcon.md#fairness",
+        "matched_entities": ["falcon", "scheduler"],
+        "strong_match": True,
+        "excerpt": "Falcon Scheduler fairness and overload recovery.",
+    }]
+    decision = router.route(
+        "比较 Falcon Scheduler 的公平性与过载恢复策略",
+        tools,
+        memory_context="上一轮助手已经回答过相同问题。",
+        index_hint=hint,
+    )
+    assert decision.mode == "tool_call"
+    assert decision.tool_name == "knowledge.search"
+    assert "历史回答不作为事实证据" in decision.reason
 
 
 def test_router_rejects_knowledge_search_when_index_has_no_candidate() -> None:
@@ -146,6 +191,23 @@ def test_router_rejects_unrequested_web_search_for_general_knowledge() -> None:
 
     decision = router.route("qwenVL 的工作流程是什么样的？", tools, index_hint=[])
 
+    assert decision.mode == "direct_answer"
+    assert "不依赖实时信息" in decision.reason
+
+
+def test_router_rechecks_false_explicit_web_claim() -> None:
+    router = IntentRouter(FakeClient(
+        '{"mode":"tool_call","reason":"联网补充模型架构","tool_name":"web.search",'
+        '"arguments":{"query":"qwenVL workflow"},"missing_slots":[],"confidence":0.9,'
+        '"explicit_web_retrieval":true,"requires_fresh_information":false}'
+    ))
+    tools = [{
+        "name": "web.search",
+        "description": "Search the web.",
+        "parameters": [{"name": "query", "type": "string", "required": True}],
+    }]
+    with patch.object(router, "_verify_web_requirement", return_value=(False, False)):
+        decision = router.route("qwenVL 的工作流程是什么样的？", tools, index_hint=[])
     assert decision.mode == "direct_answer"
     assert "不依赖实时信息" in decision.reason
 
@@ -305,10 +367,14 @@ def main() -> None:
         test_slot_validator_accepts_tool_dict_and_coerces_values()
         test_slot_validator_reports_missing_required_slots()
         test_intent_router_prefers_direct_answer()
+        test_offline_fallback_routes_structural_file_write()
+        test_offline_fallback_routes_structural_python_execution()
         test_index_hint_is_injected_but_does_not_force_generic_question()
+        test_repeated_domain_question_with_strong_entities_still_uses_rag()
         test_router_rejects_knowledge_search_when_index_has_no_candidate()
         test_explicit_local_retrieval_can_search_an_empty_candidate_set()
         test_router_rejects_unrequested_web_search_for_general_knowledge()
+        test_router_rechecks_false_explicit_web_claim()
         test_router_allows_web_search_for_fresh_information()
         test_router_recovers_empty_tool_call_to_direct_answer()
         test_offline_router_uses_strong_index_hint_for_domain_question()

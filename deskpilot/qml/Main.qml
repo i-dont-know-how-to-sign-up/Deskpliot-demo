@@ -34,7 +34,7 @@ ApplicationWindow {
 
     function ask() {
         const value = composer.text.trim()
-        if (!value) return
+        if (!value || deskPilot.busy) return
         deskPilot.ask(value)
         composer.clear()
     }
@@ -178,14 +178,14 @@ ApplicationWindow {
 
                 RowLayout {
                     Layout.fillWidth: true
-                    SmallButton { text: "新会话"; Layout.fillWidth: true; onClicked: deskPilot.newSession() }
-                    SmallButton { text: "压缩"; Layout.fillWidth: true; onClicked: deskPilot.compactSession() }
+                    SmallButton { text: "新会话"; Layout.fillWidth: true; enabled: !deskPilot.busy; onClicked: deskPilot.newSession() }
+                    SmallButton { text: "压缩"; Layout.fillWidth: true; enabled: !deskPilot.busy; onClicked: deskPilot.compactSession() }
                 }
 
                 SectionTitle { text: "文档索引"; Layout.topMargin: 10 }
-                SmallButton { text: "选择文件"; Layout.fillWidth: true; onClicked: deskPilot.chooseIndexFile() }
-                SmallButton { text: "选择文件夹"; Layout.fillWidth: true; onClicked: deskPilot.chooseIndexFolder() }
-                SmallButton { text: "清空索引"; Layout.fillWidth: true; onClicked: deskPilot.clearIndex() }
+                SmallButton { text: "选择文件"; Layout.fillWidth: true; enabled: !deskPilot.busy; onClicked: deskPilot.chooseIndexFile() }
+                SmallButton { text: "选择文件夹"; Layout.fillWidth: true; enabled: !deskPilot.busy; onClicked: deskPilot.chooseIndexFolder() }
+                SmallButton { text: "清空索引"; Layout.fillWidth: true; enabled: !deskPilot.busy; onClicked: deskPilot.clearIndex() }
                 Label {
                     Layout.fillWidth: true
                     text: deskPilot.stats.documents + " 个文档  ·  " + deskPilot.stats.chunks + " 个片段"
@@ -326,10 +326,11 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         Label { text: "Ctrl + Enter 发送"; color: theme.muted; font.pixelSize: 10 }
                         Item { Layout.fillWidth: true }
-                        SmallButton { text: "网页调研"; onClicked: { deskPilot.research(composer.text, 5); composer.clear() } }
+                        SmallButton { text: "网页调研"; enabled: !deskPilot.busy; onClicked: { deskPilot.research(composer.text, 5); composer.clear() } }
                         Button {
                             id: sendButton
                             text: "发送"
+                            enabled: !deskPilot.busy
                             implicitHeight: 34
                             padding: 16
                             onClicked: ask()
@@ -362,9 +363,47 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     currentIndex: tabs.currentIndex
-                    ScrollView {
+                    ListView {
+                        id: stepsList
+                        objectName: "stepsList"
                         clip: true
-                        Column { width: parent.width; spacing: 9; Repeater { model: deskPilot.steps; delegate: Rectangle { width: parent.width; height: stepText.contentHeight + 22; radius: 6; color: theme.surfaceSoft; border.color: modelData.status === "failed" ? theme.danger : theme.border; TextEdit { id: stepText; anchors.fill: parent; anchors.margins: 10; text: "[" + modelData.status + "] " + modelData.name + "\n" + modelData.detail; color: theme.text; font.pixelSize: 11; wrapMode: TextEdit.Wrap; textFormat: TextEdit.PlainText; readOnly: true; selectByMouse: true; selectByKeyboard: true; cursorVisible: false; selectionColor: theme.cyanSoft; selectedTextColor: theme.text } } } }
+                        spacing: 9
+                        model: deskPilot.steps
+                        boundsBehavior: Flickable.StopAtBounds
+                        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                        Label {
+                            anchors.centerIn: parent
+                            visible: stepsList.count === 0
+                            text: deskPilot.status === "正在处理" ? "正在生成执行步骤..." : "本轮暂无执行步骤"
+                            color: theme.textMuted
+                            font.pixelSize: 11
+                        }
+                        delegate: Rectangle {
+                            required property var modelData
+                            width: stepsList.width
+                            height: stepText.implicitHeight + 20
+                            radius: 6
+                            color: theme.surfaceSoft
+                            border.color: modelData.status === "failed" ? theme.danger : theme.border
+                            TextEdit {
+                                id: stepText
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.top: parent.top
+                                anchors.margins: 10
+                                text: "[" + modelData.status + "] " + modelData.name + "\n" + modelData.detail
+                                color: theme.text
+                                font.pixelSize: 11
+                                wrapMode: TextEdit.Wrap
+                                textFormat: TextEdit.PlainText
+                                readOnly: true
+                                selectByMouse: true
+                                selectByKeyboard: true
+                                cursorVisible: false
+                                selectionColor: theme.cyanSoft
+                                selectedTextColor: theme.text
+                            }
+                        }
                     }
                     ScrollView {
                         clip: true

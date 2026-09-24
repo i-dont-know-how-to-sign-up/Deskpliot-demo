@@ -81,7 +81,14 @@ def _references(expected: dict[str, Any]) -> list[str]:
     return [str(reference)] if reference is not None and str(reference).strip() else []
 
 
-def score_case(case: dict[str, Any], result: Any, skipped_reason: str | None = None, *, workspace: Path | None = None) -> dict[str, Any]:
+def score_case(
+    case: dict[str, Any],
+    result: Any,
+    skipped_reason: str | None = None,
+    *,
+    workspace: Path | None = None,
+    pending_arguments: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if skipped_reason:
         return {
             "case_id": case["id"],
@@ -104,6 +111,9 @@ def score_case(case: dict[str, Any], result: Any, skipped_reason: str | None = N
         "must_not_include_ok": not _has_any(answer, expected.get("must_not_include", [])),
         "has_trace": bool(names),
     }
+    pending = getattr(result, "pending_action", None) or {}
+    # 新审批协议不向 UI 暴露 kwargs；runner 可从进程内 PendingActionStore 注入参数用于断言。
+    pending_kwargs = pending_arguments if pending_arguments is not None else pending.get("kwargs", {})
     if "must_have_steps" in expected:
         checks["required_steps_ok"] = all(name in names for name in expected["must_have_steps"])
     if "ordered_steps" in expected:
@@ -128,26 +138,21 @@ def score_case(case: dict[str, Any], result: Any, skipped_reason: str | None = N
         )
         checks["artifact_exists"] = exists
     if "pending_path_suffix" in expected:
-        pending = getattr(result, "pending_action", None) or {}
-        raw = str(pending.get("kwargs", {}).get("path", "")).replace("\\", "/")
+        raw = str(pending_kwargs.get("path", "")).replace("\\", "/")
         suffix = str(expected["pending_path_suffix"]).replace("\\", "/")
         checks["pending_path_ok"] = bool(raw and raw.casefold().endswith(suffix.casefold()))
     if "pending_target_absent" in expected:
-        pending = getattr(result, "pending_action", None) or {}
-        raw = str(pending.get("kwargs", {}).get("path", ""))
+        raw = str(pending_kwargs.get("path", ""))
         target = Path(raw).resolve() if raw else None
         sandbox = workspace.resolve().parent if workspace else None
         checks["pending_target_absent_ok"] = bool(
             target and sandbox and target.is_relative_to(sandbox) and not target.exists()
         ) == bool(expected["pending_target_absent"])
     if "pending_tool" in expected:
-        pending = getattr(result, "pending_action", None) or {}
         checks["pending_tool_ok"] = pending.get("tool_name") == expected["pending_tool"]
     if "pending_arguments_contains" in expected:
-        pending = getattr(result, "pending_action", None) or {}
-        kwargs = pending.get("kwargs", {})
         checks["pending_arguments_ok"] = all(
-            _has_all(str(kwargs.get(key, "")), [value])
+            _has_all(str(pending_kwargs.get(key, "")), [value])
             for key, value in expected["pending_arguments_contains"].items()
         )
     if "requires_confirmation" in expected:

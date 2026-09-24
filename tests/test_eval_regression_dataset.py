@@ -14,7 +14,7 @@ class RegressionDatasetTests(unittest.TestCase):
         cases = load_cases(DATASET)
         ids = [case["id"] for case in cases]
         self.assertEqual(len(ids), len(set(ids)))
-        self.assertEqual(len(cases), 140)
+        self.assertEqual(len(cases), 152)
         regression = [case for case in cases if case["id"].startswith("reg_index_report_") or case["id"].startswith("reg_web_file_")]
         self.assertEqual(len(regression), 6)
         for case in regression:

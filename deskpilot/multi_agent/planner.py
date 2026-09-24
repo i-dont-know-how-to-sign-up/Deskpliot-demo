@@ -5,6 +5,7 @@ import re
 from collections.abc import Callable
 
 from .schemas import TaskPlan, TaskPlanStep
+from ..core.json_utils import parse_json_value
 
 
 class PlannerAgent:
@@ -103,6 +104,8 @@ class PlannerAgent:
 如果用户要求先整理文档并作为附件发送，knowledge.allowed_tools 必须包含 web.research，commit.arguments 必须设置 attach_report=true；
 附件路径是前置节点运行时产生的动态结果，不要虚构 attachment_paths。
 request/query/topic 只能填写要搜索或调研的主题，不得包含“在网上搜索、整理成文档、作为附件、发送给某人”等操作指令。
+读取源文件统一使用 files.read_document；读取节点可使用任意唯一 step_id，执行器不会依赖固定节点名。
+已有本地附件写入 commit.arguments.attachment_paths；只有附件由前置 web.research 动态生成时才使用 attach_report=true。
 读取源文件时不要输出清单之外的路径；新建的报告输出路径可按用户要求填写。不要省略已知的收件人、标题或查询内容。
 如果当前输入是在补充上一轮未完成任务的参数，请结合最近会话重建完整计划；绝不输出“模拟调用”或声称工具已成功。
 示例：用户说“读取项目说明和评测说明”，应从清单选择对应的 .md 文件；用户说“发给 a@b.com，标题为 test”，应输出 to=["a@b.com"] 和 subject="test"。
@@ -112,16 +115,16 @@ Planner 独立运行时上下文（其中已包含当前任务）：{conversatio
 """.strip()
         try:
             response = self.llm_call(prompt)
-            match = re.search(r"\{.*\}", response or "", flags=re.DOTALL)
-            if not match:
+            data = parse_json_value(response or "", dict)
+            if not isinstance(data, dict):
                 return None
-            data = json.loads(match.group(0))
             allowed_agents = {"knowledge", "communication"}
             steps: list[TaskPlanStep] = []
             for raw in data.get("steps", []):
                 if not isinstance(raw, dict) or raw.get("agent") not in allowed_agents:
                     return None
-                tools = [str(tool) for tool in raw.get("allowed_tools", [])]
+                tool_aliases = {"files.read_file": "files.read_document"}
+                tools = [tool_aliases.get(str(tool), str(tool)) for tool in raw.get("allowed_tools", [])]
                 risky = {"email.send", "email.save_draft", "files.write_file"}
                 requires_human = bool(raw.get("requires_human", False)) or bool(risky.intersection(tools))
                 steps.append(TaskPlanStep(
@@ -140,7 +143,7 @@ Planner 独立运行时上下文（其中已包含当前任务）：{conversatio
                 complexity_score=int(data.get("complexity_score", len(steps))),
                 metadata=dict(data.get("metadata", {})) if isinstance(data.get("metadata", {}), dict) else {},
             )
-        except (TypeError, ValueError, json.JSONDecodeError, KeyError):
+        except (TypeError, ValueError, KeyError):
             return None
 
     def validate(self, plan: TaskPlan) -> tuple[bool, str]:
@@ -151,9 +154,19 @@ Planner 独立运行时上下文（其中已包含当前任务）：{conversatio
         if len(ids) != len(plan.steps):
             return False, "计划包含重复节点"
         risky_tools = {"email.send", "email.save_draft", "files.write_file"}
+        planner_tools = {
+            "knowledge.search", "web.search", "web.research", "web.read_page",
+            "files.read_document", "files.write_file", "email.send", "email.save_draft",
+            "email.create_reply_draft",
+        }
         for step in plan.steps:
+            if not step.step_id.strip():
+                return False, "计划包含空节点 ID"
             if any(dep not in ids for dep in step.depends_on):
                 return False, f"节点 {step.step_id} 存在缺失依赖"
+            unsupported = [tool for tool in step.allowed_tools if tool not in planner_tools]
+            if unsupported:
+                return False, f"节点 {step.step_id} 使用未受支持工具：{', '.join(unsupported)}"
             if any(tool in risky_tools for tool in step.allowed_tools) and not step.requires_human:
                 return False, f"高风险节点 {step.step_id} 未标记人工确认"
 

@@ -4,6 +4,8 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from .permissions import assess_file_move, require_permission
+
 from ..rag.document_parsers import parse_document
 
 
@@ -188,24 +190,29 @@ def build_organization_plan(folder: Path, target_root: Path | None = None, max_f
     }
 
 
-def apply_file_move(source: Path, destination: Path, confirm: bool = False) -> dict[str, Any]:
+def apply_file_move(
+    source: Path,
+    destination: Path,
+    confirm: bool = False,
+    safe_roots: list[str | Path] | None = None,
+) -> dict[str, Any]:
     source = source.expanduser().resolve()
     destination = destination.expanduser().resolve()
     if not source.exists():
         raise FileNotFoundError(f"Source file not found: {source}")
     if source.is_dir():
         raise IsADirectoryError(f"Source must be a file: {source}")
-    if not confirm:
+    decision = assess_file_move(source, destination, additional_safe_roots=safe_roots)
+    permission = require_permission(decision, confirm=confirm)
+    if not permission["permitted"]:
         return {
             "ok": True,
             "confirmed": False,
             "source": str(source),
             "destination": str(destination),
-            "message": "Dry run only. Set confirm=True to execute the move.",
+            **permission,
         }
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists() and destination.is_dir():
-        destination = destination / source.name
     shutil.move(str(source), str(destination))
     return {
         "ok": True,
@@ -213,6 +220,7 @@ def apply_file_move(source: Path, destination: Path, confirm: bool = False) -> d
         "source": str(source),
         "destination": str(destination),
         "message": "File moved successfully.",
+        "permission": decision.to_dict(),
     }
 
 
