@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from tempfile import TemporaryDirectory
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -14,7 +15,14 @@ from deskpilot.tools.file_tools import resolve_document_path
 def test_action_prefix_is_removed_from_document_target() -> None:
     filename = "开发日志.md"
     question = "请读取" + filename
-    assert resolve_document_path(question).name == filename
+    # 测试必须自带夹具，不能依赖不会提交到仓库的本地开发日志。
+    with TemporaryDirectory() as temp_dir:
+        document = Path(temp_dir) / filename
+        document.write_text("测试文档", encoding="utf-8")
+
+        resolved = resolve_document_path(question, search_roots=[Path(temp_dir)])
+
+    assert resolved == document.resolve()
 
 
 def test_multiple_document_targets_come_from_structured_plan() -> None:
@@ -38,4 +46,5 @@ def test_report_filename_is_not_polluted_by_action_description() -> None:
 if __name__ == "__main__":
     test_action_prefix_is_removed_from_document_target()
     test_multiple_document_targets_come_from_structured_plan()
+    test_report_filename_is_not_polluted_by_action_description()
     print("document target parsing passed")
