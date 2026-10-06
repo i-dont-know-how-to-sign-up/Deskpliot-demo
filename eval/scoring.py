@@ -116,6 +116,16 @@ def score_case(
     pending_kwargs = pending_arguments if pending_arguments is not None else pending.get("kwargs", {})
     if "must_have_steps" in expected:
         checks["required_steps_ok"] = all(name in names for name in expected["must_have_steps"])
+    if "must_have_step_status" in expected:
+        required_statuses = expected["must_have_step_status"]
+        actual_statuses = {
+            str(item.name): str(item.status)
+            for item in getattr(result, "steps", [])
+        }
+        checks["step_status_ok"] = all(
+            actual_statuses.get(str(name)) == str(status)
+            for name, status in required_statuses.items()
+        )
     if "ordered_steps" in expected:
         required = expected["ordered_steps"]
         positions = [names.index(name) if name in names else -1 for name in required]
@@ -189,6 +199,7 @@ def score_case(
         if field in expected:
             applicable_checks.append(checks[check_name])
     for field, check_name in (("must_have_steps", "required_steps_ok"),
+                              ("must_have_step_status", "step_status_ok"),
                               ("ordered_steps", "ordered_steps_ok"),
                               ("min_evidence_documents", "evidence_documents_ok"),
                               ("artifact", "artifact_ok"),
@@ -205,6 +216,8 @@ def score_case(
                     ("requires_confirmation", "confirmation_ok"), ("pending_path_suffix", "pending_path_ok"),
                     ("pending_tool", "pending_tool_ok"), ("pending_arguments_contains", "pending_arguments_ok"))
                    if field in expected]
+    if "must_have_step_status" in expected:
+        hard_checks.append(checks["step_status_ok"])
     hard_checks.extend(
         checks[name] for field, name in (("pending_target_absent", "pending_target_absent_ok"),)
         if field in expected

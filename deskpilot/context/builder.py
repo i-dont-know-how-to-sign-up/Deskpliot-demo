@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import json
+import re
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
@@ -9,7 +10,7 @@ from typing import Any
 from .budget_manager import AdaptiveBudgetManager, RoleBudget
 from .compressor import ContextCompressor
 from .models import AssembledContext, ContextConfig, ContextPacket
-from .quality import calculate_context_quality
+from .quality import calculate_context_quality, lost_in_middle_metrics, summary_fact_consistency
 from .tokenizer import ModelTokenizer
 from ..core.models import Evidence
 from ..memory.memory_models import MemoryItem, SessionMessage
@@ -60,7 +61,19 @@ class ContextBuilder:
             question, workspace_memory, session_summary, recent_messages, retrieved_memories,
             planner_state=planner_state, tool_outputs=tool_outputs, evidences=evidences,
         )
-        return self.build_from_packets(packets, retrieved_memories, role=role, complexity=complexity)
+        result = self.build_from_packets(packets, retrieved_memories, role=role, complexity=complexity)
+        if session_summary.strip():
+            source_texts = [message.content for message in recent_messages]
+            if workspace_memory.strip():
+                source_texts.append(workspace_memory)
+            result.quality["summary_fact_consistency"] = summary_fact_consistency(
+                session_summary, source_texts
+            ) if source_texts else {"claims": 0, "consistency": None, "unsupported_claims": []}
+        required_ids = [packet.packet_id for packet in result.packets + result.dropped_packets if packet.required]
+        result.quality["lost_in_middle"] = lost_in_middle_metrics(
+            [packet.packet_id for packet in result.packets], required_ids
+        )
+        return result
 
     def build_from_packets(
         self,
@@ -111,6 +124,7 @@ class ContextBuilder:
             input_budget=role_budget.input_tokens,
             output_budget=role_budget.output_tokens,
             complexity=role_budget.complexity,
+            attribution=list(quality.get("packet_attribution", [])),
         )
 
     def for_role(
@@ -124,7 +138,9 @@ class ContextBuilder:
         evidences: list[Evidence] | None = None,
         evidence_grounded: bool = False,
     ) -> AssembledContext:
-        packets = [replace(packet) for packet in context.packets + context.dropped_packets]
+        all_packets = [replace(packet) for packet in context.packets + context.dropped_packets]
+        packets = self._filter_for_role(all_packets, role)
+        role_filtered = {packet.packet_id for packet in all_packets} - {packet.packet_id for packet in packets}
         if evidence_grounded:
             # 文档问答中的事实只能来自 Evidence。保留用户偏好和最近的用户消息用于
             # 理解输出要求，但隔离摘要、助手历史回答和事实型长期记忆，避免幻觉回流。
@@ -146,12 +162,28 @@ class ContextBuilder:
                 or packet.content.lstrip().startswith("- user:")
             ]
         packets.extend(self._runtime_packets(planner_state, tool_outputs, evidences))
-        return self.build_from_packets(
+        result = self.build_from_packets(
             self._deduplicate_packets(packets),
             context.retrieved_memories,
             role=role,
             complexity=context.complexity if complexity is None else complexity,
         )
+        for packet in all_packets:
+            if packet.packet_id in role_filtered:
+                result.attribution.append({
+                    "packet_id": packet.packet_id,
+                    "kind": packet.kind,
+                    "source": packet.source,
+                    "state": "dropped",
+                    "reason": "role_filtered",
+                    "estimated_tokens": packet.estimated_tokens,
+                    "relevance": round(packet.relevance_score, 4),
+                    "required": packet.required,
+                })
+        result.quality["packet_attribution"] = result.attribution
+        result.quality["role_filtered_packets"] = len(role_filtered)
+        result.debug_lines.append(f"Role filtered packets: {len(role_filtered)}")
+        return result
 
     def gather(
         self,
@@ -169,9 +201,15 @@ class ContextBuilder:
         if question.strip():
             packets.append(self._packet("task", "current_question", question, required=True, priority=140, relevance=1.0))
         if workspace_memory.strip():
-            packets.append(self._packet("workspace", "workspace", workspace_memory, required=True, priority=100))
+            packets.append(self._packet(
+                "workspace", "workspace", workspace_memory, priority=100,
+                relevance=self._text_relevance(question, workspace_memory),
+            ))
         if session_summary.strip():
-            packets.append(self._packet("summary", "session_summary", session_summary, required=True, priority=90))
+            packets.append(self._packet(
+                "summary", "session_summary", session_summary, priority=90,
+                relevance=self._text_relevance(question, session_summary),
+            ))
         recent = recent_messages[-self.config.recent_message_limit :]
         for index, message in enumerate(recent):
             content = " ".join(message.content.strip().split())
@@ -184,7 +222,7 @@ class ContextBuilder:
                 required=index >= max(0, len(recent) - 2),
                 # 最新两条消息优先级高于静态工作区，极小预算下也先保住当前对话。
                 priority=(120 + index) if index >= max(0, len(recent) - 2) else (80 + index),
-                relevance=0.55,
+                relevance=max(0.15, self._text_relevance(question, content)),
             )
             packet = self.compressor.compress(packet, self.config.per_message_tokens)
             packet.estimated_tokens = self.tokenizer.count(packet.content)
@@ -327,3 +365,30 @@ class ContextBuilder:
             if previous is None or packet.priority >= previous.priority:
                 selected[packet.packet_id] = packet
         return list(selected.values())
+
+    def _filter_for_role(self, packets: list[ContextPacket], role: str) -> list[ContextPacket]:
+        """按角色渐进披露上下文，避免 Router/Planner 重复接收无关状态。"""
+        if role == "router":
+            allowed = {"task", "recent_message", "summary", "memory"}
+            return [
+                packet for packet in packets
+                if packet.kind in allowed
+                and (packet.kind in {"task", "recent_message"} or packet.relevance_score >= 0.25)
+            ]
+        if role == "planner":
+            allowed = {"task", "workspace", "summary", "recent_message", "planner_state", "tool_output"}
+            return [
+                packet for packet in packets
+                if packet.kind in allowed
+                and (packet.required or packet.kind in {"task", "planner_state", "tool_output"}
+                     or packet.relevance_score >= 0.18)
+            ]
+        return packets
+
+    @staticmethod
+    def _text_relevance(question: str, content: str) -> float:
+        query_terms = set(re.findall(r"[a-z0-9_.+-]+|[\u4e00-\u9fff]{2,}", question.casefold()))
+        if not query_terms:
+            return 0.0
+        value = content.casefold()
+        return min(1.0, sum(term in value for term in query_terms) / len(query_terms))

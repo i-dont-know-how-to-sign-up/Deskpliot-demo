@@ -56,3 +56,4 @@ class AssembledContext:
     input_budget: int = 0
     output_budget: int = 0
     complexity: int = 0
+    attribution: list[dict[str, Any]] = field(default_factory=list)

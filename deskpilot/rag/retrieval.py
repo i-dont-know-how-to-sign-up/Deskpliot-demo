@@ -235,9 +235,10 @@ class HybridRetriever:
             item.final_score = item.rerank_score
         pool.sort(key=lambda item: (item.rerank_score, item.score), reverse=True)
         output = pool[:top_n]
+        metadata = reranker.metadata() if hasattr(reranker, "metadata") else {}
         trace.add("rerank", started, len(ranked), len(output), requested_provider=requested,
                   effective_provider=effective, candidate_limit=pool_size, top_n=top_n,
-                  fallback=bool(error), error=error)
+                  fallback=bool(error), error=error, model_metadata=metadata)
         return output, effective
 
     def _apply_threshold(self, request: RetrievalRequest, ranked: list[RetrievalCandidate],

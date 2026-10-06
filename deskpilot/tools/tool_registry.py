@@ -79,6 +79,8 @@ class ToolResult:
     tool_name: str
     output: Any = None
     error: str = ""
+    status: str = "success"
+    error_code: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -86,6 +88,8 @@ class ToolResult:
             "tool_name": self.tool_name,
             "output": self.output,
             "error": self.error,
+            "status": self.status,
+            "error_code": self.error_code,
         }
 
 
@@ -114,29 +118,69 @@ class ToolRegistry:
     def call(self, name: str, **kwargs: Any) -> ToolResult:
         spec = self._tools.get(name)
         if not spec:
-            return ToolResult(ok=False, tool_name=name, error=f"Unknown tool: {name}")
+            return ToolResult(ok=False, tool_name=name, error=f"Unknown tool: {name}", status="failed", error_code="UNKNOWN_TOOL")
         try:
             # 只把工具 schema 里声明过的参数传给处理函数，避免审批回放时被额外字段打断。
             allowed_keys = {parameter.name for parameter in spec.parameters}
             filtered_kwargs = {key: value for key, value in kwargs.items() if key in allowed_keys}
             output = spec.handler(**filtered_kwargs)
-            return ToolResult(ok=True, tool_name=name, output=output)
+            status, error_code = self._output_state(output)
+            return ToolResult(ok=True, tool_name=name, output=output, status=status, error_code=error_code)
         except Exception as exc:
-            return ToolResult(ok=False, tool_name=name, error=str(exc))
+            return ToolResult(
+                ok=False, tool_name=name, error=str(exc), status="failed",
+                error_code=self._exception_code(exc),
+            )
 
     def call_approved(self, name: str, **kwargs: Any) -> ToolResult:
         """执行已经由一次性审批状态确认的调用，禁止普通路由触达此入口。"""
         spec = self._tools.get(name)
         if not spec:
-            return ToolResult(ok=False, tool_name=name, error=f"Unknown tool: {name}")
+            return ToolResult(ok=False, tool_name=name, error=f"Unknown tool: {name}", status="failed", error_code="UNKNOWN_TOOL")
         if spec.approval_handler is None:
-            return ToolResult(ok=False, tool_name=name, error=f"Tool does not support approved execution: {name}")
+            return ToolResult(ok=False, tool_name=name, error=f"Tool does not support approved execution: {name}", status="failed", error_code="APPROVAL_NOT_SUPPORTED")
         try:
             allowed_keys = {parameter.name for parameter in spec.parameters}
             filtered_kwargs = {key: value for key, value in kwargs.items() if key in allowed_keys}
-            return ToolResult(ok=True, tool_name=name, output=spec.approval_handler(**filtered_kwargs))
+            output = spec.approval_handler(**filtered_kwargs)
+            status, error_code = self._output_state(output)
+            return ToolResult(ok=True, tool_name=name, output=output, status=status, error_code=error_code)
         except Exception as exc:
-            return ToolResult(ok=False, tool_name=name, error=str(exc))
+            return ToolResult(
+                ok=False, tool_name=name, error=str(exc), status="failed",
+                error_code=self._exception_code(exc),
+            )
+
+    @staticmethod
+    def _output_state(output: Any) -> tuple[str, str]:
+        if not isinstance(output, dict):
+            return "success", ""
+        permission = output.get("permission")
+        if isinstance(permission, dict):
+            if permission.get("blocked"):
+                reasons = " ".join(str(item) for item in permission.get("reasons", []))
+                code = "PROTECTED_PATH" if "protected" in reasons.casefold() else "POLICY_BLOCKED"
+                return "blocked", code
+            if permission.get("requires_confirmation") and not any(
+                output.get(key) for key in ("written", "executed", "sent", "saved", "confirmed")
+            ):
+                return "waiting_human", "CONFIRMATION_REQUIRED"
+        return "success", ""
+
+    @staticmethod
+    def _exception_code(exc: Exception) -> str:
+        if isinstance(exc, FileNotFoundError):
+            return "FILE_NOT_FOUND"
+        if isinstance(exc, PermissionError):
+            return "PERMISSION_DENIED"
+        message = str(exc).casefold()
+        if "protected system" in message or "受保护" in message:
+            return "PROTECTED_PATH"
+        if "does not exist" in message or "not found" in message or "不存在" in message:
+            return "FILE_NOT_FOUND"
+        if "timeout" in message or "timed out" in message or "超时" in message:
+            return "TIMEOUT"
+        return "TOOL_EXECUTION_ERROR"
 
 
 def build_default_tool_registry(

@@ -1,0 +1,17 @@
+{
+  "name": "baseline-api-v0.8.0",
+  "description": "DeskPilot v0.8.0 精选真实模型 API 基线。外部网页和邮箱均使用 fixture/mock，不访问私人邮箱，不执行真实外部副作用。",
+  "case_ids": [
+    "direct_001",
+    "route_005",
+    "rag_003",
+    "reg_debug3_004",
+    "tool_006",
+    "memory_001",
+    "context_006",
+    "composite_001",
+    "multi_exec_001",
+    "safe_009",
+    "recovery_001"
+  ]
+}

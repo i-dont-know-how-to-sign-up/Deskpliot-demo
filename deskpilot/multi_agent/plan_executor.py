@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from .schemas import TaskPlan, TaskPlanStep
 from .supervisor import SupervisorAgent, SupervisorResult
+from .task_ledger import TaskLedger
 
 
 @dataclass
@@ -26,11 +27,71 @@ class PlanExecutor:
         research: Callable[[str], Any],
         llm_call: Callable[[str], str],
         supervisor: SupervisorAgent | None = None,
+        task_ledger: TaskLedger | None = None,
     ) -> None:
         self.tool_call = tool_call
         self.research = research
         self.llm_call = llm_call
         self.supervisor = supervisor or SupervisorAgent()
+        self.task_ledger = task_ledger
+
+    def execute_bound_plan(
+        self,
+        plan_preview: dict[str, Any],
+        handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]],
+        *,
+        initial_values: dict[str, Any] | None = None,
+        parallel: bool = False,
+    ) -> SupervisorResult:
+        """执行 Planner DAG，并按节点 ID 注入受控领域 handler。
+
+        Planner 只描述依赖、Agent 和允许工具，不直接携带可执行函数。Core 在
+        执行前完成绑定，因此同一 Runtime 可以承载网页、文件、索引和邮件任务，
+        也便于评测替换外部依赖。
+        """
+        raw_steps = plan_preview.get("steps", [])
+        if not isinstance(raw_steps, list) or not raw_steps:
+            return SupervisorResult("failed", dict(initial_values or {}), [], "计划没有可执行节点")
+        steps: list[TaskPlanStep] = []
+        for raw in raw_steps:
+            if not isinstance(raw, dict):
+                continue
+            step_id = str(raw.get("id") or raw.get("step_id") or "").strip()
+            if not step_id:
+                return SupervisorResult("failed", dict(initial_values or {}), [], "计划节点缺少 ID")
+            handler = handlers.get(step_id)
+            if handler is None:
+                return SupervisorResult(
+                    "failed", dict(initial_values or {}), [], f"计划节点未绑定执行器：{step_id}",
+                )
+            steps.append(TaskPlanStep(
+                step_id=step_id,
+                agent=str(raw.get("agent") or "executor"),
+                description=str(raw.get("description") or step_id),
+                depends_on=[str(value) for value in raw.get("depends_on", [])],
+                allowed_tools=[str(value) for value in raw.get("allowed_tools", [])],
+                requires_human=bool(raw.get("requires_human", False)),
+                arguments=dict(raw.get("arguments", {})) if isinstance(raw.get("arguments"), dict) else {},
+                handler=handler,
+                max_retries=max(0, int(raw.get("max_retries", 1) or 0)),
+            ))
+        plan = TaskPlan(
+            goal=str(plan_preview.get("goal") or "执行复杂任务"),
+            route="multi_agent",
+            steps=steps,
+            complexity_score=int(plan_preview.get("score", 0) or 0),
+        )
+        task_id = self.task_ledger.start(plan) if self.task_ledger else ""
+        result = self.supervisor.execute(
+            plan,
+            initial_values=initial_values,
+            parallel=parallel,
+            on_result=(lambda item: self.task_ledger.update_node(task_id, item)) if self.task_ledger else None,
+        )
+        if self.task_ledger:
+            self.task_ledger.finish(task_id, result.status, result.error)
+            result.values["task_id"] = task_id
+        return result
 
     def execute_email_plan(
         self,
@@ -38,7 +99,16 @@ class PlanExecutor:
         request: dict[str, Any],
     ) -> PlanExecution:
         plan = self._email_plan_from_preview(plan_preview, request)
-        result = self.supervisor.execute(plan, initial_values={"request": dict(request)}, parallel=False)
+        task_id = self.task_ledger.start(plan) if self.task_ledger else ""
+        result = self.supervisor.execute(
+            plan,
+            initial_values={"request": dict(request)},
+            parallel=False,
+            on_result=(lambda item: self.task_ledger.update_node(task_id, item)) if self.task_ledger else None,
+        )
+        if self.task_ledger:
+            self.task_ledger.finish(task_id, result.status, result.error)
+            result.values["task_id"] = task_id
         commit = next((item for item in result.results if item.output.get("tool_name") in {
             "email.send", "email.save_draft",
         }), None)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 from .memory_models import MemoryItem, SessionMessage
 from .session_store import SessionStore
 from ..core.api_clients import OpenAICompatibleClient
@@ -46,13 +48,15 @@ class MemoryCompactor:
             f"结构化记忆：\n{memory_lines or '无'}\n\n"
             f"checkpoint 后新增对话：\n{transcript or '无'}"
         )
-        response = self.client.chat(
-            [
-                {"role": "system", "content": "你是会话压缩器，只输出 Markdown 摘要。"},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.0,
-        )
+        stage = getattr(self.client, "stage", None)
+        with (stage("Memory Compaction") if callable(stage) else nullcontext()):
+            response = self.client.chat(
+                [
+                    {"role": "system", "content": "你是会话压缩器，只输出 Markdown 摘要。"},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+            )
         if response:
             return response.strip()
         return self._fallback_summary(existing_summary, messages, memories)

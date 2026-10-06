@@ -22,6 +22,8 @@ class IntentDecision:
     requires_fresh_information: bool = False
     # 用户要求答案依据哪类资料；用于阻止“根据知识库”被降级为无证据直接回答。
     knowledge_scope: str = "general"
+    # 简单问答由 Router 在同一次模型调用中返回正文，避免 Router + Answer 双调用。
+    direct_response: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

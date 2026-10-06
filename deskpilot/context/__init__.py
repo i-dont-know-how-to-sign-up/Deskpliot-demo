@@ -4,9 +4,11 @@ from .builder import ContextBuilder
 from .budget_manager import AdaptiveBudgetManager, RoleBudget
 from .cost_tracker import UsageCostTracker, UsageSnapshot
 from .models import AssembledContext, ContextConfig, ContextPacket
+from .quality import context_precision_recall, lost_in_middle_metrics, summary_fact_consistency
 from .tokenizer import ModelTokenizer, TokenCount
 
 __all__ = [
     "AdaptiveBudgetManager", "AssembledContext", "ContextBuilder", "ContextConfig", "ContextPacket",
     "ModelTokenizer", "RoleBudget", "TokenCount", "UsageCostTracker", "UsageSnapshot",
+    "context_precision_recall", "lost_in_middle_metrics", "summary_fact_consistency",
 ]

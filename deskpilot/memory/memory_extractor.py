@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from contextlib import nullcontext
 
 from ..core.api_clients import OpenAICompatibleClient
 from ..core.config import load_config
@@ -51,13 +52,15 @@ class MemoryExtractor:
             "无外部证据时，禁止从助手回答抽取 fact。\n"
             f"用户消息：{user_message}\n\n助手回答：{assistant_message[:1200]}"
         )
-        response = self.client.chat(
-            [
-                {"role": "system", "content": "你只输出合法 JSON，不输出解释。"},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.0,
-        )
+        stage = getattr(self.client, "stage", None)
+        with (stage("Memory Extraction") if callable(stage) else nullcontext()):
+            response = self.client.chat(
+                [
+                    {"role": "system", "content": "你只输出合法 JSON，不输出解释。"},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+            )
         if not response:
             return []
         raw_items = parse_json_value(response, list)

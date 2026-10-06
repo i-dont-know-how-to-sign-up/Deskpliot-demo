@@ -13,10 +13,40 @@ from deskpilot.memory.turn_manager import MemoryTurnManager
 from deskpilot.multi_agent.plan_executor import PlanExecutor
 from deskpilot.multi_agent.schemas import TaskPlan, TaskPlanStep
 from deskpilot.multi_agent.supervisor import SupervisorAgent
+from deskpilot.multi_agent.task_ledger import TaskLedger
 from deskpilot.tools.tool_registry import ToolResult
 
 
 class PlanExecutorTests(unittest.TestCase):
+    def test_bound_plan_persists_sanitized_task_ledger(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="deskpilot_ledger_") as raw:
+            ledger = TaskLedger(Path(raw) / "tasks.json")
+            executor = PlanExecutor(
+                tool_call=lambda name, **kwargs: ToolResult(True, name, {}),
+                research=lambda topic: None,
+                llm_call=lambda prompt: "",
+                task_ledger=ledger,
+            )
+            result = executor.execute_bound_plan(
+                {
+                    "goal": "读取资料后生成摘要",
+                    "steps": [
+                        {"id": "read", "agent": "knowledge", "allowed_tools": ["files.read_document"]},
+                        {"id": "synthesize", "agent": "knowledge", "depends_on": ["read"]},
+                    ],
+                },
+                {
+                    "read": lambda values: {"artifact_path": "report.md", "secret": "not persisted"},
+                    "synthesize": lambda values: {"answer": "done"},
+                },
+            )
+
+            records = ledger.list_tasks()
+            self.assertEqual(result.status, "success")
+            self.assertEqual(records[0]["status"], "success")
+            self.assertEqual(records[0]["nodes"]["read"]["artifact_paths"], ["report.md"])
+            self.assertNotIn("secret", str(records[0]))
+
     def test_email_plan_runs_through_supervisor_and_waits_for_approval(self) -> None:
         calls: list[tuple[str, dict[str, object]]] = []
 

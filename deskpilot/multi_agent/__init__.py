@@ -5,6 +5,7 @@ from .router import MultiAgentRouter, RouteDecision
 from .schemas import AgentResult, TaskPlan, TaskPlanStep
 from .supervisor import SupervisorAgent
 from .plan_executor import PlanExecution, PlanExecutor
+from .task_ledger import TaskLedger
 from .agents import CommunicationAgent, KnowledgeAgent, ReflectionAgent
 
 __all__ = [
@@ -17,6 +18,7 @@ __all__ = [
     "SupervisorAgent",
     "PlanExecution",
     "PlanExecutor",
+    "TaskLedger",
     "KnowledgeAgent",
     "CommunicationAgent",
     "ReflectionAgent",

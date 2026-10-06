@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 from concurrent.futures import ThreadPoolExecutor
 import time
 
@@ -19,7 +19,10 @@ class SupervisorResult:
 class SupervisorAgent:
     """P0 顺序 DAG Supervisor，负责依赖、预算和人工确认状态。"""
 
-    def execute(self, plan: TaskPlan, initial_values: dict[str, Any] | None = None, *, parallel: bool = True) -> SupervisorResult:
+    def execute(
+        self, plan: TaskPlan, initial_values: dict[str, Any] | None = None, *, parallel: bool = True,
+        on_result: Callable[[AgentResult], None] | None = None,
+    ) -> SupervisorResult:
         started = time.monotonic()
         values = dict(initial_values or {})
         results: list[AgentResult] = []
@@ -63,6 +66,8 @@ class SupervisorAgent:
                 batch_results = [run_step(batch[0])]
             for step, result in batch_results:
                 results.append(result)
+                if on_result is not None:
+                    on_result(result)
                 completed.add(step.step_id)
                 outputs_by_step[step.step_id] = dict(result.output)
                 values.update(result.output)

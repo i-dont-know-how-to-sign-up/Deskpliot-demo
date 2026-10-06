@@ -4,6 +4,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 from ..core.api_clients import cosine_similarity, local_hash_embedding
@@ -92,21 +93,38 @@ class LexicalCrossEncoderReranker:
 
 class SentenceTransformersCrossEncoderReranker:
     provider = "cross_encoder"
+    _models: dict[str, object] = {}
 
     def __init__(self, model_name: str) -> None:
         if not model_name.strip():
             raise RuntimeError("RAG_RERANK_MODEL 未配置，拒绝隐式下载 Cross-Encoder 模型")
+        self.model_name = model_name.strip()
+        self.model: object | None = None
+
+    def _load_model(self) -> object:
+        if self.model is not None:
+            return self.model
+        cached = self._models.get(self.model_name)
+        if cached is not None:
+            self.model = cached
+            return cached
         try:
             from sentence_transformers import CrossEncoder  # type: ignore[import-not-found]
         except ImportError as exc:
-            raise RuntimeError("未安装 sentence-transformers") from exc
-        # local_files_only 防止桌面问答时意外下载数 GB 模型。
-        self.model = CrossEncoder(model_name, automodel_args={"local_files_only": True})
+            raise RuntimeError(
+                "未安装可选依赖 sentence-transformers；请执行 python -m pip install -r requirements-rerank.txt"
+            ) from exc
+        # local_files_only 防止桌面问答时意外下载模型；下载由用户在安装阶段显式完成。
+        model = CrossEncoder(self.model_name, automodel_args={"local_files_only": True})
+        self._models[self.model_name] = model
+        self.model = model
+        return model
 
     def rerank(self, query: str, documents: list[RerankDocument]) -> list[RerankScore]:
         if not documents:
             return []
-        scores = self.model.predict([(query, item.model_text()) for item in documents])
+        model = self._load_model()
+        scores = model.predict([(query, item.model_text()) for item in documents])
         values = [float(value) for value in scores]
         # 不同模型可能输出 logit 或 0-1 分数，统一映射到 0-1。
         normalized = [value if 0.0 <= value <= 1.0 else 1.0 / (1.0 + math.exp(-value)) for value in values]
@@ -115,6 +133,21 @@ class SentenceTransformersCrossEncoderReranker:
             key=lambda value: value.score,
             reverse=True,
         )
+
+    def metadata(self) -> dict[str, object]:
+        path = Path(self.model_name)
+        disk_bytes = 0
+        if path.exists():
+            try:
+                disk_bytes = sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+            except OSError:
+                disk_bytes = 0
+        return {
+            "model": self.model_name,
+            "lazy_loaded": self.model is not None,
+            "disk_bytes": disk_bytes,
+            "local_files_only": True,
+        }
 
 
 class HashColBERTReranker:

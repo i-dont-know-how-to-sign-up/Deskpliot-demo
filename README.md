@@ -1,5 +1,7 @@
 # DeskPilot
 
+> 当前版本：`0.8.0`
+
 DeskPilot 是一个本地优先、面向个人办公场景的桌面 Agent。它将本地文档 RAG、会话记忆、网页调研、邮件处理、文件与终端工具、权限控制和多智能体编排整合到一个 PySide6 + Qt Quick 桌面应用中。
 
 项目当前以“可运行、可审计、可评测”为目标：简单问题直接回答，单工具任务由语义路由器选择工具，复杂任务进入 Plan-and-Execute / Multi-Agent 流程；检索证据、计划、工具步骤、权限请求和上下文统计都可以在桌面端查看。
@@ -157,7 +159,7 @@ DeskPilot 内部 Tool Registry 直接复用邮件 MCP 业务层，因此启动�
 | 记忆存储 | JSONL、SQLite、可选 Chroma |
 | 浏览器 | Playwright，可复用 Chrome/Chromium |
 | 邮件 | IMAP、SMTP、可选 MCP stdio Server |
-| 测试与评测 | Python 回归脚本、152 条 DeskPilotBench、RAG P0/P1/P2 检索评测、GitHub Actions CI |
+| 测试与评测 | Python 回归脚本、160 条 DeskPilotBench、RAG P0/P1/P2 检索评测、GitHub Actions CI |
 
 当前核心实现没有引入 LangChain、LlamaIndex 或 LangGraph，以便直接观察路由、检索、上下文和 Agent Loop 的内部行为。
 
@@ -210,6 +212,7 @@ python -m pip install -r requirements.txt
 - `PyMuPDF`、`pypdf`：PDF 解析与 PDF 写入。
 - `playwright`：浏览器搜索和动态网页读取。
 - `mcp`：可选邮件 MCP stdio Server。
+- `pytest`：执行完整测试模块和版本基线。
 
 可选依赖：
 
@@ -376,6 +379,19 @@ DeskPilotBench 离线模式不会调用真实模型、网页或邮箱：
 ```powershell
 .\.conda\deskpilot-py311\python.exe -m eval.run_eval --count 20 --mode offline
 ```
+
+生成当前版本的完整可复现基线（31 个测试模块、160 条离线评测和精选真实 API 套件）：
+
+```powershell
+.\.conda\deskpilot-py311\python.exe -m eval.run_baseline `
+  --project-version 0.8.1 `
+  --api-suite baseline_api_v0.8.0 `
+  --compare-baseline D:\broagent\eval\baselines\deskpilot_baseline_v0.8.0_20261006T191333+0800 `
+  --change-summary "完成P1基线整改与复杂任务Runtime统一" `
+  --change-summary "完成P1.5调用归因与P2质量性能闭环"
+```
+
+完整基线会消耗真实 LLM/Embedding API 配额，且强制禁用本地 fallback。报告按版本和带时区时间戳写入 `eval/baselines/`，该目录包含模型输出和本机运行信息，已从 Git 排除。
 
 使用真实模型 API 或运行单例：
 

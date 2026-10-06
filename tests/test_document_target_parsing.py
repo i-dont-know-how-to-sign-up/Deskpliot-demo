@@ -28,6 +28,13 @@ def test_multiple_document_targets_come_from_structured_plan() -> None:
     assert targets == ["开发日志.md", "开发计划文档.md"]
 
 
+def test_report_filename_is_not_polluted_by_action_description() -> None:
+    agent = DocumentQAAgent.__new__(DocumentQAAgent)
+    raw = "再将带引用来源的结论保存到当前目录的技术报告.md"
+
+    assert agent._normalize_file_write_target(raw) == "技术报告.md"
+
+
 if __name__ == "__main__":
     test_action_prefix_is_removed_from_document_target()
     test_multiple_document_targets_come_from_structured_plan()

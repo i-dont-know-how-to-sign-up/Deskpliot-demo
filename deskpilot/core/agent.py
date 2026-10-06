@@ -6,7 +6,9 @@ import os
 import re
 import sys
 import threading
+from contextlib import ExitStack
 from pathlib import Path
+from typing import Any, Callable
 
 from .api_clients import OpenAICompatibleClient
 from .approval import PendingActionStore
@@ -32,6 +34,7 @@ from ..tools.tool_registry import build_default_tool_registry
 from ..multi_agent.planner import PlannerAgent
 from ..multi_agent.plan_executor import PlanExecutor
 from ..multi_agent.router import MultiAgentRouter
+from ..multi_agent.task_ledger import TaskLedger
 
 
 class DocumentQAAgent:
@@ -56,7 +59,8 @@ class DocumentQAAgent:
         )
         self.query_optimizer = QueryOptimizer()
         self.query_analyzer = QueryAnalyzer(
-            llm_call=lambda prompt: self.client.chat(
+            llm_call=lambda prompt: self._chat_with_stage(
+                "Query Optimization",
                 [
                     {"role": "system", "content": "你是检索查询分析器，只输出请求指定的内容。"},
                     {"role": "user", "content": prompt},
@@ -70,6 +74,8 @@ class DocumentQAAgent:
         self._operation_lock = threading.RLock()
         self._turn_usage_start = self.usage_tracker.snapshot(self._combined_usage())
         self.workspace_root = Path.cwd().resolve()
+        # Ledger 跟随索引所在的数据目录，测试/评测使用临时索引时不会污染项目工作区。
+        self.task_ledger = TaskLedger(Path(self.index.index_file).parent / "task_ledger.json")
         self.tool_registry = build_default_tool_registry(index, self.web_research_agent, workspace_root=self.workspace_root)
         self.pending_actions = PendingActionStore()
         self.runtime = PlanAndExecuteRuntime(default_max_retries=1)
@@ -78,7 +84,8 @@ class DocumentQAAgent:
         # PlanExecutor + Supervisor 执行，其余任务暂走兼容执行链。
         self.multi_agent_router = MultiAgentRouter(
             PlannerAgent(
-                llm_call=lambda prompt: self.client.chat(
+                llm_call=lambda prompt: self._chat_with_stage(
+                    "Planner",
                     [{"role": "system", "content": "你是 DeskPilot 的任务规划器，只输出 JSON。"},
                      {"role": "user", "content": prompt}],
                     temperature=0.0,
@@ -179,13 +186,30 @@ class DocumentQAAgent:
     def list_tools(self, category: str | None = None) -> list[dict[str, object]]:
         return self.tool_registry.list_tools(category=category)
 
+    def list_tasks(self, *, recovery_only: bool = False) -> list[dict[str, object]]:
+        """供桌面端或调试工具查看持久化任务；中断副作用不会在这里自动重放。"""
+        if recovery_only:
+            return self.task_ledger.recovery_candidates()
+        return self.task_ledger.list_tasks()
+
     def call_tool(self, name: str, **kwargs) -> object:
         return self.tool_registry.call(name, **kwargs).to_dict()
 
-    def answer(self, question: str, top_k: int = 5, session_id: str | None = None) -> AnswerResult:
+    def answer(
+        self,
+        question: str,
+        top_k: int = 5,
+        session_id: str | None = None,
+        event_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> AnswerResult:
         """串行执行一次问答，隔离共享的 Client、Index trace 和 usage 快照。"""
         with self._operation_lock:
-            return self._answer_unlocked(question, top_k=top_k, session_id=session_id)
+            with ExitStack() as stack:
+                for client in self._usage_clients():
+                    event_stream = getattr(client, "event_stream", None)
+                    if callable(event_stream):
+                        stack.enter_context(event_stream(event_callback))
+                return self._answer_unlocked(question, top_k=top_k, session_id=session_id)
 
     def _answer_unlocked(self, question: str, top_k: int = 5, session_id: str | None = None) -> AnswerResult:
         if hasattr(self, "usage_tracker"):
@@ -334,7 +358,7 @@ class DocumentQAAgent:
             if web_file_request is not None:
                 return self._answer_web_file_request(
                     question, web_file_request, steps, session.session_id,
-                    user_message.message_id, memory_context,
+                    user_message.message_id, memory_context, plan_preview=plan_preview,
                 )
             if any(
                 isinstance(item, dict)
@@ -371,7 +395,8 @@ class DocumentQAAgent:
                         doc_ids=[str(item) for item in report_request.get("doc_ids", [])],
                     )
                 return self._answer_index_report(
-                    question, report_request, steps, session.session_id, user_message.message_id, memory_context
+                    question, report_request, steps, session.session_id, user_message.message_id, memory_context,
+                    plan_preview=plan_preview,
                 )
             wants_file = decision.requires_file_output
             if not wants_file:
@@ -382,6 +407,7 @@ class DocumentQAAgent:
                     question, {"query": str(decision.arguments.get("query") or question),
                                "doc_ids": [], "path": "", "write_report": True},
                     steps, session.session_id, user_message.message_id, memory_context,
+                    plan_preview=plan_preview,
                 )
             # Router 可能正确识别为复杂只读汇总，却漏填 needs_index_catalog；Planner
             # 也可能只给 communication 空节点。只要计划无副作用、没有其他工具，且
@@ -600,6 +626,32 @@ class DocumentQAAgent:
                 memory_context=memory_context,
             )
 
+        missing_subject = self._unsupported_negative_subject(question, evidences)
+        if missing_subject:
+            # 否定性核验不能把相近片段摘要当成肯定答案。目标术语完全未出现时，
+            # 直接返回带检索范围引用的“证据不足”，无须依赖生成模型猜测。
+            steps.append(AgentStep(
+                "evidence_sufficiency",
+                "insufficient",
+                f"检索证据未出现待核实主题：{missing_subject}",
+            ))
+            answer = (
+                f"当前检索到的文档证据中没有提到“{missing_subject}”，"
+                "因此现有证据不足，无法确认该信息。[1]"
+            )
+            answer = self._append_source_list(answer, evidences)
+            steps.append(AgentStep("attach_citations", "success", "已附加用于核对检索范围的文档来源。"))
+            return self._finalize_answer(
+                answer=answer,
+                evidences=evidences,
+                steps=steps,
+                used_llm=False,
+                session_id=session_id,
+                user_message_id=user_message_id,
+                question=question,
+                memory_context=memory_context,
+            )
+
         evidence_context = self.context_assembler.for_role(
             memory_context,
             "answer",
@@ -609,7 +661,8 @@ class DocumentQAAgent:
         )
         steps.append(AgentStep("evidence_context", "success", "；".join(evidence_context.debug_lines)))
         prompt = self._build_prompt(question, evidences, evidence_context)
-        answer = self.client.chat(
+        answer = self._chat_with_stage(
+            "Answer",
             [
                 {
                     "role": "system",
@@ -623,6 +676,7 @@ class DocumentQAAgent:
                 {"role": "user", "content": prompt},
             ],
             max_tokens=evidence_context.output_budget,
+            stream=True,
         )
         used_llm = bool(answer)
         if used_llm:
@@ -630,7 +684,8 @@ class DocumentQAAgent:
             valid, reasons = self._validate_grounded_answer(answer, evidences)
             if not valid:
                 steps.append(AgentStep("validate_citations", "failed", "；".join(reasons)))
-                answer = self.client.chat(
+                answer = self._chat_with_stage(
+                    "Citation Repair",
                     [
                         {
                             "role": "system",
@@ -742,14 +797,16 @@ class DocumentQAAgent:
         )
 
         if decision.mode == "direct_answer":
-            answer = self._direct_answer(question, memory_context)
+            # Router 的结构化响应已同时携带最终正文，普通 DirectQA 因而只需一次模型调用。
+            answer = decision.direct_response or self._direct_answer(question, memory_context)
             used_llm = bool(answer)
             if not answer:
                 if self.client.config.llm_api_key and self.client.last_error:
                     steps.append(AgentStep("llm_api_call", "failed", self.client.last_error))
                 answer = self._direct_fallback_answer(question, memory_context)
             elif self._needs_enumeration_review(answer):
-                reviewed = self.client.chat(
+                reviewed = self._chat_with_stage(
+                    "Reflection",
                     [
                         {
                             "role": "system",
@@ -961,6 +1018,26 @@ class DocumentQAAgent:
         ]
         return bool(matched), entities
 
+    @staticmethod
+    def _unsupported_negative_subject(question: str, evidences: list[Evidence]) -> str:
+        """提取“是否提到/支持”的核验目标，并判断证据是否完全未涉及。"""
+        patterns = (
+            r"(?:是否|有没有|有无)\s*(?:提到|说明|描述|包含|支持|授权)?\s*[“\"']?"
+            r"(.+?)[”\"']?(?=[？?，,。；;]|如果|请|$)",
+            r"[“\"'](.+?)[”\"']\s*(?:是否)?\s*(?:被|得到)?\s*(?:文档|资料)?.{0,4}(?:支持|授权)",
+        )
+        subject = ""
+        for pattern in patterns:
+            match = re.search(pattern, question, flags=re.IGNORECASE)
+            if match:
+                subject = match.group(1).strip(" ：:，,。；;？?\"'“”")
+                break
+        if not subject or len(subject) > 80:
+            return ""
+        normalized_subject = re.sub(r"\s+", "", subject).casefold()
+        corpus = re.sub(r"\s+", "", "\n".join(item.text for item in evidences)).casefold()
+        return subject if normalized_subject and normalized_subject not in corpus else ""
+
     def _normalize_email_arguments(
         self, question: str, tool_name: str, arguments: dict[str, object]
     ) -> dict[str, object]:
@@ -999,12 +1076,14 @@ class DocumentQAAgent:
         executor = PlanExecutor(
             tool_call=self.tool_registry.call,
             research=self.web_research_agent.research,
-            llm_call=lambda prompt: self.client.chat(
+            llm_call=lambda prompt: self._chat_with_stage(
+                "Answer",
                 [
                     {"role": "system", "content": "你是邮件助手，只根据给定资料生成邮件正文。"},
                     {"role": "user", "content": prompt},
                 ], temperature=0.2,
             ),
+            task_ledger=getattr(self, "task_ledger", None),
         )
         execution = executor.execute_email_plan(effective_plan, request)
         for result in execution.supervisor.results:
@@ -1522,12 +1601,7 @@ class DocumentQAAgent:
     def _combined_usage(self) -> dict[str, int]:
         """汇总本轮可能参与的 LLM、Embedding、Memory 和 Web Research 客户端 usage。"""
         totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "reported_calls": 0}
-        clients = [
-            getattr(self, "client", None),
-            getattr(getattr(self, "index", None), "client", None),
-            getattr(getattr(self, "memory_store", None), "client", None),
-            getattr(getattr(self, "web_research_agent", None), "client", None),
-        ]
+        clients = self._usage_clients()
         seen: set[int] = set()
         for client in clients:
             if client is None or id(client) in seen:
@@ -1537,6 +1611,50 @@ class DocumentQAAgent:
             for key in totals:
                 totals[key] += int(usage.get(key, 0))
         return totals
+
+    def _usage_clients(self) -> list[object]:
+        """列出本轮可能调用 API 的独立客户端，保持顺序稳定并去重。"""
+        clients = [
+            getattr(self, "client", None),
+            getattr(getattr(self, "index", None), "client", None),
+            getattr(getattr(self, "memory_store", None), "client", None),
+            getattr(getattr(self, "web_research_agent", None), "client", None),
+            getattr(getattr(self, "memory_extractor", None), "client", None),
+            getattr(getattr(self, "memory_compactor", None), "client", None),
+        ]
+        seen: set[int] = set()
+        result: list[object] = []
+        for client in clients:
+            if client is None or id(client) in seen:
+                continue
+            seen.add(id(client))
+            result.append(client)
+        return result
+
+    def usage_events(self) -> list[dict[str, Any]]:
+        """返回全部客户端的逐调用记录，供评测按阶段聚合。"""
+        events: list[dict[str, Any]] = []
+        for client in self._usage_clients():
+            events.extend(dict(item) for item in getattr(client, "usage_events", []))
+        return events
+
+    def _chat_with_stage(
+        self,
+        stage: str,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.2,
+        max_tokens: int | None = None,
+        stream: bool = False,
+    ) -> str:
+        kwargs: dict[str, Any] = {"temperature": temperature}
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        stage_context = getattr(self.client, "stage", None)
+        if not callable(stage_context):
+            return self.client.chat(messages, **kwargs)
+        with stage_context(stage, stream=stream):
+            return self.client.chat(messages, **kwargs)
 
     def approve_pending_action(self, pending_action: dict, session_id: str | None = None) -> AnswerResult:
         with self._operation_lock:
@@ -1972,6 +2090,7 @@ class DocumentQAAgent:
     def _answer_web_file_request(
         self, question: str, request: dict[str, str], steps: list[AgentStep],
         session_id: str, user_message_id: str, memory_context: AssembledContext,
+        plan_preview: dict[str, object] | None = None,
     ) -> AnswerResult:
         try:
             if request.get("error"):
@@ -1993,13 +2112,46 @@ class DocumentQAAgent:
                 user_message_id=user_message_id, question=question, memory_context=memory_context,
             )
 
+        raw_steps = [
+            item for item in (plan_preview or {}).get("steps", [])
+            if isinstance(item, dict)
+        ]
+        source_raw = next((item for item in raw_steps if any(
+            tool in {"web.search", "web.research"} for tool in item.get("allowed_tools", [])
+        )), {"id": "web_search", "agent": "knowledge", "allowed_tools": ["web.search"]})
+        commit_raw = next((item for item in raw_steps if "files.write_file" in item.get("allowed_tools", [])), {
+            "id": "write_file", "agent": "commit", "allowed_tools": ["files.write_file"],
+            "depends_on": [str(source_raw.get("id") or "web_search")], "requires_human": True,
+        })
+        source_id = str(source_raw.get("id") or "web_search")
+        commit_id = str(commit_raw.get("id") or "write_file")
+        workflow_plan = {
+            "goal": question,
+            "score": (plan_preview or {}).get("score", 7),
+            "steps": [
+                {**source_raw, "id": source_id, "depends_on": [],
+                 "max_retries": source_raw.get("max_retries", 0)},
+                {**commit_raw, "id": commit_id, "depends_on": [source_id]},
+            ],
+        }
+
         def search(values: dict[str, object]) -> dict[str, object]:
-            result = self.tool_registry.call("web.search", query=query, limit=5)
+            source_tools = [str(value) for value in source_raw.get("allowed_tools", [])]
+            tool_name = "web.research" if "web.research" in source_tools else "web.search"
+            arguments = {"topic": query, "max_results": 5} if tool_name == "web.research" else {
+                "query": query, "limit": 5,
+            }
+            result = self.tool_registry.call(tool_name, **arguments)
             if not result.ok:
                 raise RuntimeError(result.error or "网页搜索失败")
+            if tool_name == "web.research":
+                content = str(result.output or "").strip()
+                if not content:
+                    raise RuntimeError("网页调研没有返回可写入报告；未创建文件。")
+                return {"file_content": content + "\n", "_tool_calls": 1}
             if not isinstance(result.output, list) or not result.output:
                 raise RuntimeError("网页搜索没有返回结果；未创建文件。")
-            return {"search_results": result.output}
+            return {"search_results": result.output, "_tool_calls": 1}
 
         def format_results(values: dict[str, object]) -> dict[str, object]:
             lines = [f"网页搜索结果：{query}", ""]
@@ -2014,20 +2166,51 @@ class DocumentQAAgent:
                 raise RuntimeError("搜索结果没有可核对的来源链接；未创建文件。")
             return {"file_content": "\n".join(lines).strip() + "\n"}
 
-        execution = self.runtime.run([
-            PlanStep("web_search", search, "已取得带来源的网页搜索结果。", max_retries=0),
-            PlanStep("prepare_file_content", format_results, "已将真实搜索结果和来源整理成正文。", max_retries=0),
-        ])
-        steps.extend(execution.agent_steps)
-        if execution.failed:
+        def write_result(values: dict[str, object]) -> dict[str, object]:
+            content = str(values.get("file_content") or "")
+            if not content:
+                content = str(format_results(values)["file_content"])
+            result = self.tool_registry.call("files.write_file", path=str(target), content=content, overwrite=False)
+            if not result.ok:
+                raise RuntimeError(result.error or "文件写入工具失败")
+            output = result.output if isinstance(result.output, dict) else {}
+            waiting = bool(output.get("permission", {}).get("requires_confirmation") and not output.get("written"))
+            if not output.get("written") and not waiting:
+                raise RuntimeError(str(output.get("message") or "文件没有写入"))
+            return {
+                "file_content": content,
+                "write_output": output,
+                "_waiting_human": waiting,
+                "_tool_calls": 1,
+            }
+
+        executor = PlanExecutor(
+            tool_call=self.tool_registry.call,
+            research=self.web_research_agent.research,
+            llm_call=lambda prompt: self._chat_with_stage("Answer", [{"role": "user", "content": prompt}]),
+            task_ledger=getattr(self, "task_ledger", None),
+        )
+        execution = executor.execute_bound_plan(
+            workflow_plan,
+            {source_id: search, commit_id: write_result},
+            initial_values={"query": query, "target": str(target)},
+            parallel=False,
+        )
+        for item in execution.results:
+            steps.append(AgentStep(
+                f"supervisor:{item.step_id}", item.status,
+                item.error or f"agent={item.agent}; tool_calls={item.tool_calls}; tokens={item.tokens}",
+            ))
+        steps.append(AgentStep("supervisor", execution.status, execution.error or "网页到文件计划执行完成。"))
+        if execution.status == "failed":
             return self._finalize_answer(
-                answer=f"未写入文件：{execution.failure}", evidences=[], steps=steps,
+                answer=f"未写入文件：{execution.error}", evidences=[], steps=steps,
                 used_llm=False, session_id=session_id, user_message_id=user_message_id,
                 question=question, memory_context=memory_context,
             )
-        content = str(execution.values["file_content"])
-        result = self.tool_registry.call("files.write_file", path=str(target), content=content, overwrite=False)
-        output = result.output if result.ok and isinstance(result.output, dict) else {}
+        content = str(execution.values.get("file_content", ""))
+        output = execution.values.get("write_output", {})
+        output = output if isinstance(output, dict) else {}
         pending = None
         if output.get("written"):
             answer = f"已将搜索结果写入文件：{target}\n\n内容附有对应来源链接。"
@@ -2042,9 +2225,10 @@ class DocumentQAAgent:
             answer = f"搜索结果已准备好，写入 {target} 需要人工确认；确认前文件不会被创建。"
             status = "waiting_human"
         else:
-            answer = f"搜索结果已准备好，但文件未写入：{result.error or output.get('message', '未知错误')}"
+            answer = f"搜索结果已准备好，但文件未写入：{output.get('message', '未知错误')}"
             status = "failed"
-        steps.append(AgentStep("write_file", status, str(target)))
+        steps.append(AgentStep("web_search", "success", f"由 Supervisor 节点 {source_id} 完成资料获取。"))
+        steps.append(AgentStep("write_file", status, f"由 Supervisor 节点 {commit_id} 处理：{target}"))
         return self._finalize_answer(
             answer=answer, evidences=[], steps=steps, used_llm=False,
             session_id=session_id, user_message_id=user_message_id,
@@ -2076,7 +2260,7 @@ class DocumentQAAgent:
         catalog = self._index_document_catalog(query)
         if not catalog:
             return []
-        reply = self.client.chat([
+        reply = self._chat_with_stage("Retrieval Planning", [
             {"role": "system", "content": "你是索引文档选择器，只输出 JSON。"},
             {"role": "user", "content": (
                 f"任务主题：{query}\n索引目录：{json.dumps(catalog, ensure_ascii=False)}\n"
@@ -2094,6 +2278,170 @@ class DocumentQAAgent:
         return list(dict.fromkeys(str(item) for item in data["doc_ids"] if str(item) in valid))[:6]
 
     def _answer_index_report(
+        self, question: str, request: dict[str, object], steps: list[AgentStep],
+        session_id: str, user_message_id: str, memory_context: AssembledContext,
+        plan_preview: dict[str, object] | None = None,
+    ) -> AnswerResult:
+        """由统一 Supervisor 执行“索引检索 -> 报告生成/写入”DAG。"""
+        query = str(request.get("query") or question).strip()
+        requested_ids = request.get("doc_ids")
+        requested_ids = [str(item) for item in requested_ids] if isinstance(requested_ids, list) else []
+        write_report = bool(request.get("write_report", True))
+        raw_steps = [item for item in (plan_preview or {}).get("steps", []) if isinstance(item, dict)]
+        source_raw = next((item for item in raw_steps if "knowledge.search" in item.get("allowed_tools", [])), {
+            "id": "retrieve_index_collection", "agent": "knowledge", "allowed_tools": ["knowledge.search"],
+        })
+        commit_raw = next((item for item in raw_steps if "files.write_file" in item.get("allowed_tools", [])), {
+            "id": "write_report", "agent": "commit", "allowed_tools": ["files.write_file"] if write_report else [],
+            "requires_human": write_report,
+        })
+        source_id = str(source_raw.get("id") or "retrieve_index_collection")
+        commit_id = str(commit_raw.get("id") or "write_report")
+        workflow_plan = {
+            "goal": question,
+            "score": (plan_preview or {}).get("score", 7),
+            "steps": [
+                {**source_raw, "id": source_id, "depends_on": []},
+                {**commit_raw, "id": commit_id, "depends_on": [source_id]},
+            ],
+        }
+
+        def retrieve(_values: dict[str, object]) -> dict[str, object]:
+            doc_ids = list(requested_ids) or self._select_index_doc_ids(query)
+            if any(doc_id not in self.index.documents for doc_id in doc_ids):
+                raise RuntimeError("计划选择的文档不在当前索引中，请刷新索引后重试")
+            if not doc_ids:
+                raise RuntimeError("无法从当前索引目录确定与主题相关的文档")
+            chunks_per_doc = min(12, max(4, 36 // min(len(doc_ids), 6)))
+            evidences = self.index.search_collection(
+                query, doc_ids=doc_ids, max_docs=6, chunks_per_doc=chunks_per_doc,
+            )
+            if not evidences:
+                raise RuntimeError("当前索引没有可用于该主题的文档证据")
+            return {"doc_ids": doc_ids, "evidences": evidences, "_tool_calls": 1}
+
+        def generate_and_commit(values: dict[str, object]) -> dict[str, object]:
+            evidences = values.get("evidences", [])
+            if not isinstance(evidences, list) or not evidences:
+                raise RuntimeError("报告节点没有收到索引证据")
+            sources: list[str] = []
+            references: list[str] = []
+            for number, evidence in enumerate(evidences, start=1):
+                doc = self.index.documents[evidence.doc_id]
+                sources.append(f"[{number}] {doc.title} | {evidence.source_label}\n{evidence.text[:600]}")
+                references.append(f"[{number}] {doc.title}；来源：{doc.path}；片段：{evidence.source_label}")
+            report = self._chat_with_stage("Answer", [
+                {"role": "system", "content": (
+                    "你是基于索引证据撰写技术报告的助手。只输出 Markdown 正文，不描述工具或权限。"
+                    "每项技术结论标注有效 [编号]；分别总结文档并比较，证据不足时明确说明。"
+                    "不要自行生成参考来源章节。"
+                )},
+                {"role": "user", "content": f"需求：{question}\n检索主题：{query}\n\n索引证据：\n" + "\n\n".join(sources)},
+            ], max_tokens=3600)
+            if not report:
+                raise RuntimeError("已检索到证据，但报告正文生成失败")
+            valid_numbers = set(range(1, len(evidences) + 1))
+            content = re.sub(
+                r"\[(\d+)\]", lambda match: match.group(0) if int(match.group(1)) in valid_numbers else "[来源待核实]",
+                fix_mojibake(report).strip(),
+            )
+            if not re.search(r"\[(\d+)\]", content):
+                content += "\n\n## 证据要点\n\n" + "\n".join(
+                    f"- [{number}] {self.index.documents[item.doc_id].title}：{item.text[:180].replace(chr(10), ' ')}"
+                    for number, item in enumerate(evidences, start=1)
+                )
+            content += "\n\n## 检索范围\n\n本报告基于索引中各文档不同位置的代表性片段，未逐页覆盖原文。\n"
+            content += "\n## 参考来源\n\n" + "\n".join(references) + "\n"
+            if not write_report:
+                return {"report_content": content, "used_llm": True}
+
+            raw_path = str(request.get("path") or "").strip()
+            current_directory = bool(re.search(r"(?:当前|本)(?:工作)?(?:目录|文件夹)(?:下|中|里|的)?", question))
+            explicit_filename = re.search(
+                r"[^\s，,；;。/\\]+?\.(?:md|markdown|txt|docx|pdf)\b", question, re.IGNORECASE,
+            )
+            if current_directory and explicit_filename is None:
+                # 用户只指定目录时忽略 Planner 猜出的文件名，继续使用稳定默认名。
+                raw_path = ""
+            try:
+                target = self._planned_output_path(question, raw_path)
+            except ValueError:
+                target = (self.workspace_root / "技术报告.md").resolve()
+            result = self.tool_registry.call("files.write_file", path=str(target), content=content, overwrite=False)
+            if not result.ok:
+                raise RuntimeError(result.error or "报告文件写入失败")
+            output = result.output if isinstance(result.output, dict) else {}
+            waiting = bool(output.get("permission", {}).get("requires_confirmation") and not output.get("written"))
+            if not output.get("written") and not waiting:
+                raise RuntimeError(str(output.get("message") or "报告文件没有写入"))
+            return {
+                "report_content": content,
+                "target": str(target),
+                "write_output": output,
+                "used_llm": True,
+                "_waiting_human": waiting,
+                "_tool_calls": 1,
+            }
+
+        executor = PlanExecutor(
+            tool_call=self.tool_registry.call,
+            research=self.web_research_agent.research,
+            llm_call=lambda prompt: self._chat_with_stage("Answer", [{"role": "user", "content": prompt}]),
+            task_ledger=getattr(self, "task_ledger", None),
+        )
+        execution = executor.execute_bound_plan(
+            workflow_plan, {source_id: retrieve, commit_id: generate_and_commit},
+            initial_values={"query": query}, parallel=False,
+        )
+        for item in execution.results:
+            steps.append(AgentStep(
+                f"supervisor:{item.step_id}", item.status,
+                item.error or f"agent={item.agent}; tool_calls={item.tool_calls}; tokens={item.tokens}",
+            ))
+        steps.append(AgentStep("supervisor", execution.status, execution.error or "索引报告计划执行完成。"))
+        evidences = execution.values.get("evidences", [])
+        evidences = evidences if isinstance(evidences, list) else []
+        steps.append(AgentStep(
+            "retrieve_index_collection", "success" if evidences else "failed",
+            f"索引中选出 {len({item.doc_id for item in evidences})} 份文档、{len(evidences)} 条证据。",
+        ))
+        if execution.status == "failed":
+            return self._finalize_answer(
+                answer=f"未生成技术报告：{execution.error}", evidences=evidences, steps=steps, used_llm=False,
+                session_id=session_id, user_message_id=user_message_id,
+                question=question, memory_context=memory_context,
+            )
+        if not write_report:
+            return self._finalize_answer(
+                answer=str(execution.values.get("report_content", "")), evidences=evidences, steps=steps, used_llm=True,
+                session_id=session_id, user_message_id=user_message_id,
+                question=question, memory_context=memory_context,
+            )
+        target = str(execution.values.get("target", ""))
+        output = execution.values.get("write_output", {})
+        output = output if isinstance(output, dict) else {}
+        waiting = bool(output.get("permission", {}).get("requires_confirmation") and not output.get("written"))
+        steps.append(AgentStep("write_report", "waiting_human" if waiting else "success", target))
+        pending = None
+        if waiting:
+            permission = output.get("permission", {})
+            pending = {
+                "tool_name": "files.write_file",
+                "kwargs": {"path": target, "content": str(execution.values.get("report_content", "")), "overwrite": False},
+                "description": f"写入技术报告：{target}",
+                "risk_level": permission.get("risk_level", "high"),
+                "reasons": permission.get("reasons", []),
+            }
+            answer = f"报告正文已生成，写入 {target} 需要人工确认。确认后才会创建文件。"
+        else:
+            answer = f"已生成技术报告：{target}\n\n共引用 {len({item.doc_id for item in evidences})} 份索引文档；报告末尾附有对应来源。"
+        return self._finalize_answer(
+            answer=answer, evidences=evidences, steps=steps, used_llm=True,
+            session_id=session_id, user_message_id=user_message_id,
+            question=question, memory_context=memory_context, pending_action=pending,
+        )
+
+    def _answer_index_report_legacy(
         self, question: str, request: dict[str, object], steps: list[AgentStep],
         session_id: str, user_message_id: str, memory_context: AssembledContext,
     ) -> AnswerResult:
@@ -2131,7 +2479,7 @@ class DocumentQAAgent:
             doc = self.index.documents[evidence.doc_id]
             sources.append(f"[{number}] {doc.title} | {evidence.source_label}\n{evidence.text[:600]}")
             references.append(f"[{number}] {doc.title}；来源：{doc.path}；片段：{evidence.source_label}")
-        report = self.client.chat([
+        report = self._chat_with_stage("Answer", [
             {"role": "system", "content": (
                 "你是基于索引证据撰写技术报告的助手。只输出 Markdown 报告正文，不描述工具、权限、"
                 "Planner 或是否能够写文件；文件写入由独立执行器完成。每项技术结论标注提供的 [编号]。"
@@ -2286,6 +2634,7 @@ class DocumentQAAgent:
             "更新",
             "修改",
             "替换",
+            "覆盖",
         )
         return any(marker in normalized for marker in markers)
 
@@ -2300,6 +2649,7 @@ class DocumentQAAgent:
             "更新",
             "修改",
             "替换",
+            "覆盖",
         )
         return any(marker in normalized for marker in explicit_write_markers)
 
@@ -2308,7 +2658,12 @@ class DocumentQAAgent:
         target = target.strip("，。；;、,. ")
         action_markers = (
             "保存为",
+            "保存到",
+            "保存至",
             "另存为",
+            "输出为",
+            "输出到",
+            "输出至",
             "创建一个",
             "创建一份",
             "创建",
@@ -2335,11 +2690,17 @@ class DocumentQAAgent:
                     target = candidate
                     break
         location_prefixes = (
+            "当前工作目录下的",
+            "当前工作目录的",
+            "当前工作目录下",
             "当前目录下的",
+            "当前目录的",
             "当前目录下",
             "当前文件夹下的",
+            "当前文件夹的",
             "当前文件夹下",
             "本目录下的",
+            "本目录的",
             "本目录下",
             "工作区下的",
             "工作区下",
@@ -2376,7 +2737,8 @@ class DocumentQAAgent:
         if not self._should_generate_file_write_content(requested_content):
             return requested_content, False, "literal"
 
-        response = self.client.chat(
+        response = self._chat_with_stage(
+            "Answer",
             [
                 {
                     "role": "system",
@@ -2566,45 +2928,100 @@ class DocumentQAAgent:
         user_message_id: str, memory_context: AssembledContext,
     ) -> AnswerResult:
         """批量读取本地文档，避免多文档请求被单文件槽位校验截断。"""
-        contents: list[tuple[str, str]] = []
-        evidences: list[Evidence] = []
-        for target in targets:
-            resolved = self.tool_registry.call("files.resolve_document", target=target)
-            if not resolved.ok:
-                return self._finalize_answer(
-                    answer=f"无法定位本地文档：{target}。请确认文件名或检查文档别名。",
-                    evidences=evidences, steps=steps, used_llm=False,
-                    session_id=session_id, user_message_id=user_message_id,
-                    question=question, memory_context=memory_context,
+        plan_steps: list[dict[str, object]] = []
+        handlers: dict[str, object] = {}
+        source_ids: list[str] = []
+        for index, target in enumerate(targets, start=1):
+            step_id = f"read_document_{index}"
+            source_ids.append(step_id)
+            plan_steps.append({
+                "id": step_id, "agent": "knowledge", "depends_on": [],
+                "allowed_tools": ["files.resolve_document", "files.read_document"],
+                "description": f"读取本地文档：{target}", "max_retries": 0,
+            })
+
+            def read_document(_values: dict[str, object], *, requested_target: str = target) -> dict[str, object]:
+                resolved = self.tool_registry.call("files.resolve_document", target=requested_target)
+                if not resolved.ok:
+                    raise RuntimeError(f"无法定位本地文档：{requested_target}。{resolved.error}")
+                read = self.tool_registry.call("files.read_document", path=str(resolved.output))
+                if not read.ok:
+                    raise RuntimeError(f"已定位文档但读取失败：{requested_target}。{read.error}")
+                payload = read.output if isinstance(read.output, dict) else {}
+                content = str(payload.get("content", ""))
+                title = str(payload.get("title", requested_target))
+                evidence = Evidence(
+                    chunk_id=f"local_{hashlib.sha256(str(resolved.output).encode('utf-8')).hexdigest()[:12]}",
+                    doc_id=str(resolved.output), source_label=f"file:{title}",
+                    text=content[:1800], score=1.0,
                 )
-            read = self.tool_registry.call("files.read_document", path=str(resolved.output))
-            if not read.ok:
-                return self._finalize_answer(
-                    answer=f"已定位文档，但读取失败：{target}。原因：{read.error}",
-                    evidences=evidences, steps=steps, used_llm=False,
-                    session_id=session_id, user_message_id=user_message_id,
-                    question=question, memory_context=memory_context,
+                return {
+                    f"document_{requested_target}": {"title": title, "content": content, "evidence": evidence},
+                    "_tool_calls": 2,
+                }
+
+            handlers[step_id] = read_document
+
+        synthesis_id = "synthesize_documents"
+        plan_steps.append({
+            "id": synthesis_id, "agent": "knowledge", "depends_on": source_ids,
+            "allowed_tools": [], "description": "合并多文档并生成对比摘要", "max_retries": 0,
+        })
+
+        def synthesize(values: dict[str, object]) -> dict[str, object]:
+            documents = [
+                value for key, value in values.items()
+                if key.startswith("document_") and isinstance(value, dict)
+            ]
+            if len(documents) != len(targets):
+                raise RuntimeError("多文档读取结果不完整，停止生成对比摘要")
+            prompt = "\n\n".join(
+                f"文档：{item['title']}\n内容：{str(item['content'])[:12000]}" for item in documents
+            )
+            answer = self._chat_with_stage("Answer", [
+                {"role": "system", "content": "你是本地文档对比助手，只能根据给定文档内容回答，不得补充文档外事实。"},
+                {"role": "user", "content": f"请分别提取各文档核心目标，再给出对比摘要。\n{prompt}"},
+            ], temperature=0.2)
+            if not answer:
+                answer = "\n\n".join(
+                    f"## {item['title']}\n{str(item['content'])[:800]}" for item in documents
                 )
-            payload = read.output or {}
-            content = str(payload.get("content", ""))
-            title = str(payload.get("title", target))
-            contents.append((title, content))
-            evidences.append(Evidence(
-                chunk_id=f"local_{hashlib.sha256(str(resolved.output).encode('utf-8')).hexdigest()[:12]}",
-                doc_id=str(resolved.output), source_label=f"file:{title}",
-                text=content[:1800], score=1.0,
+            return {
+                "answer": fix_mojibake(answer),
+                "evidences": [item["evidence"] for item in documents],
+                "used_llm": bool(answer) and not bool(self.client.last_error),
+            }
+
+        handlers[synthesis_id] = synthesize
+        executor = PlanExecutor(
+            tool_call=self.tool_registry.call,
+            research=self.web_research_agent.research,
+            llm_call=lambda prompt: self._chat_with_stage("Answer", [{"role": "user", "content": prompt}]),
+            task_ledger=getattr(self, "task_ledger", None),
+        )
+        execution = executor.execute_bound_plan(
+            {"goal": question, "score": 7, "steps": plan_steps}, handlers,
+            initial_values={"targets": list(targets)}, parallel=True,
+        )
+        for item in execution.results:
+            steps.append(AgentStep(
+                f"supervisor:{item.step_id}", item.status,
+                item.error or f"agent={item.agent}; tool_calls={item.tool_calls}; tokens={item.tokens}",
             ))
-        prompt = "\n\n".join(f"文档：{title}\n内容：{content[:12000]}" for title, content in contents)
-        answer = self.client.chat([
-            {"role": "system", "content": "你是本地文档对比助手，只能根据给定文档内容回答，不得补充文档外事实。"},
-            {"role": "user", "content": f"请分别提取各文档核心目标，再给出对比摘要。\n{prompt}"},
-        ], temperature=0.2)
-        if not answer:
-            answer = "\n\n".join(f"## {title}\n{content[:800]}" for title, content in contents)
-        steps.append(AgentStep("read_local_documents", "success", f"已读取 {len(contents)} 份本地文档。"))
+        steps.append(AgentStep("supervisor", execution.status, execution.error or "多文档对比计划执行完成。"))
+        if execution.status == "failed":
+            return self._finalize_answer(
+                answer=f"多文档任务失败：{execution.error}", evidences=[], steps=steps, used_llm=False,
+                session_id=session_id, user_message_id=user_message_id,
+                question=question, memory_context=memory_context,
+            )
+        answer = str(execution.values.get("answer", ""))
+        evidences = execution.values.get("evidences", [])
+        evidences = evidences if isinstance(evidences, list) else []
+        steps.append(AgentStep("read_local_documents", "success", f"已读取 {len(evidences)} 份本地文档。"))
         return self._finalize_answer(
-            answer=fix_mojibake(answer), evidences=evidences, steps=steps,
-            used_llm=bool(answer) and not bool(self.client.last_error), session_id=session_id,
+            answer=answer, evidences=evidences, steps=steps,
+            used_llm=bool(execution.values.get("used_llm")), session_id=session_id,
             user_message_id=user_message_id, question=question,
             memory_context=memory_context,
         )
@@ -2721,7 +3138,8 @@ class DocumentQAAgent:
             if read_mode == "question_answer" else
             "请先给出 3-6 条要点总结，再给出一段简短整体概括；有章节时按章节组织。"
         )
-        response = self.client.chat(
+        response = self._chat_with_stage(
+            "Answer",
             [
                 {
                     "role": "system",
@@ -2843,7 +3261,8 @@ class DocumentQAAgent:
         )
 
     def _direct_answer(self, question: str, memory_context: AssembledContext) -> str:
-        return self.client.chat(
+        return self._chat_with_stage(
+            "Answer",
             [
                 {
                     "role": "system",
@@ -2865,6 +3284,7 @@ class DocumentQAAgent:
             ],
             temperature=0.3,
             max_tokens=memory_context.output_budget or None,
+            stream=True,
         )
 
     def _direct_fallback_answer(self, question: str, memory_context: AssembledContext) -> str:
@@ -2930,7 +3350,8 @@ class DocumentQAAgent:
             f"[{index}] {item.source_label}\n{item.text[:1800]}"
             for index, item in enumerate(evidences[:8], start=1)
         )
-        response = self.client.chat(
+        response = self._chat_with_stage(
+            "Reflection",
             [
                 {
                     "role": "system",

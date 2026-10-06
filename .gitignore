@@ -16,6 +16,7 @@ venv/
 data/
 eval/runs/
 eval/reports/
+eval/baselines/
 sess_*.md
 
 # Root-level design/debug documents are local working material. Keep README only.
@@ -23,6 +24,7 @@ sess_*.md
 !/README.md
 /*.txt
 !/requirements.txt
+!/requirements-rerank.txt
 
 # Imported documents, generated attachments and local corpora may contain private data.
 *.docx

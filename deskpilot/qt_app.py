@@ -10,7 +10,7 @@ from .core.config import ROOT_DIR, ensure_dirs
 from .rag.vector_index import DocumentIndex
 
 try:
-    from PySide6.QtCore import QAbstractListModel, QModelIndex, QObject, Property, Qt, QTimer, Signal, Slot, QUrl
+    from PySide6.QtCore import QAbstractListModel, QModelIndex, QObject, Property, Qt, Signal, Slot, QUrl
     from PySide6.QtWidgets import QApplication, QFileDialog
     from PySide6.QtGui import QFont
     from PySide6.QtQml import QQmlApplicationEngine
@@ -91,6 +91,7 @@ class DeskPilotBridge(QObject):
     confirmRequested = Signal(str, str, str)
     errorRaised = Signal(str)
     _resultReady = Signal(object)
+    _streamEvent = Signal(object)
     _indexReady = Signal(str)
     _errorReady = Signal(str)
 
@@ -110,14 +111,11 @@ class DeskPilotBridge(QObject):
         self._status = "就绪"
         self._busy = False
         self._context = ""
-        self._stream_base: list[dict[str, str]] = []
-        self._stream_text = ""
-        self._stream_index = 0
-        self._stream_result: Any = None
-        self._stream_generation = 0
+        self._live_stream_received = False
         self._pending_action: dict[str, Any] | None = None
         # 所有后台任务都通过 signal 回到 Qt 主线程，再更新 QML 属性。
         self._resultReady.connect(self._start_stream)
+        self._streamEvent.connect(self._handle_stream_event)
         self._indexReady.connect(self._index_finished)
         self._errorReady.connect(self._background_failed)
         self._refresh_all()
@@ -247,41 +245,50 @@ class DeskPilotBridge(QObject):
         self._refresh_memories()
 
     def _start_stream(self, result: Any) -> None:
-        # 结果已写入会话存储，这里去掉最后一条完整回答，再在主线程逐字显示。
+        """收束真实流式结果；不再对完整回答做二次打字机动画。"""
         self.current_session_id = result.session_id or self.current_session_id
-        saved = self.agent.session_store.read_messages(self.current_session_id)
-        base = saved[:-1] if saved and saved[-1].role == "assistant" else saved
-        self._stream_base = [{"role": item.role, "content": item.content} for item in base]
-        self._stream_text = str(getattr(result, "answer", getattr(result, "report", "")))
-        self._stream_index = 0
-        self._stream_result = result
-        self._stream_generation += 1
-        generation = self._stream_generation
-        self._set_status("正在生成")
-        # Agent 已经完成执行，Steps/Evidence 应立即可见，无需等待最多约 6 秒的
-        # 逐字动画结束。聊天文本仍保持增量显示。
+        final_text = str(getattr(result, "answer", getattr(result, "report", "")))
+        self._update_last_message(final_text)
         self._set_result_panels(result)
-        # 流开始时只重置一次，后续每一帧只更新最后一个 delegate。
-        self._set_messages(self._stream_base + [{"role": "assistant", "content": ""}])
-        self._stream_tick(generation)
-
-    def _stream_tick(self, generation: int) -> None:
-        # 新回答开始后丢弃旧定时器回调，避免两个流同时刷新同一消息模型。
-        if generation != self._stream_generation:
-            return
-        # 长回答限制在约 500 次布局刷新内，同时保留短回答的平滑逐字效果。
-        chunk_size = max(3, (len(self._stream_text) + 499) // 500)
-        self._stream_index = min(len(self._stream_text), self._stream_index + chunk_size)
-        self._update_last_message(self._stream_text[: self._stream_index])
-        if self._stream_index < len(self._stream_text):
-            QTimer.singleShot(12, lambda: self._stream_tick(generation))
-            return
-        result = self._stream_result
-        self._stream_result = None
-        if result is not None:
-            self._set_status("回答完成")
-            self._maybe_request_confirmation(result)
+        self._set_status("回答完成")
+        self._maybe_request_confirmation(result)
         self._end_operation()
+
+    def _handle_stream_event(self, event: Any) -> None:
+        """所有事件经 Qt signal 回到主线程，只更新一个消息 delegate。"""
+        if not isinstance(event, dict):
+            return
+        event_type = str(event.get("type", ""))
+        stage = str(event.get("stage", "Model"))
+        if event_type == "token":
+            delta = str(event.get("text", ""))
+            if not delta:
+                return
+            if not self._live_stream_received:
+                self._live_stream_received = True
+                self._update_last_message("")
+            current = self._messages[-1].get("content", "") if self._messages else ""
+            self._update_last_message(current + delta)
+            self._set_status(f"正在生成 / {stage}")
+            return
+        if event_type == "model_start":
+            self._set_status(f"正在处理 / {stage}")
+            self._upsert_runtime_step(stage, "running", "模型调用进行中。")
+        elif event_type == "model_end":
+            ok = event.get("ok") is True
+            detail = "模型调用完成。" if ok else f"模型调用失败：{event.get('error', '')}"
+            self._upsert_runtime_step(stage, "success" if ok else "failed", detail)
+
+    def _upsert_runtime_step(self, stage: str, status: str, detail: str) -> None:
+        name = f"model:{stage}"
+        replacement = {"name": name, "status": status, "detail": detail}
+        for index, item in enumerate(self._steps):
+            if item.get("name") == name:
+                self._steps[index] = replacement
+                break
+        else:
+            self._steps.append(replacement)
+        self.stepsChanged.emit()
 
     def _maybe_request_confirmation(self, result: Any) -> None:
         pending = getattr(result, "pending_action", None)
@@ -307,14 +314,19 @@ class DeskPilotBridge(QObject):
         session_id = self.current_session_id
         self._steps = []
         self._evidences = []
+        self._live_stream_received = False
         self.stepsChanged.emit()
         self.evidencesChanged.emit()
-        self._set_messages(self._messages + [{"role": "user", "content": question}, {"role": "assistant", "content": "正在处理..."}])
+        self._set_messages(self._messages + [{"role": "user", "content": question}, {"role": "assistant", "content": ""}])
         threading.Thread(target=self._run_answer, args=(question, session_id), daemon=True).start()
 
     def _run_answer(self, question: str, session_id: str) -> None:
         try:
-            result = self.agent.answer(question, session_id=session_id)
+            result = self.agent.answer(
+                question,
+                session_id=session_id,
+                event_callback=lambda event: self._streamEvent.emit(event),
+            )
             self._resultReady.emit(result)
         except Exception as exc:  # pragma: no cover - 防止后台异常让 GUI 无响应
             self._errorReady.emit(str(exc))

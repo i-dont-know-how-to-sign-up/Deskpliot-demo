@@ -1,6 +1,6 @@
 # DeskPilotBench Dataset
 
-> 主数据集现为 v0.8，共 152 条；除既有复合操作、索引感知路由和 RAG 回归用例外，新增 Supervisor 真实执行链、Memory Gate 和 `debug3.md` 历史问题看护用例。完整统计、运行模式与 mock 说明以 `../数据集描述文档.md` 为准。旧版 92/140/146 条统计仅为历史记录；`offline` 现禁用外部 API，不能和历史报告的同名模式直接比较。另有 3 条可选的 `local_multimodal_cases.jsonl` 本地真实 PDF 用例。
+> 主数据集现为 v0.8，共 160 条；除既有复合操作、索引感知路由和 RAG 回归用例外，新增 Supervisor 真实执行链、Memory Gate、`debug3.md` 历史问题、P1 基线修复以及 P1.5/P2 调用归因与可靠性看护用例。完整统计、运行模式与 mock 说明以 `../数据集描述文档.md` 为准。旧版 92/140/146/152/156 条统计仅为历史记录；`offline` 现禁用外部 API，不能和历史报告的同名模式直接比较。另有 3 条可选的 `local_multimodal_cases.jsonl` 本地真实 PDF 用例。
 
 `reg_rag_compare_001` 使用本地真实 `blip.pdf` 与 `blip-2.pdf`，检查短标题、连字符变体、跨论文均衡取证、综合回答与双文档引用来源。该用例需要真实 LLM API。
 
@@ -10,7 +10,7 @@
 
 ## RAG P0 检索层数据集
 
-`rag_p0_cases.jsonl` 是与 152 条端到端主数据集分离的检索层数据集，共 10 条。它直接评估 chunk/section 召回，避免最终 LLM 回答掩盖分块和索引问题：
+`rag_p0_cases.jsonl` 是与 160 条端到端主数据集分离的检索层数据集，共 10 条。它直接评估 chunk/section 召回，避免最终 LLM 回答掩盖分块和索引问题：
 
 - Markdown 标题、列表和表格结构：3 条。
 - TXT 语义主题边界：1 条。
@@ -76,7 +76,7 @@
 .\.conda\deskpilot-py311\python.exe -m eval.run_rag_p1_eval --mode api --strategy hybrid --include-local --case-id rag_p1_007
 ```
 
-主数据集当前包含 152 条用例。`safe_009` 至 `safe_011` 用于看护 LLM 伪造 `confirm`、危险 Python 静态阻断和受保护目录移动；`multi_exec_001` 用于看护 Planner、PlanExecutor、Supervisor 与人工确认的完整 DAG；`memory_gate_001` 至 `memory_gate_002` 用于看护低价值问答跳过记忆抽取和显式偏好进入记忆处理；`reg_debug3_001` 至 `reg_debug3_006` 覆盖只读 PowerShell 统计、短文件原文、已有附件邮件、显式知识库、RAM 缩写别名和冲突输出路径。具体子集数量以 `deskpilot_bench.jsonl` 实时统计为准。
+主数据集当前包含 160 条用例。`safe_009` 至 `safe_011` 用于看护 LLM 伪造 `confirm`、危险 Python 静态阻断和受保护目录移动；`multi_exec_001` 用于看护 Planner、PlanExecutor、Supervisor 与人工确认的完整 DAG；`memory_gate_001` 至 `memory_gate_002` 用于看护低价值问答跳过记忆抽取和显式偏好进入记忆处理；`reg_debug3_001` 至 `reg_debug3_006` 覆盖历史问题；`reg_p1_*` 覆盖 P1 基线缺陷；`p15_*` 与 `p2_*` 看护单调用直答、角色上下文、网页可靠性和精排 trace。具体子集数量以 `deskpilot_bench.jsonl` 实时统计为准。
 
 GAIA/Ragas 改编来源清单位于 dataset/public_sources/gaia_ragas_adaptation_manifest.json。
 
@@ -130,7 +130,9 @@ GAIA/Ragas 改编来源清单位于 dataset/public_sources/gaia_ragas_adaptation
 - input：单轮输入；conversation 存在时优先使用多轮输入。
 - setup.index_files：运行前导入的本地 fixture。
 - expected：可自动检查的期望行为，不要求回答逐字匹配。
-- runtime.requires_online：需要真实网络时设为 true。
+- runtime.requires_network：需要真实网络时设为 true；`requires_online` 仅作为旧数据兼容别名。
+- runtime.requires_email：需要真实邮箱服务且没有 mock 时设为 true。
+- runtime.has_side_effect：用例涉及外部副作用时设为 true，供套件审计和报告展示；它不等于自动批准。
 
 第一版不纳入 WebArena。WebArena 需要自托管网页环境，磁盘和环境成本较高；网页样例先使用 online 标记，后续可以改成固定 HTML 和 fake search。
 

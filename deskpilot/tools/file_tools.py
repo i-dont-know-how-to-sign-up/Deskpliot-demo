@@ -57,17 +57,17 @@ LEADING_ACTION_WORDS = (
 
 def resolve_document_path(target: str | Path, search_roots: list[Path] | None = None) -> Path:
     candidate = Path(str(target).strip().strip('"').strip("'"))
-    roots = [Path.cwd()]
-    if search_roots:
-        roots.extend(search_roots)
+    # 调用方显式给出的目录代表用户限定的搜索范围，必须优先于进程 cwd；
+    # 否则项目根目录的同名文件会污染隔离工作区或指定文件夹的解析结果。
+    roots = list(search_roots or []) + [Path.cwd()]
     if candidate.is_absolute() and candidate.exists():
         return candidate.resolve()
-    if candidate.exists():
+    if candidate.exists() and not search_roots:
         return candidate.resolve()
     normalized = _normalize_document_query(candidate.name)
     if normalized and normalized != candidate.name:
         normalized_candidate = candidate.with_name(normalized)
-        if normalized_candidate.exists():
+        if normalized_candidate.exists() and not search_roots:
             return normalized_candidate.resolve()
         for root in roots:
             direct = (root / normalized_candidate).resolve()

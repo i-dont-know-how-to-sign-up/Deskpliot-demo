@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import platform
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -30,13 +31,14 @@ class IntentRouter:
         full_tool_specs = self._normalize_tools(tools)
         # 第一步先判断问题该直接回答，还是需要调用工具或继续追问。
         prompt = self._build_prompt(question, tool_summaries, memory_context, index_hint or [])
-        response = self.client.chat(
-            [
-                {"role": "system", "content": "You are DeskPilot's intent router. Output JSON only."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.0,
-        )
+        with self._client_stage("Router", stream=True):
+            response = self.client.chat(
+                [
+                    {"role": "system", "content": "You are DeskPilot's intent router and direct-answer gateway. Output JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+            )
         decision = self._parse_response(response)
         if decision is None:
             # 模型输出无法解析时，退回到保守规则，保证路由器不会直接失效。
@@ -187,13 +189,14 @@ class IntentRouter:
 
     def requires_output_file(self, question: str) -> bool:
         """仅判断是否要求实际创建文件；失败时保守返回 false，由计划执行层显式报错。"""
-        response = self.client.chat([
-            {"role": "system", "content": "你是文件产物校验器，只输出 JSON。"},
-            {"role": "user", "content": (
-                "用户是否要求助手实际创建、写入或保存本地文件？只是展示回答或引用不算。"
-                '只返回 {"requires_file_output":true|false}。\n用户请求：' + question
-            )},
-        ], temperature=0.0)
+        with self._client_stage("Router"):
+            response = self.client.chat([
+                {"role": "system", "content": "你是文件产物校验器，只输出 JSON。"},
+                {"role": "user", "content": (
+                    "用户是否要求助手实际创建、写入或保存本地文件？只是展示回答或引用不算。"
+                    '只返回 {"requires_file_output":true|false}。\n用户请求：' + question
+                )},
+            ], temperature=0.0)
         match = re.search(r"\{[^{}]*\}", response or "")
         if not match:
             return False
@@ -205,15 +208,16 @@ class IntentRouter:
 
     def _verify_web_requirement(self, question: str) -> tuple[bool, bool] | None:
         """复核网页工具的必要性，防止 Router 自行把普通知识问答解释成联网请求。"""
-        response = self.client.chat([
-            {"role": "system", "content": "你是联网必要性校验器，只输出 JSON。"},
-            {"role": "user", "content": (
-                "判断用户是否明确要求搜索/浏览互联网，以及答案是否依赖实时变化的信息。"
-                "普通原理、模型架构、历史知识不属于实时信息。只返回："
-                '{"explicit_web_retrieval":true|false,"requires_fresh_information":true|false}\n'
-                f"用户请求：{question}"
-            )},
-        ], temperature=0.0)
+        with self._client_stage("Router"):
+            response = self.client.chat([
+                {"role": "system", "content": "你是联网必要性校验器，只输出 JSON。"},
+                {"role": "user", "content": (
+                    "判断用户是否明确要求搜索/浏览互联网，以及答案是否依赖实时变化的信息。"
+                    "普通原理、模型架构、历史知识不属于实时信息。只返回："
+                    '{"explicit_web_retrieval":true|false,"requires_fresh_information":true|false}\n'
+                    f"用户请求：{question}"
+                )},
+            ], temperature=0.0)
         match = re.search(r"\{[^{}]*\}", response or "")
         if not match:
             return None
@@ -297,8 +301,11 @@ class IntentRouter:
             "knowledge_scope=local_index only in that case. Use knowledge_scope=workspace for named local files, "
             "knowledge_scope=web for requested web material, otherwise knowledge_scope=general. "
             "Never answer from candidate excerpts inside the router.\n"
+            "When mode is direct_answer, answer the user's question in this same call and put the final user-facing "
+            "Chinese answer in direct_response. Do not mention routing, tools, context packets, or internal policy. "
+            "For every other mode direct_response must be an empty string.\n"
             "Output a single JSON object only with keys:\n"
-            '{"mode":"direct_answer|tool_call|clarify|plan_task","reason":"...","tool_name":"...","arguments":{},"missing_slots":[],"confidence":0.0,"needs_workspace_files":false,"needs_index_catalog":false,"requires_file_output":false,"explicit_local_retrieval":false,"explicit_web_retrieval":false,"requires_fresh_information":false,"knowledge_scope":"general|local_index|workspace|web"}\n\n'
+            '{"mode":"direct_answer|tool_call|clarify|plan_task","reason":"...","direct_response":"final answer or empty","tool_name":"...","arguments":{},"missing_slots":[],"confidence":0.0,"needs_workspace_files":false,"needs_index_catalog":false,"requires_file_output":false,"explicit_local_retrieval":false,"explicit_web_retrieval":false,"requires_fresh_information":false,"knowledge_scope":"general|local_index|workspace|web"}\n\n'
             f"Runtime context (contains the current task and selected memory):\n{memory_context or question}\n\n"
             f"Runtime operating system: {platform.system()} ({platform.platform()}). "
             "For shell.execute_command, generate syntax for this operating system and prefer one simple command.\n"
@@ -346,11 +353,13 @@ class IntentRouter:
             explicit_web_retrieval=data.get("explicit_web_retrieval") is True,
             requires_fresh_information=data.get("requires_fresh_information") is True,
             knowledge_scope=knowledge_scope,
+            direct_response=str(data.get("direct_response", "")).strip() if mode == "direct_answer" else "",
         )
 
     def _fallback_route(self, question: str, tools: list[dict[str, Any]], response: str,
                         index_hint: list[dict[str, Any]] | None = None) -> IntentDecision:
-        # 兜底策略尽量保守，只在明显的检索意图上才改派到网页相关工具。
+        # 兜底只处理可确定解析的命令结构。它不是第二套关键词意图分类器；
+        # 语义问答、假设描述和复杂规划必须留给 LLM/API 模式。
         lowered = question.lower()
         if any(item.get("strong_match") is True for item in (index_hint or [])):
             tool = self._find_tool(tools, "knowledge.search")
@@ -376,10 +385,64 @@ class IntentRouter:
                     confidence=0.6,
                     raw_response=response,
                 )
+        python_match = re.search(
+            r"(?:执行|运行)\s*Python\s*(?:代码)?\s*[：:]?\s*(.+)$",
+            question,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if python_match:
+            tool = self._find_tool(tools, "code.execute_python")
+            if tool:
+                return IntentDecision(
+                    mode="tool_call",
+                    reason="离线 fallback 解析到明确的 Python 代码执行命令。",
+                    tool_name="code.execute_python",
+                    arguments={"code": python_match.group(1).strip()},
+                    confidence=0.75,
+                    raw_response=response,
+                )
+        command_match = re.search(
+            r"(?:执行|运行)\s*(?:命令|command)\s*[：:]?\s*(.+)$",
+            question,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if command_match:
+            tool = self._find_tool(tools, "shell.execute_command")
+            if tool:
+                return IntentDecision(
+                    mode="tool_call",
+                    reason="离线 fallback 解析到明确的终端命令。",
+                    tool_name="shell.execute_command",
+                    arguments={"command": command_match.group(1).strip(), "timeout_seconds": 10},
+                    confidence=0.75,
+                    raw_response=response,
+                )
+        delete_match = re.search(
+            r"(?:删除|移除)\s*[\"'`“”‘’]?(.+?)[\"'`“”‘’]?(?:[。；;]|$)",
+            question,
+            flags=re.IGNORECASE,
+        )
+        if delete_match:
+            tool = self._find_tool(tools, "shell.execute_command")
+            if tool:
+                target = delete_match.group(1).strip()
+                command = (
+                    f"Remove-Item -LiteralPath '{target.replace(chr(39), chr(39) * 2)}'"
+                    if platform.system() == "Windows"
+                    else f"rm -- '{target.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'"
+                )
+                return IntentDecision(
+                    mode="tool_call",
+                    reason="离线 fallback 解析到明确的删除命令；是否阻断由终端权限策略决定。",
+                    tool_name="shell.execute_command",
+                    arguments={"command": command, "timeout_seconds": 10},
+                    confidence=0.75,
+                    raw_response=response,
+                )
         # 离线 fallback 只接受“明确写动作 + 支持的文件扩展名”的结构组合。
         # 路径解析和权限判断仍由 Agent 槽位归一化及文件工具负责，Router 不直接写盘。
         if re.search(r"\.(?:md|markdown|txt|pdf|docx)(?![A-Za-z0-9])", question, re.IGNORECASE) and any(
-            token in lowered for token in ("创建", "新建", "写入", "写到", "保存到", "导出")
+            token in lowered for token in ("创建", "新建", "写入", "写到", "保存到", "导出", "覆盖")
         ):
             tool = self._find_tool(tools, "files.write_file")
             if tool:
@@ -389,6 +452,24 @@ class IntentRouter:
                     tool_name="files.write_file",
                     arguments={},
                     confidence=0.6,
+                    raw_response=response,
+                )
+        local_match = re.search(
+            r"(?:打开|读取|查看|总结)\s*[\"'`“”‘’]?(.+?\.(?:md|markdown|txt|pdf|docx|pptx|xlsx|csv))[\"'`“”‘’]?"
+            r"(?=\s*(?:然后|并|，|,|。|$))",
+            question,
+            flags=re.IGNORECASE,
+        )
+        if local_match:
+            tool = self._find_tool(tools, "files.read_document")
+            if tool:
+                target = re.sub(r"^(?:当前|本)(?:工作)?(?:目录|文件夹)(?:下|中|里)?(?:的)?", "", local_match.group(1).strip())
+                return IntentDecision(
+                    mode="tool_call",
+                    reason="离线 fallback 解析到明确的本地文档读取命令。",
+                    tool_name="files.read_document",
+                    arguments={"path": target, "read_mode": "summary" if "总结" in question else "verbatim"},
+                    confidence=0.75,
                     raw_response=response,
                 )
         if any(token in lowered for token in ("未读邮件", "未读的邮件", "未查看邮件", "unread", "unseen")):
@@ -402,7 +483,15 @@ class IntentRouter:
                     confidence=0.75,
                     raw_response=response,
                 )
-        if any(token in lowered for token in ("搜索", "调研", "网页", "联网", "web", "browser")):
+        # 只有明确祈使动作才允许联网。诸如“如何拆分搜索网页的任务”或
+        # “判断是否编造网页来源”只是讨论工具，不应产生外部副作用。
+        explicit_web_command = bool(re.search(
+            r"(?:^|[，,。；;]\s*)(?:请|帮我|麻烦)?\s*(?:在网上|联网)?\s*"
+            r"(?:搜索|查找|查询|调研|浏览|读取\s*https?://|打开\s*https?://)",
+            question,
+            flags=re.IGNORECASE,
+        ))
+        if explicit_web_command:
             tool = self._find_tool(tools, "web.research") or self._find_tool(tools, "web.search")
             if tool:
                 return IntentDecision(
@@ -413,6 +502,15 @@ class IntentRouter:
                     confidence=0.25,
                     raw_response=response,
                 )
+        if re.search(r"(?:没有|缺少|未提供|未配置).{0,8}(?:目标)?(?:路径|文件名)", question):
+            return IntentDecision(
+                mode="clarify",
+                reason="文件写入缺少目标路径。",
+                tool_name="files.write_file",
+                missing_slots=["path"],
+                confidence=0.7,
+                raw_response=response,
+            )
         return IntentDecision(
             mode="direct_answer",
             reason="Fallback to direct answer.",
@@ -430,3 +528,12 @@ class IntentRouter:
             if str(tool.get("name", "")) == name:
                 return tool
         return None
+
+    def _client_stage(self, name: str, *, stream: bool = False):
+        stage = getattr(self.client, "stage", None)
+        if not callable(stage):
+            return nullcontext()
+        try:
+            return stage(name, stream=stream)
+        except TypeError:
+            return stage(name)

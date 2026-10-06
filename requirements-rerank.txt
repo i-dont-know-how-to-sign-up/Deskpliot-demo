@@ -1,0 +1,4 @@
+# Optional local Cross-Encoder reranking dependencies.
+# This file installs the runtime only. Download the selected model explicitly,
+# then set RAG_RERANK_MODEL to its local directory; DeskPilot never downloads it during a query.
+sentence-transformers>=3.0.0,<4.0.0

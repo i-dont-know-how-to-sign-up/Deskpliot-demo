@@ -4,8 +4,11 @@ import hashlib
 import html
 import json
 import re
+import os
+import time
 import urllib.parse
 import urllib.request
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime
 from html.parser import HTMLParser
@@ -14,7 +17,7 @@ from typing import Any
 
 from .vector_index import DocumentIndex
 from ..core.api_clients import OpenAICompatibleClient
-from ..core.config import REPORTS_DIR, load_config
+from ..core.config import DATA_DIR, REPORTS_DIR, load_config
 from ..core.encoding_utils import fix_mojibake, is_probably_garbled
 from ..core.models import AgentStep, Document, Evidence, utc_now
 
@@ -23,6 +26,14 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 DeskPilot/0.3"
 )
+
+
+def _bounded_timeout(name: str, default: int, *, minimum: int = 1, maximum: int = 120) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, min(value, maximum))
 
 
 @dataclass
@@ -53,24 +64,94 @@ class ResearchResult:
     memory_context: str = ""
 
 
+class WebCache:
+    """按请求哈希持久化网页结果；缓存只存公开网页数据，不存凭证。"""
+
+    def __init__(self, root: Path, ttl_seconds: int = 21600) -> None:
+        self.root = root
+        self.ttl_seconds = max(0, ttl_seconds)
+
+    def get(self, namespace: str, key: str) -> Any | None:
+        path = self._path(namespace, key)
+        if not path.is_file() or self.ttl_seconds == 0:
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if time.time() - float(payload.get("created_at", 0)) > self.ttl_seconds:
+                return None
+            return payload.get("value")
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+
+    def put(self, namespace: str, key: str, value: Any) -> None:
+        if self.ttl_seconds == 0:
+            return
+        path = self._path(namespace, key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"created_at": time.time(), "value": value}, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(path)
+
+    def _path(self, namespace: str, key: str) -> Path:
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        return self.root / namespace / f"{digest}.json"
+
+
 class WebSearchClient:
     def __init__(self) -> None:
         self.config = load_config()
+        self.search_timeout = _bounded_timeout("WEB_SEARCH_TIMEOUT_SECONDS", 15)
+        self.fetch_timeout = _bounded_timeout("WEB_FETCH_TIMEOUT_SECONDS", 20)
+        self.cache = WebCache(
+            Path(os.getenv("WEB_CACHE_DIR") or str(DATA_DIR / "cache" / "web")),
+            _bounded_timeout("WEB_CACHE_TTL_SECONDS", 21600, minimum=0, maximum=604800),
+        )
+        self.last_provider = ""
+        self.last_cache_hit = False
+        self.last_errors: list[str] = []
 
     def search(self, query: str, limit: int = 5) -> list[SearchResult]:
-        provider = self.config.search_provider
-        if provider == "playwright":
-            return self._search_playwright(query, limit)
-        if provider == "tavily" and self.config.search_api_key:
-            return self._search_tavily(query, limit)
-        if provider == "bing" and self.config.search_api_key:
-            return self._search_bing(query, limit)
-        return self._search_duckduckgo(query, limit)
+        self.last_errors = []
+        self.last_cache_hit = False
+        providers = [self.config.search_provider]
+        providers.extend(item.strip().lower() for item in os.getenv(
+            "SEARCH_PROVIDER_FALLBACKS", "duckduckgo"
+        ).split(",") if item.strip())
+        for provider in dict.fromkeys(providers):
+            if provider in {"tavily", "bing"} and not self.config.search_api_key:
+                continue
+            cached = self.cache.get("search", f"{provider}|{limit}|{query}")
+            if isinstance(cached, list):
+                self.last_provider = provider
+                self.last_cache_hit = True
+                return [SearchResult(**item) for item in cached if isinstance(item, dict)]
+            try:
+                handler = {
+                    "playwright": self._search_playwright,
+                    "tavily": self._search_tavily,
+                    "bing": self._search_bing,
+                    "duckduckgo": self._search_duckduckgo,
+                }.get(provider)
+                if handler is None:
+                    raise RuntimeError(f"不支持的搜索 Provider：{provider}")
+                results = handler(query, limit)
+                if not results:
+                    raise RuntimeError("搜索结果为空")
+                self.last_provider = provider
+                self.cache.put("search", f"{provider}|{limit}|{query}", [item.__dict__ for item in results])
+                return results
+            except Exception as exc:
+                self.last_errors.append(f"{provider}: {type(exc).__name__}: {exc}")
+        raise RuntimeError("所有网页搜索 Provider 均失败：" + "；".join(self.last_errors))
 
     def fetch_page(self, url: str) -> WebPage:
-        if self.config.search_provider == "playwright":
-            return self._fetch_page_playwright(url)
-        return self._fetch_page_http(url)
+        cached = self.cache.get("page", canonical_url_key(url))
+        if isinstance(cached, dict):
+            self.last_cache_hit = True
+            return WebPage(**cached)
+        page = self._fetch_page_playwright(url) if self.config.search_provider == "playwright" else self._fetch_page_http(url)
+        self.cache.put("page", canonical_url_key(url), page.__dict__)
+        return page
 
     def _fetch_page_http(self, url: str) -> WebPage:
         request = urllib.request.Request(
@@ -82,7 +163,7 @@ class WebSearchClient:
             },
             method="GET",
         )
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=self.fetch_timeout) as response:
             raw = response.read()
             content_type = response.headers.get("Content-Type", "")
         encoding = self._detect_encoding(raw, content_type)
@@ -106,7 +187,7 @@ class WebSearchClient:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=self.search_timeout) as response:
             parsed = json.loads(response.read().decode("utf-8-sig"))
         results = []
         for item in parsed.get("results", [])[:limit]:
@@ -127,7 +208,7 @@ class WebSearchClient:
             headers={"Ocp-Apim-Subscription-Key": self.config.search_api_key},
             method="GET",
         )
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=self.search_timeout) as response:
             parsed = json.loads(response.read().decode("utf-8-sig"))
         results = []
         for item in parsed.get("webPages", {}).get("value", [])[:limit]:
@@ -148,7 +229,7 @@ class WebSearchClient:
             headers={"User-Agent": USER_AGENT},
             method="GET",
         )
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=self.search_timeout) as response:
             html_text = response.read().decode("utf-8", errors="replace")
         return parse_duckduckgo_results(html_text, limit)
 
@@ -285,10 +366,17 @@ class WebResearchAgent:
         try:
             search_results = self.search_client.search(topic, limit=limit)
             sources.extend(search_results)
-            if provider == "playwright":
+            effective_provider = getattr(self.search_client, "last_provider", "") or provider
+            cache_hit = bool(getattr(self.search_client, "last_cache_hit", False))
+            if effective_provider == "playwright":
                 detail = f"使用 Playwright/{engine} 搜索到 {len(search_results)} 条网页结果。"
             else:
-                detail = f"使用 {provider} 搜索到 {len(search_results)} 条网页结果。"
+                detail = f"使用 {effective_provider} 搜索到 {len(search_results)} 条网页结果。"
+            if cache_hit:
+                detail += " 命中本地 TTL 缓存。"
+            errors = getattr(self.search_client, "last_errors", [])
+            if errors:
+                detail += f" 前序 Provider 已降级：{'；'.join(errors)}。"
             steps.append(AgentStep("web_search", "success", detail))
         except Exception as exc:
             steps.append(AgentStep("web_search", "failed", f"搜索失败：{exc}"))
@@ -367,8 +455,10 @@ class WebResearchAgent:
             f"正文只能使用 [1] 到 [{len(citation_sources)}] 的引用编号，编号对应上面的搜索来源；"
             "不得发明编号，不要自行生成参考来源章节，程序会在文末添加可核对的来源。证据不足时明确说明限制。"
         )
-        response = self.client.chat(
-            [
+        stage = getattr(self.client, "stage", None)
+        with (stage("Answer", stream=True) if callable(stage) else nullcontext()):
+            response = self.client.chat(
+                [
                 {
                     "role": "system",
                     "content": (
@@ -378,9 +468,9 @@ class WebResearchAgent:
                     ),
                 },
                 {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-        )
+                ],
+                temperature=0.2,
+            )
         if response:
             body = self._sanitize_report_citations(fix_mojibake(response), len(citation_sources))
             return self._append_reference_section(body, citation_sources), True

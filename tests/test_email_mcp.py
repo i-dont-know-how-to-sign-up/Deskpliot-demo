@@ -131,13 +131,16 @@ def test_approved_email_draft_is_reported_as_success() -> None:
         agent.tool_registry = build_default_tool_registry(
             None, email_service=EmailMCPService(provider)
         )
-        result = agent.approve_pending_action(
+        session = agent.session_store.get_or_create()
+        pending = agent.pending_actions.create(
+            session.session_id,
             {
                 "tool_name": "email.save_draft",
                 "kwargs": {"to": ["a@example.com"], "subject": "test", "body": "body"},
                 "description": "保存邮件草稿",
             }
         )
+        result = agent.approve_pending_action(pending, session_id=session.session_id)
         assert "保存邮件草稿" in result.answer
         assert any(step.name == "execute_approved_action" and step.status == "success" for step in result.steps)
 

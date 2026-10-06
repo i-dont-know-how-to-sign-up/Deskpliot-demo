@@ -93,6 +93,35 @@ def test_offline_fallback_routes_structural_file_write() -> None:
     assert decision.tool_name == "files.write_file"
 
 
+def test_offline_fallback_does_not_execute_web_tool_when_discussing_search() -> None:
+    tools = [{"name": "web.research", "parameters": []}]
+
+    decision = IntentRouter(FakeClient("")).route(
+        "请给出一个判断 Agent 是否编造网页来源的方法。", tools,
+    )
+
+    assert decision.mode == "direct_answer"
+
+
+def test_offline_fallback_routes_explicit_web_command() -> None:
+    tools = [{"name": "web.research", "parameters": []}]
+
+    decision = IntentRouter(FakeClient("")).route("帮我在网上搜索 Agent benchmark。", tools)
+
+    assert decision.mode == "tool_call"
+    assert decision.tool_name == "web.research"
+
+
+def test_offline_fallback_extracts_named_local_document() -> None:
+    tools = [{"name": "files.read_document", "parameters": []}]
+
+    decision = IntentRouter(FakeClient("")).route("打开技术路线文档.md，然后总结其中内容。", tools)
+
+    assert decision.mode == "tool_call"
+    assert decision.arguments["path"] == "技术路线文档.md"
+    assert decision.tool_name == "files.read_document"
+
+
 def test_offline_fallback_routes_structural_python_execution() -> None:
     decision = IntentRouter(FakeClient("")).route(
         "运行 tests/test_sample.py",
