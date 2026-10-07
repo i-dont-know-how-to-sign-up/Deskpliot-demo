@@ -4,7 +4,7 @@ import ast
 import os
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from ..core.config import ROOT_DIR, WORKSPACE_DIR
@@ -49,6 +49,31 @@ def assess_path_write(
     operation: str = "write",
     additional_safe_roots: list[str | Path] | None = None,
 ) -> PermissionDecision:
+    raw_path = str(path).strip()
+    if not _is_windows_host() and _is_windows_absolute_path(raw_path):
+        if _is_windows_protected_path(raw_path):
+            return PermissionDecision(
+                allowed_without_confirmation=False,
+                requires_confirmation=False,
+                blocked=True,
+                risk_level=BLOCKED,
+                reasons=[
+                    f"Target is inside a protected Windows system directory: {raw_path}",
+                    "Protected system paths are blocked by policy.",
+                ],
+            )
+        drive = PureWindowsPath(raw_path).drive.casefold()
+        location = "the C: drive" if drive == "c:" else f"Windows drive {drive.upper()}"
+        return PermissionDecision(
+            allowed_without_confirmation=False,
+            requires_confirmation=True,
+            blocked=False,
+            risk_level=HIGH,
+            reasons=[
+                f"Target is on {location} and cannot be treated as a local POSIX workspace path.",
+                f"Operation '{operation}' requires explicit human confirmation.",
+            ],
+        )
     target = _resolve(path)
     reasons: list[str] = []
 
@@ -100,6 +125,23 @@ def assess_file_move(
     additional_safe_roots: list[str | Path] | None = None,
 ) -> PermissionDecision:
     """同时评估移动的删除侧和写入侧；移动操作始终需要人工确认。"""
+    foreign_windows_paths = [
+        (label, str(path))
+        for label, path in (("Source", source), ("Destination", destination))
+        if not _is_windows_host() and _is_windows_absolute_path(path)
+    ]
+    for label, path in foreign_windows_paths:
+        if _is_windows_protected_path(path):
+            return PermissionDecision(False, False, True, BLOCKED, [
+                f"{label} is inside a protected Windows system directory: {path}",
+                "Protected system paths are blocked by policy.",
+            ])
+    if foreign_windows_paths:
+        details = "; ".join(f"{label}: {path}" for label, path in foreign_windows_paths)
+        return PermissionDecision(False, True, False, HIGH, [
+            f"Windows absolute paths cannot be treated as local POSIX workspace paths: {details}",
+            "Explicit human confirmation is required.",
+        ])
     source_path = _resolve(source)
     destination_path = _resolve(destination)
     for label, path in (("Source", source_path), ("Destination", destination_path)):
@@ -277,7 +319,10 @@ def _external_command_path_reason(command_text: str, cwd: str | Path | None) -> 
     # 识别 Windows 和 POSIX 绝对路径；相对路径由受限 cwd 约束。
     raw_paths = re.findall(r"(?:[A-Za-z]:[\\/][^\s'\"]+|(?<!:)\/[^\s'\"]+)", command_text)
     for raw in raw_paths:
-        candidate = _resolve(raw.rstrip(",;"))
+        cleaned = raw.rstrip(",;")
+        if not _is_windows_host() and _is_windows_absolute_path(cleaned):
+            return f"Command references a Windows absolute path outside the POSIX workspace: {cleaned}"
+        candidate = _resolve(cleaned)
         if not _is_safe_root(candidate):
             return f"Command references a path outside configured safe roots: {candidate}"
     return ""
@@ -342,6 +387,24 @@ def safe_roots(additional_safe_roots: list[str | Path] | None = None) -> list[Pa
 
 def _resolve(path: str | Path) -> Path:
     return Path(path).expanduser().resolve(strict=False)
+
+
+def _is_windows_absolute_path(path: str | Path) -> bool:
+    """在非 Windows 主机上也识别盘符和 UNC 绝对路径。"""
+    value = str(path).strip().strip('"').strip("'")
+    return bool(re.match(r"^[A-Za-z]:[\\/]", value)) or value.startswith("\\\\")
+
+
+def _is_windows_host() -> bool:
+    return os.name == "nt"
+
+
+def _is_windows_protected_path(path: str | Path) -> bool:
+    if not _is_windows_absolute_path(path):
+        return False
+    normalized = str(PureWindowsPath(str(path))).replace("/", "\\").casefold().rstrip("\\")
+    protected = (r"c:\windows", r"c:\program files", r"c:\program files (x86)")
+    return any(normalized == root or normalized.startswith(root + "\\") for root in protected)
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:

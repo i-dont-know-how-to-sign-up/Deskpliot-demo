@@ -7,7 +7,7 @@ import re
 import sys
 import threading
 from contextlib import ExitStack
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
 
 from .api_clients import OpenAICompatibleClient
@@ -2740,12 +2740,16 @@ class DocumentQAAgent:
     def _apply_file_write_directory_hint(self, question: str, target: str) -> str:
         if not target:
             return target
+        if re.match(r"^[A-Za-z]:[\\/]", target) or target.startswith("\\\\"):
+            return str(PureWindowsPath(target))
         target_path = Path(target)
         if target_path.is_absolute():
             return str(target_path)
         directory = self._extract_file_write_directory_hint(question)
         if not directory:
             return target
+        if re.match(r"^[A-Za-z]:[\\/]", directory) or directory.startswith("\\\\"):
+            return str(PureWindowsPath(directory) / PureWindowsPath(target))
         return str((Path(directory) / target).resolve(strict=False))
 
     def _extract_file_write_directory_hint(self, question: str) -> str:

@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -40,7 +40,20 @@ class PaddleOCRProvider:
 
     def __init__(self) -> None:
         self._engine: Any = None
-        self._major_version = int(version("paddleocr").split(".", 1)[0])
+        # PaddleOCR 是可选大依赖。仅在真正识别图片时读取版本，避免基础 CI、
+        # 路由和子进程容错测试仅实例化 provider 就要求安装完整 OCR 运行时。
+        self._major_version: int | None = None
+
+    def _get_major_version(self) -> int:
+        if self._major_version is not None:
+            return self._major_version
+        try:
+            self._major_version = int(version("paddleocr").split(".", 1)[0])
+        except (PackageNotFoundError, ValueError) as exc:
+            raise RuntimeError(
+                "OCR_PROVIDER=paddleocr 需要可选依赖：pip install paddleocr paddlepaddle"
+            ) from exc
+        return self._major_version
 
     def _load(self) -> Any:
         if self._engine is None:
@@ -50,7 +63,7 @@ class PaddleOCRProvider:
                 raise RuntimeError(
                     "OCR_PROVIDER=paddleocr 需要可选依赖：pip install paddleocr paddlepaddle"
                 ) from exc
-            if self._major_version >= 3:
+            if self._get_major_version() >= 3:
                 enable_mkldnn = os.getenv("OCR_ENABLE_MKLDNN", "false").casefold() in {
                     "1", "true", "yes", "on",
                 }
@@ -82,13 +95,13 @@ class PaddleOCRProvider:
         isolated = os.getenv("OCR_ISOLATED_PROCESS", "true").casefold() in {
             "1", "true", "yes", "on",
         }
-        if self._major_version >= 3 and isolated:
+        if self._get_major_version() >= 3 and isolated:
             return self._recognize_isolated(image_path)
         return self._recognize_in_process(image_path)
 
     def _recognize_in_process(self, image_path: Path) -> list[OCRRegion]:
         engine = self._load()
-        if self._major_version >= 3:
+        if self._get_major_version() >= 3:
             return self._parse_v3_results(engine.predict(str(image_path)))
         raw = engine.ocr(str(image_path), cls=True)
         regions: list[OCRRegion] = []

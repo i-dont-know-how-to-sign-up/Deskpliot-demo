@@ -33,6 +33,22 @@ def test_write_unknown_and_composite_commands_require_confirmation() -> None:
     assert expanded.risk_level == "high"
 
 
+def test_windows_absolute_path_stays_external_on_posix_host() -> None:
+    import deskpilot.tools.permissions as permissions
+    from unittest.mock import patch
+
+    with patch.object(permissions, "_is_windows_host", return_value=False):
+        read = assess_command(r"Get-Content C:\Users\Public\note.txt")
+        write = permissions.assess_path_write(r"C:\Temp\report.md")
+        protected = permissions.assess_path_write(r"C:\Windows\System32\drivers\etc\hosts")
+
+    assert read.risk_level == "medium"
+    assert read.requires_confirmation is True
+    assert write.risk_level == "high"
+    assert write.requires_confirmation is True
+    assert protected.risk_level == "blocked"
+
+
 def test_destructive_command_is_blocked() -> None:
     decision = assess_command("Remove-Item -Recurse important")
     assert decision.blocked is True
