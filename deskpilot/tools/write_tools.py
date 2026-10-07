@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import html
 import zipfile
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
-from .permissions import assess_path_write, require_permission
+from .permissions import assess_path_write, is_foreign_windows_path, require_permission
 
 
 TEXT_FORMATS = {
@@ -36,24 +36,43 @@ def write_file(
     confirm: bool = False,
     safe_roots: list[str | Path] | None = None,
 ) -> dict[str, Any]:
-    target = Path(path).expanduser().resolve(strict=False)
-    suffix = _normalize_format(file_format or target.suffix)
+    # 必须先用原始字符串鉴权。POSIX 的 Path.resolve() 会把 C:\... 错当成
+    # 当前目录下的相对文件名，进而绕过工作区外写入的人工确认。
+    raw_path = str(path).strip()
+    foreign_windows_path = is_foreign_windows_path(raw_path)
+    lexical_path = PureWindowsPath(raw_path) if foreign_windows_path else Path(raw_path).expanduser()
+    suffix = _normalize_format(file_format or lexical_path.suffix)
     if not suffix:
         suffix = ".txt"
-        target = target.with_suffix(suffix)
+        lexical_path = lexical_path.with_suffix(suffix)
     if suffix not in TEXT_FORMATS and suffix not in {".docx", ".pdf"}:
         raise ValueError(f"Unsupported output format: {suffix}")
 
-    decision = assess_path_write(target, operation="write_file", additional_safe_roots=safe_roots)
+    display_path = str(lexical_path)
+    decision = assess_path_write(display_path, operation="write_file", additional_safe_roots=safe_roots)
     permission = require_permission(decision, confirm=confirm)
     if not permission["permitted"]:
         return {
             "ok": True,
             "written": False,
-            "path": str(target),
+            "path": display_path,
             "format": suffix,
             **permission,
         }
+
+    # 确认仅代表风险授权，并不能让当前系统执行另一平台的路径语义。
+    # 显式拒绝可避免在 POSIX 工作目录中创建名为 ``C:\...`` 的伪文件。
+    if foreign_windows_path:
+        return {
+            "ok": True,
+            "written": False,
+            "path": display_path,
+            "format": suffix,
+            "permission": decision.to_dict(),
+            "message": "The Windows path cannot be written from the current POSIX host.",
+        }
+
+    target = Path(lexical_path).resolve(strict=False)
     if target.exists() and not overwrite:
         return {
             "ok": True,

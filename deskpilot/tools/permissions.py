@@ -50,7 +50,7 @@ def assess_path_write(
     additional_safe_roots: list[str | Path] | None = None,
 ) -> PermissionDecision:
     raw_path = str(path).strip()
-    if not _is_windows_host() and _is_windows_absolute_path(raw_path):
+    if is_foreign_windows_path(raw_path):
         if _is_windows_protected_path(raw_path):
             return PermissionDecision(
                 allowed_without_confirmation=False,
@@ -128,7 +128,7 @@ def assess_file_move(
     foreign_windows_paths = [
         (label, str(path))
         for label, path in (("Source", source), ("Destination", destination))
-        if not _is_windows_host() and _is_windows_absolute_path(path)
+        if is_foreign_windows_path(path)
     ]
     for label, path in foreign_windows_paths:
         if _is_windows_protected_path(path):
@@ -320,7 +320,7 @@ def _external_command_path_reason(command_text: str, cwd: str | Path | None) -> 
     raw_paths = re.findall(r"(?:[A-Za-z]:[\\/][^\s'\"]+|(?<!:)\/[^\s'\"]+)", command_text)
     for raw in raw_paths:
         cleaned = raw.rstrip(",;")
-        if not _is_windows_host() and _is_windows_absolute_path(cleaned):
+        if is_foreign_windows_path(cleaned):
             return f"Command references a Windows absolute path outside the POSIX workspace: {cleaned}"
         candidate = _resolve(cleaned)
         if not _is_safe_root(candidate):
@@ -389,7 +389,7 @@ def _resolve(path: str | Path) -> Path:
     return Path(path).expanduser().resolve(strict=False)
 
 
-def _is_windows_absolute_path(path: str | Path) -> bool:
+def is_windows_absolute_path(path: str | Path) -> bool:
     """在非 Windows 主机上也识别盘符和 UNC 绝对路径。"""
     value = str(path).strip().strip('"').strip("'")
     return bool(re.match(r"^[A-Za-z]:[\\/]", value)) or value.startswith("\\\\")
@@ -399,8 +399,13 @@ def _is_windows_host() -> bool:
     return os.name == "nt"
 
 
+def is_foreign_windows_path(path: str | Path) -> bool:
+    """判断路径是否为当前 POSIX 主机无法直接执行的 Windows 绝对路径。"""
+    return not _is_windows_host() and is_windows_absolute_path(path)
+
+
 def _is_windows_protected_path(path: str | Path) -> bool:
-    if not _is_windows_absolute_path(path):
+    if not is_windows_absolute_path(path):
         return False
     normalized = str(PureWindowsPath(str(path))).replace("/", "\\").casefold().rstrip("\\")
     protected = (r"c:\windows", r"c:\program files", r"c:\program files (x86)")

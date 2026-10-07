@@ -357,7 +357,9 @@ def test_document_agent_keeps_absolute_directory_hint_for_file_creation(base: Pa
         parsed = agent._extract_file_write_request(
             "\u5728C:\\Users\\TestUser\\Desktop\u4e0b\u521b\u5efatest1.docx"
         )
-        result = agent.answer("\u5728C:\\Users\\TestUser\\Desktop\u4e0b\u521b\u5efatest1.docx")
+        # 在 Windows 开发机上模拟 Linux CI，覆盖跨平台路径进入写工具的完整链路。
+        with patch("deskpilot.tools.permissions._is_windows_host", return_value=False):
+            result = agent.answer("\u5728C:\\Users\\TestUser\\Desktop\u4e0b\u521b\u5efatest1.docx")
     finally:
         os.chdir(previous_cwd)
 

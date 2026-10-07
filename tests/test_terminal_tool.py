@@ -49,6 +49,32 @@ def test_windows_absolute_path_stays_external_on_posix_host() -> None:
     assert protected.risk_level == "blocked"
 
 
+def test_write_tool_preserves_foreign_windows_path_before_permission_check(tmp_path: Path) -> None:
+    import os
+    from unittest.mock import patch
+
+    import deskpilot.tools.permissions as permissions
+    from deskpilot.tools.write_tools import write_file
+
+    target = r"C:\Users\TestUser\Desktop\test1.docx"
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+        with patch.object(permissions, "_is_windows_host", return_value=False):
+            result = write_file(target, "")
+            confirmed = write_file(target, "", confirm=True)
+    finally:
+        os.chdir(previous_cwd)
+
+    assert result["written"] is False
+    assert result["path"] == target
+    assert result["permission"]["requires_confirmation"] is True
+    assert confirmed["written"] is False
+    assert confirmed["path"] == target
+    assert "POSIX" in confirmed["message"]
+    assert not (tmp_path / target).exists()
+
+
 def test_destructive_command_is_blocked() -> None:
     decision = assess_command("Remove-Item -Recurse important")
     assert decision.blocked is True
