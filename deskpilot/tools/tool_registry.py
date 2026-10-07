@@ -19,6 +19,7 @@ from .permissions import assess_command, assess_path_write
 from .write_tools import write_docx, write_file, write_markdown, write_pdf, write_text
 from ..rag.web_research import WebResearchAgent, WebSearchClient
 from ..mcp.email_mcp import EmailMCPService
+from ..multimodal import MultimodalService
 
 
 ToolHandler = Callable[..., Any]
@@ -188,12 +189,53 @@ def build_default_tool_registry(
     web_research_agent: WebResearchAgent | None = None,
     workspace_root: Path | None = None,
     email_service: EmailMCPService | None = None,
+    multimodal_service: MultimodalService | None = None,
 ) -> ToolRegistry:
     # 这里集中注册所有工具，意图路由器和 UI 都只需要依赖这一份工具清单。
     registry = ToolRegistry()
     email = email_service or EmailMCPService()
     search_client = web_research_agent.search_client if web_research_agent else WebSearchClient()
     write_safe_roots = [workspace_root] if workspace_root is not None else None
+
+    if multimodal_service is not None:
+        registry.register(ToolSpec(
+            name="vision.inspect_image", category="vision",
+            description="校验并检查本地图片，可选执行 OCR；只读源文件，结果不包含 Base64。",
+            parameters=[
+                ToolParameter("path", "string", True, "本地图片路径"),
+                ToolParameter("include_ocr", "boolean", False, "是否执行 OCR", True),
+            ],
+            handler=lambda path, include_ocr=True: multimodal_service.inspect_image(
+                Path(path), bool(include_ocr)
+            ),
+        ))
+        registry.register(ToolSpec(
+            name="knowledge.index_image", category="knowledge",
+            description="将图片或 PDF 页图写入独立多模态索引。",
+            parameters=[ToolParameter("path", "string", True, "图片或 PDF 路径")],
+            handler=lambda path: multimodal_service.index_file(Path(path)),
+        ))
+        registry.register(ToolSpec(
+            name="knowledge.search_multimodal", category="knowledge",
+            description="融合 OCR、文本和视觉向量检索图片资料；只读。",
+            parameters=[
+                ToolParameter("query", "string", False, "文本查询", ""),
+                ToolParameter("image_path", "string", False, "可选查询图片路径", ""),
+                ToolParameter("top_k", "integer", False, "返回证据数", 5),
+            ],
+            handler=lambda query="", image_path="", top_k=5: [item.to_dict() for item in multimodal_service.search(
+                str(query), Path(image_path) if image_path else None, int(top_k)
+            )],
+        ))
+        registry.register(ToolSpec(
+            name="knowledge.answer_multimodal", category="knowledge",
+            description="从多模态索引检索有限图片，并使用视觉模型生成带图片来源的综合回答。",
+            parameters=[
+                ToolParameter("query", "string", True, "需要基于图片知识库回答的问题"),
+                ToolParameter("top_k", "integer", False, "检索候选数量", 4),
+            ],
+            handler=lambda query, top_k=4: multimodal_service.answer_from_index(str(query), int(top_k)),
+        ))
 
     # 邮件工具统一走 MCP 业务层；发送和保存草稿由业务层返回审批信息。
     registry.register(ToolSpec("email.list_messages", "email", "List recent email messages. Read-only.", [ToolParameter("limit", "integer", False, "Maximum messages", 20), ToolParameter("unread_only", "boolean", False, "Only unread", False)], lambda limit=20, unread_only=False: email.list_messages(int(limit), bool(unread_only))))

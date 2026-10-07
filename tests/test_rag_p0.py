@@ -169,6 +169,8 @@ def test_rag_p0_dataset_is_extensible_and_local_files_exist() -> None:
     assert len({case["id"] for case in cases}) == len(cases)
     for case in cases:
         assert case["query"] and case["relevant_sources"]
+        if case.get("runtime", {}).get("optional_local"):
+            continue
         for relative in case["corpus"]:
             assert (root / relative).is_file(), relative
 

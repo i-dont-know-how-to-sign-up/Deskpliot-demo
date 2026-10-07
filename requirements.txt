@@ -5,6 +5,7 @@ PySide6>=6.7.0
 pypdf>=5.0.0
 PyMuPDF>=1.24.0
 pytest>=8.0.0
+Pillow>=10.4.0
 
 # Optional memory vector database for Stage 2 P1.
 # Install manually if you want MEMORY_VECTOR_PROVIDER=chroma:

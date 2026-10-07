@@ -15,6 +15,8 @@ def test_p1_dataset_is_unique_and_reproducible() -> None:
     assert len(cases) == 8
     assert len({case["id"] for case in cases}) == len(cases)
     for case in cases:
+        if case.get("runtime", {}).get("optional_local"):
+            continue
         for relative in case.get("corpus", []):
             assert (ROOT / relative).is_file()
 

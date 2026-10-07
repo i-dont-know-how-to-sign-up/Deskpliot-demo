@@ -34,7 +34,7 @@ ApplicationWindow {
 
     function ask() {
         const value = composer.text.trim()
-        if (!value || deskPilot.busy) return
+        if ((!value && deskPilot.pendingAttachments.length === 0) || deskPilot.busy) return
         deskPilot.ask(value)
         composer.clear()
     }
@@ -253,6 +253,33 @@ ApplicationWindow {
                                     font.pixelSize: 10
                                     font.weight: Font.DemiBold
                                 }
+                                Flow {
+                                    width: bubble.width - 26
+                                    spacing: 8
+                                    visible: messageAttachments && messageAttachments.length > 0
+                                    Repeater {
+                                        model: messageAttachments || []
+                                        delegate: Rectangle {
+                                            required property var modelData
+                                            width: 112
+                                            height: 82
+                                            radius: 6
+                                            color: theme.surfaceSoft
+                                            border.color: theme.border
+                                            clip: true
+                                            Image {
+                                                anchors.fill: parent
+                                                anchors.margins: 3
+                                                source: modelData.thumbnail
+                                                fillMode: Image.PreserveAspectCrop
+                                                asynchronous: true
+                                            }
+                                            ToolTip.visible: attachmentHover.hovered
+                                            ToolTip.text: modelData.name
+                                            HoverHandler { id: attachmentHover }
+                                        }
+                                    }
+                                }
                                 TextEdit {
                                     id: bubbleText
                                     width: bubble.width - 26
@@ -302,12 +329,85 @@ ApplicationWindow {
 
             PanelFrame {
                 Layout.fillWidth: true
-                Layout.preferredHeight: 142
+                Layout.preferredHeight: deskPilot.pendingAttachments.length > 0 ? 230 : 150
                 color: theme.surface
+                DropArea {
+                    anchors.fill: parent
+                    onDropped: function(drop) {
+                        if (drop.hasUrls) {
+                            deskPilot.addImageUrls(JSON.stringify(drop.urls))
+                            drop.acceptProposedAction()
+                        }
+                    }
+                }
                 ColumnLayout {
                     anchors.fill: parent
                     anchors.margins: 12
                     spacing: 8
+                    ListView {
+                        id: attachmentTray
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: deskPilot.pendingAttachments.length > 0 ? 72 : 0
+                        visible: deskPilot.pendingAttachments.length > 0
+                        orientation: ListView.Horizontal
+                        spacing: 8
+                        clip: true
+                        model: deskPilot.pendingAttachments
+                        delegate: Rectangle {
+                            required property var modelData
+                            width: 132
+                            height: 68
+                            radius: 6
+                            color: theme.surfaceRaised
+                            border.color: theme.border
+                            Image {
+                                width: 62
+                                height: 62
+                                anchors.left: parent.left
+                                anchors.leftMargin: 3
+                                anchors.verticalCenter: parent.verticalCenter
+                                source: modelData.thumbnail
+                                fillMode: Image.PreserveAspectCrop
+                                asynchronous: true
+                            }
+                            Label {
+                                anchors.left: parent.left
+                                anchors.leftMargin: 70
+                                anchors.right: removeAttachment.left
+                                anchors.rightMargin: 4
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: modelData.name
+                                elide: Text.ElideMiddle
+                                color: theme.text
+                                font.pixelSize: 11
+                            }
+                            Button {
+                                id: removeAttachment
+                                width: 28
+                                height: 28
+                                anchors.right: parent.right
+                                anchors.rightMargin: 4
+                                anchors.top: parent.top
+                                anchors.topMargin: 4
+                                text: "×"
+                                Accessible.name: "移除图片 " + modelData.name
+                                onClicked: deskPilot.removePendingAttachment(modelData.assetId)
+                                ToolTip.visible: hovered
+                                ToolTip.text: "移除图片"
+                                background: Rectangle {
+                                    radius: 4
+                                    color: removeAttachment.hovered ? "#334155" : "#1c2532"
+                                }
+                                contentItem: Label {
+                                    text: removeAttachment.text
+                                    color: theme.muted
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                    font.pixelSize: 16
+                                }
+                            }
+                        }
+                    }
                     ScrollView {
                         Layout.fillWidth: true
                         Layout.fillHeight: true
@@ -326,6 +426,18 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         Label { text: "Ctrl + Enter 发送"; color: theme.muted; font.pixelSize: 10 }
                         Item { Layout.fillWidth: true }
+                        SmallButton {
+                            text: "添加图片"
+                            enabled: !deskPilot.busy
+                            Accessible.name: "添加图片附件"
+                            onClicked: deskPilot.chooseImageAttachments()
+                        }
+                        SmallButton {
+                            text: "粘贴图片"
+                            enabled: !deskPilot.busy
+                            Accessible.name: "粘贴剪贴板图片"
+                            onClicked: deskPilot.pasteImageAttachment()
+                        }
                         SmallButton { text: "网页调研"; enabled: !deskPilot.busy; onClicked: { deskPilot.research(composer.text, 5); composer.clear() } }
                         Button {
                             id: sendButton
@@ -339,6 +451,11 @@ ApplicationWindow {
                         }
                     }
                 }
+            }
+            Shortcut {
+                sequence: "Ctrl+Shift+V"
+                enabled: !deskPilot.busy
+                onActivated: deskPilot.pasteImageAttachment()
             }
         }
 

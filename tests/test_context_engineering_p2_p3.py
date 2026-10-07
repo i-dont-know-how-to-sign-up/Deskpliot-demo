@@ -10,6 +10,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from deskpilot.context import AdaptiveBudgetManager, ContextBuilder, UsageCostTracker
+from deskpilot.context.tokenizer import ModelTokenizer
 from deskpilot.core.agent import DocumentQAAgent
 from deskpilot.core.models import AgentStep
 from deskpilot.core.models import Chunk, Document, Evidence
@@ -63,6 +64,17 @@ def test_adaptive_budget_grows_with_complexity() -> None:
     assert complex_task.input_tokens > simple.input_tokens
     assert complex_task.output_tokens > simple.output_tokens
     assert manager.allocate("router", 5).input_tokens < manager.allocate("answer", 5).input_tokens
+
+
+def test_auto_tokenizer_for_qwen_does_not_import_transformers_at_startup(monkeypatch) -> None:
+    def fail_if_called(self) -> None:
+        raise AssertionError("auto 模式不应在启动阶段加载 transformers/torch")
+
+    monkeypatch.setattr(ModelTokenizer, "_try_transformers", fail_if_called)
+    tokenizer = ModelTokenizer("qwen3.8-max", "auto")
+
+    assert tokenizer.provider == "heuristic"
+    assert tokenizer.exact is False
 
 
 def test_tool_catalog_uses_progressive_disclosure() -> None:

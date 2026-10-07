@@ -1,0 +1,14 @@
+{
+  "gaia": {
+    "source_url": "https://arxiv.org/abs/2311.12983",
+    "source_dataset": "GAIA",
+    "adapted_case_ids": ["gaia_001", "gaia_002", "gaia_003", "gaia_004", "gaia_005", "gaia_006"],
+    "adaptation_note": "These cases preserve GAIA-style multi-ability tasks while replacing external and multimodal dependencies with DeskPilot documents, web research, evidence, and report artifacts."
+  },
+  "ragas": {
+    "source_url": "https://github.com/vibrantlabsai/ragas",
+    "source_dataset": "Ragas methodology",
+    "adapted_case_ids": ["ragas_001", "ragas_002", "ragas_003", "ragas_004", "ragas_005", "ragas_006"],
+    "adaptation_note": "These cases map RAG evaluation ideas to local fixtures and check retrieval evidence, faithfulness, answer support, and refusal when context is insufficient."
+  }
+}

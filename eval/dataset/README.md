@@ -145,3 +145,23 @@ GAIA/Ragas 改编来源清单位于 dataset/public_sources/gaia_ragas_adaptation
 - 高质量任务启用 Reflection、普通即时问答跳过 Reflection 的策略。
 
 P1 用例沿用同一 JSONL 模板，新增字段可放在 `expected` 中，例如 `parallelizable`、`recovery_required` 和 `reflection_policy`。评测 runner 未识别字段时应忽略它们，不影响已有用例。
+
+## 多模态 P0/P1 数据集
+
+`multimodal_cases.jsonl` 是独立于 DeskPilotBench 主集的 12 条轻量数据，运行时由评测脚本生成红/蓝办公截图，不存放个人图片或大型公开数据集文件：
+
+- `Multimodal-Safety` 5 条：内容去重、损坏文件、像素上限、向量空间隔离、Base64 不落盘。
+- `Multimodal-RAG` 4 条：文本搜图、以图搜图和 OCR/视觉 RRF 融合。
+- `Multimodal-QA` 3 条：单图读取、多图比较和图片引用，需要真实视觉 API。
+
+离线结构评测：
+
+```powershell
+python -m eval.run_multimodal_eval --mode offline --count 12
+```
+
+真实 VLM 评测需要配置 `VISION_MODEL`、`VISION_API_KEY` 和 `ALLOW_CLOUD_IMAGE_UPLOAD=true`：
+
+```powershell
+python -m eval.run_multimodal_eval --mode api --count 12
+```

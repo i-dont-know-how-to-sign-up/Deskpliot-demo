@@ -3,6 +3,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+/.cache/
 
 # Local environments and secrets.
 .env
@@ -25,6 +26,7 @@ sess_*.md
 /*.txt
 !/requirements.txt
 !/requirements-rerank.txt
+!/requirements-multimodal.txt
 
 # Imported documents, generated attachments and local corpora may contain private data.
 *.docx

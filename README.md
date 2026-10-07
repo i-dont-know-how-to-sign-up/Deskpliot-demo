@@ -1,6 +1,6 @@
 # DeskPilot
 
-> 当前版本：`0.8.0`
+> 当前版本：`0.8.1`
 
 DeskPilot 是一个本地优先、面向个人办公场景的桌面 Agent。它将本地文档 RAG、会话记忆、网页调研、邮件处理、文件与终端工具、权限控制和多智能体编排整合到一个 PySide6 + Qt Quick 桌面应用中。
 
@@ -97,6 +97,24 @@ DeskPilot 是一个本地优先、面向个人办公场景的桌面 Agent。它�
 
 实现入口：`deskpilot/rag/web_research.py`。
 
+### 多模态图片问答与检索
+
+- 聊天输入区支持选择、粘贴和拖入 PNG/JPEG/WebP 图片，单轮默认最多 4 张。
+- 图片经过真实格式、大小、像素和 EXIF 方向校验，使用 SHA-256 去重并生成缩略图。
+- 会话只保存 `attachment_id`，不会把 Base64 写入消息、日志或 Steps。
+- 支持 OpenAI-compatible 视觉模型的单图/多图问答，并使用 `[图片N]` 标记来源。
+- 图片与显式 PDF 页图可进入独立多模态索引；OCR、文本向量和视觉向量通过 RRF 融合。
+- 本地 SigLIP2 和 PaddleOCR 为可选延迟加载 Provider，不会随基础安装下载大型模型。
+- 多模态入库按图片 SHA-256 和向量空间幂等复用；重复导入不会再次运行 OCR 或视觉编码。
+- 纯文本多模态问答使用 `knowledge.answer_multimodal` 完成检索和 VLM 综合；原始证据审计与以图搜图使用 `knowledge.search_multimodal`。
+- OCR 与视觉向量是独立入库通道：本地视觉模型资源不足时保留可用 OCR 索引，并返回明确的降级状态。
+
+云端图片上传默认关闭。使用前必须配置视觉模型并显式设置 `ALLOW_CLOUD_IMAGE_UPLOAD=true`。
+
+实现入口：`deskpilot/multimodal/`。
+
+多模态索引采用独立 SQLite catalog，图片二进制存放在受控资产目录，数据库只保存元数据、OCR chunk 和向量。检索结果记录 `ocr_lexical`、`ocr_dense`、`vision_text`、`vision_image` 通道，文字问答存在可靠 OCR 字面命中时会过滤仅由弱视觉相似度召回的无关页面。
+
 ### 邮件 MCP
 
 - 支持 163、QQ、Outlook 及本地 Mock Provider。
@@ -154,6 +172,7 @@ DeskPilot 内部 Tool Registry 直接复用邮件 MCP 业务层，因此启动�
 | 语言 | Python 3.11 |
 | 桌面 UI | PySide6、Qt Quick、QML |
 | LLM / Embedding | OpenAI-compatible HTTP API，默认示例为 DashScope/Qwen |
+| 多模态 | Pillow、OpenAI-compatible VLM、可选 SigLIP2/PaddleOCR |
 | 文档解析 | PyMuPDF、pypdf，以及基于 ZIP/XML 的 Office 文档解析 |
 | RAG 存储 | JSON 兼容快照、SQLite Catalog、SQLite FTS5/BM25 |
 | 记忆存储 | JSONL、SQLite、可选 Chroma |
@@ -173,6 +192,7 @@ deskpilot/
   mcp/                  # 邮件 MCP 业务层和 stdio Server
   memory/               # 会话、结构化记忆、压缩和向量存储
   multi_agent/          # Planner、Router、Supervisor 和领域 Agent
+  multimodal/           # 图片资产、OCR、视觉模型、向量库和融合检索
   qml/                  # Qt Quick 界面
   rag/                  # 解析、分块、索引、检索和网页调研
   tools/                # 工具注册、权限、文件、桌面和执行工具
@@ -213,6 +233,7 @@ python -m pip install -r requirements.txt
 - `playwright`：浏览器搜索和动态网页读取。
 - `mcp`：可选邮件 MCP stdio Server。
 - `pytest`：执行完整测试模块和版本基线。
+- `Pillow`：图片校验、方向修正、推理副本和缩略图。
 
 可选依赖：
 
@@ -226,7 +247,21 @@ python -m playwright install chromium
 # 更精确的上下文 Token 统计，可任选其一
 python -m pip install tiktoken
 python -m pip install transformers
+
+# 多模态本地 OCR 与 SigLIP2；会安装 PaddlePaddle、PyTorch 等大型依赖
+python -m pip install -r requirements-multimodal.txt
 ```
+
+模型默认缓存到各依赖的系统缓存目录。磁盘空间有限时，建议在 `.env` 或系统环境变量中把缓存迁移到空间充足的磁盘，例如：
+
+```env
+HF_HOME=D:\broagent\.cache\huggingface
+HUGGINGFACE_HUB_CACHE=D:\broagent\.cache\huggingface\hub
+PADDLE_HOME=D:\broagent\.cache\paddle
+PADDLE_PDX_CACHE_HOME=D:\broagent\.cache\paddlex
+```
+
+模型缓存目录、`.env` 和运行时索引均已排除在 Git 之外，不应提交。
 
 ## 配置
 
@@ -281,6 +316,37 @@ RAG_MMR_LAMBDA=0.72
 - `RAG_P2_ENABLED=false` 可回退到 P1 RRF；`RAG_RERANK_PROVIDER=disabled` 只关闭精排。
 - `cross_encoder` 不会自动下载模型，必须在 `RAG_RERANK_MODEL` 配置本地模型目录。
 - 完整分块、窗口、批处理和 RRF 参数见 `.env.example`。
+- `CONTEXT_TOKENIZER_PROVIDER=auto` 对 Qwen 等 OpenAI-compatible 模型使用轻量保守估算，避免 Demo 启动时导入 Transformers/Torch；准备好本地 tokenizer 后可显式设置为 `transformers`。
+
+### 多模态配置
+
+```env
+VISION_PROVIDER=openai_compatible
+VISION_MODEL=qwen3.8-omni-flash
+VISION_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+VISION_API_KEY=
+ALLOW_CLOUD_IMAGE_UPLOAD=false
+
+OCR_PROVIDER=paddleocr
+OCR_DETECTION_MODEL=PP-OCRv5_mobile_det
+OCR_RECOGNITION_MODEL=PP-OCRv5_mobile_rec
+OCR_USE_TEXTLINE_ORIENTATION=false
+OCR_ENABLE_MKLDNN=false
+OCR_CPU_THREADS=1
+OCR_ISOLATED_PROCESS=true
+
+IMAGE_EMBEDDING_PROVIDER=siglip2
+IMAGE_EMBEDDING_MODEL=google/siglip2-base-patch16-224
+IMAGE_EMBEDDING_ISOLATED_PROCESS=true
+IMAGE_EMBEDDING_MIN_AVAILABLE_COMMIT_GB=5
+MULTIMODAL_RETRY_MISSING_VISION=false
+```
+
+- 云端发送图片必须显式启用 `ALLOW_CLOUD_IMAGE_UPLOAD=true`；图片 Base64 只存在于请求体，不写入会话和日志。
+- Windows 下 PaddleOCR 默认使用单线程并关闭文字方向分类，降低原生访问冲突和冷启动成本；需要旋转文字识别时可显式开启方向分类。
+- OCR 和 SigLIP2 默认使用短生命周期子进程，避免 Paddle/Torch 与 Qt 主进程叠加占用提交内存。
+- SigLIP2 启动前检查 Windows 可用提交内存；不足时跳过视觉向量但保留 OCR 索引。增大页面文件后，将 `MULTIMODAL_RETRY_MISSING_VISION=true` 并重新导入可补齐向量。
+- 首次导入必须运行本地 OCR，耗时取决于图片文字量和 CPU；相同图片再次导入直接复用索引。当前测试机完整 Qt Bridge 冷启动约 1 秒，已完整索引图片的重复导入约 0.05 秒，该数据仅作为相对性能参考。
 
 ### 网页搜索配置
 
@@ -344,6 +410,7 @@ EMAIL_ATTACHMENTS_TOTAL_MAX_MB=25
 3. 在 Steps 中检查 Router、Planner、Query Analyzer、检索 Trace 和工具结果。
 4. 在 Evidence 中核对文件名、PDF 页码或网页链接。
 5. 对写文件、执行命令、保存草稿和发送邮件等操作进行人工确认。
+6. 添加图片进行直接图文问答，或通过自然语言将图片/PDF 页图加入多模态索引。
 
 只有外部 MCP Client 需要单独启动邮件 Server：
 
@@ -408,6 +475,17 @@ RAG 检索层消融：
 .\.conda\deskpilot-py311\python.exe -m eval.run_rag_p2_eval --count 12 --mode offline --provider auto --expansion auto
 ```
 
+多模态专项测试与评测：
+
+```powershell
+.\.conda\deskpilot-py311\python.exe -m pytest tests\test_multimodal_p0_p1.py -q
+.\.conda\deskpilot-py311\python.exe -m eval.run_multimodal_eval --mode offline --count 12
+# 需要配置视觉 API，并明确允许上传测试图片
+.\.conda\deskpilot-py311\python.exe -m eval.run_multimodal_eval --mode api --count 12
+```
+
+GitHub Actions 使用 Python 3.11 安装 `requirements.txt`，执行完整 `pytest` 回归、160 条可移植数据集的数量/唯一 ID 校验，以及一组确定性离线 smoke 用例。全量 160 条离线评测用于能力基线和版本对比，其中包含 API 专用跳过项及当前未满分用例，不作为零失败 CI 门禁。`eval/dataset/*.jsonl` 及其小型合成 fixture 是版本化测试输入，必须提交；`eval/reports/`、`eval/runs/`、本地论文和个人图片不提交。
+
 评测报告默认写入 `eval/reports/`，逐用例明细写入 `eval/runs/`。报告和运行结果属于生成产物，不应提交。
 
 ## 数据与安全
@@ -421,7 +499,9 @@ RAG 检索层消融：
 
 ## 当前局限
 
-- 尚未支持图片输入、图像向量索引和图文问答。
+- 多模态 P0/P1 已支持图片问答和小型知识库精确扫描；图片长期记忆、Office 内嵌图、后台批处理和 ANN 尚未完成。
+- 默认 `basic` 图片向量只适合离线图搜图验证；可靠文本搜图需要启用 SigLIP2，中文截图检索需要启用 PaddleOCR。
+- PaddleOCR/SigLIP2 的首次本地推理存在模型冷启动和内存成本；低页面文件环境会自动保留 OCR 通道并降级视觉向量。
 - 当前精确 Dense 扫描适合个人小型知识库，文档规模增大后性能会下降。
 - Cross-Encoder 仅提供可选本地 provider，未随项目分发模型；当前 ColBERT 是用于接口和消融的 hash MaxSim 实验实现，不等同于训练版 ColBERT。
 - PDF 如果缺少正确的 Unicode 字体映射，仍可能出现无法恢复的乱码。
@@ -429,14 +509,14 @@ RAG 检索层消融：
 - 邮箱目前一次只加载一个账号，Outlook OAuth、多账号隔离和账号切换尚未完成。
 - 多智能体目前主要覆盖结构化规划和工具协作，Reflection Agent 尚未正式启用。
 - Python 静态策略只能阻断明显危险语法，不能替代进程、账号或容器级沙箱。
-- UI 的渐进显示基于完整结果播放，并非模型服务端原生 Token Streaming。
+- 文本模型回答已支持 OpenAI-compatible SSE；视觉回答当前仍采用完整响应返回。
 - 本地 fallback 只能提供基础检索摘要，不能替代真实 LLM 的综合推理。
 - 当前没有 SFT、RLHF/DPO、Agentic RL 训练、vLLM 推理优化或端侧模型部署。
 
 ## 后续工作
 
 - RAG：校准各 reranker 阈值，使用真实中英文 Cross-Encoder 做消融，并在知识库规模增长后接入成熟 ANN Provider。
-- 多模态：图片解析、图像 Embedding、图文混合检索、图片记忆与视觉问答。
+- 多模态：继续完成视觉记忆、Office 内嵌图、敏感图片 Gate、后台批处理和端侧 VLM。
 - Agent：按任务质量要求启用 Reflection，并完善失败恢复、预算和人工接管。
 - 邮件：多账号、OAuth、模板管理、附件策略和更完整的邮箱文件夹兼容。
 - UI：服务端原生流式输出、更清晰的计划图和工具审批历史。

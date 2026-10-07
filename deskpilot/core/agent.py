@@ -35,6 +35,7 @@ from ..multi_agent.planner import PlannerAgent
 from ..multi_agent.plan_executor import PlanExecutor
 from ..multi_agent.router import MultiAgentRouter
 from ..multi_agent.task_ledger import TaskLedger
+from ..multimodal import MultimodalService
 
 
 class DocumentQAAgent:
@@ -71,12 +72,16 @@ class DocumentQAAgent:
         )
         self.usage_tracker = UsageCostTracker(LOG_DIR / "context_usage.jsonl")
         self.web_research_agent = WebResearchAgent(index)
+        self.multimodal = MultimodalService()
         self._operation_lock = threading.RLock()
         self._turn_usage_start = self.usage_tracker.snapshot(self._combined_usage())
         self.workspace_root = Path.cwd().resolve()
         # Ledger 跟随索引所在的数据目录，测试/评测使用临时索引时不会污染项目工作区。
         self.task_ledger = TaskLedger(Path(self.index.index_file).parent / "task_ledger.json")
-        self.tool_registry = build_default_tool_registry(index, self.web_research_agent, workspace_root=self.workspace_root)
+        self.tool_registry = build_default_tool_registry(
+            index, self.web_research_agent, workspace_root=self.workspace_root,
+            multimodal_service=self.multimodal,
+        )
         self.pending_actions = PendingActionStore()
         self.runtime = PlanAndExecuteRuntime(default_max_retries=1)
         self.intent_router = IntentRouter(self.client)
@@ -92,6 +97,46 @@ class DocumentQAAgent:
                 )
             )
         )
+
+    def answer_multimodal(
+        self, question: str, asset_ids: list[str], session_id: str | None = None,
+        event_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> AnswerResult:
+        """处理当前轮图片问答；简单视觉任务不进入 Planner。"""
+        with self._operation_lock:
+            session = self.session_store.get_or_create(session_id)
+            user_message = self.session_store.append_message(
+                session.session_id, "user", question or "请描述这些图片。",
+                metadata={"attachment_ids": list(dict.fromkeys(asset_ids)), "modality": "image"},
+            )
+            if event_callback:
+                event_callback({"type": "model_start", "stage": "Vision Answer", "kind": "vision", "visible": False})
+            try:
+                answer = self.multimodal.answer(question, asset_ids)
+            except Exception as exc:
+                if event_callback:
+                    event_callback({
+                        "type": "model_end", "stage": "Vision Answer", "kind": "vision",
+                        "ok": False, "error": str(exc),
+                    })
+                raise
+            if event_callback:
+                event_callback({"type": "model_end", "stage": "Vision Answer", "kind": "vision", "ok": True})
+            steps = [
+                AgentStep("validate_attachments", "success", f"已校验并加载 {len(asset_ids)} 张受控图片资产。"),
+                AgentStep("vision_answer", "success", f"由 {self.multimodal.vision_llm.model} 完成图文问答。"),
+            ]
+            assistant = self.session_store.append_message(
+                session.session_id, "assistant", answer,
+                metadata={
+                    "steps": [step.__dict__ for step in steps],
+                    "reply_to": user_message.message_id,
+                },
+            )
+            return AnswerResult(
+                answer=answer, evidences=[], steps=steps, used_llm=True,
+                session_id=session.session_id, memory_context="本轮使用图片附件，不持久化 Base64 数据。",
+            )
 
     def plan_task(
         self, question: str, conversation_context: str = "", *,
@@ -232,7 +277,12 @@ class DocumentQAAgent:
         index_hint = self.index.retrieval_hint(question)
         steps.append(AgentStep(
             "index_route_hint", "success",
-            json.dumps({"candidate_count": len(index_hint), "candidates": index_hint}, ensure_ascii=False),
+            json.dumps({
+                "scope": "text_rag",
+                "note": "该提示只探测普通文档索引；多模态索引由对应工具独立检索。",
+                "candidate_count": len(index_hint),
+                "candidates": index_hint,
+            }, ensure_ascii=False),
         ))
         decision = self.intent_router.route(
             question, self.tool_registry, router_context.text, index_hint=index_hint
@@ -1361,6 +1411,22 @@ class DocumentQAAgent:
     ) -> AnswerResult:
         # confirm 不属于模型权限。即使旧 Router 或恶意模型返回该字段，也在工具边界前丢弃。
         safe_arguments = {key: value for key, value in arguments.items() if key != "confirm"}
+        # 纯文本多模态问答需要“检索 + VLM 综合”契约。search_multimodal 是供
+        # 以图搜图和证据审计使用的底层工具，不应把原始证据列表直接当最终回答。
+        if (
+            tool_name == "knowledge.search_multimodal"
+            and str(safe_arguments.get("query", "")).strip()
+            and not str(safe_arguments.get("image_path", "")).strip()
+        ):
+            tool_name = "knowledge.answer_multimodal"
+            safe_arguments = {
+                "query": str(safe_arguments["query"]),
+                "top_k": int(safe_arguments.get("top_k", 4) or 4),
+            }
+            steps.append(AgentStep(
+                "normalize_tool_capability", "success",
+                "纯文本多模态问答已从证据检索工具提升为综合回答工具。",
+            ))
         result = self.tool_registry.call(tool_name, **safe_arguments)
         steps.append(AgentStep("execute_tool", "success" if result.ok else "failed", f"已调用工具：{tool_name}"))
         return self._finalize_generic_tool_result(
@@ -1403,6 +1469,7 @@ class DocumentQAAgent:
 
         payload = getattr(tool_result, "output", None)
         answer = ""
+        tool_evidences: list[Evidence] = []
         pending_action = None
         if isinstance(payload, dict) and payload.get("permission"):
             permission = payload.get("permission", {})
@@ -1425,7 +1492,19 @@ class DocumentQAAgent:
                     "risk_level": permission.get("risk_level", "high"),
                     "reasons": permission.get("reasons", []),
                 }
-        if isinstance(payload, list):
+        if tool_name == "knowledge.index_image" and isinstance(payload, list):
+            answer = self._present_multimodal_index_result(payload)
+        elif tool_name == "knowledge.search_multimodal" and isinstance(payload, list):
+            answer = self._present_multimodal_search_result(payload)
+        elif (
+            tool_name == "knowledge.answer_multimodal"
+            and isinstance(payload, dict)
+        ):
+            answer = str(payload.get("answer", "")).strip()
+            tool_evidences = self._multimodal_tool_evidences(payload.get("evidences"))
+            if not answer:
+                answer = "多模态索引中没有找到足够的相关图片证据。"
+        elif isinstance(payload, list):
             lines: list[str] = []
             for idx, item in enumerate(payload[:5], start=1):
                 if not isinstance(item, dict):
@@ -1460,7 +1539,12 @@ class DocumentQAAgent:
         else:
             answer = str(payload)
 
-        steps.append(AgentStep("tool_result", "success", f"工具输出已返回：{tool_name}"))
+        result_detail = f"工具输出已返回：{tool_name}"
+        if tool_name in {
+            "knowledge.index_image", "knowledge.search_multimodal", "knowledge.answer_multimodal",
+        }:
+            result_detail += "\n" + self._clip_tool_output(answer, limit=1600)
+        steps.append(AgentStep("tool_result", "success", result_detail))
         # 工具结果以 packet 进入 Executor 视图，避免后续步骤依赖未受预算控制的原始对象。
         memory_context = self.context_assembler.for_role(
             memory_context,
@@ -1472,7 +1556,7 @@ class DocumentQAAgent:
 
         return self._finalize_answer(
             answer=answer or f"工具已执行：{tool_name}",
-            evidences=[],
+            evidences=tool_evidences,
             steps=steps,
             used_llm=False,
             session_id=session_id,
@@ -1481,6 +1565,77 @@ class DocumentQAAgent:
             memory_context=memory_context,
             pending_action=pending_action,
         )
+
+    @staticmethod
+    def _present_multimodal_index_result(payload: list[object]) -> str:
+        lines: list[str] = []
+        total_regions = 0
+        warnings: list[str] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            asset = item.get("asset") if isinstance(item.get("asset"), dict) else {}
+            source = str(
+                asset.get("metadata", {}).get("source_name", "")
+                if isinstance(asset.get("metadata"), dict) else ""
+            ).strip()
+            source = source or str(item.get("source_label", "")).strip() or "图片"
+            regions = int(item.get("ocr_regions", 0) or 0)
+            total_regions += regions
+            embedding_status = str(item.get("embedding_status", "success"))
+            cache_note = "（复用已有索引）" if item.get("ocr_cached") else ""
+            lines.append(
+                f"- {source}{cache_note}：OCR {regions} 个区域；视觉向量"
+                f"{'已生成' if embedding_status == 'success' else '暂未生成'}。"
+            )
+            warning = str(item.get("warning", "")).strip()
+            if warning and warning not in warnings:
+                warnings.append(warning)
+        if not lines:
+            return "多模态索引工具已执行，但没有返回可识别的入库结果。"
+        result = f"已加入多模态索引，共处理 {len(lines)} 个图片页面、{total_regions} 个 OCR 区域：\n" + "\n".join(lines)
+        if warnings:
+            result += "\n\n注意：\n" + "\n".join(f"- {item}" for item in warnings)
+        return result
+
+    @staticmethod
+    def _present_multimodal_search_result(payload: list[object]) -> str:
+        lines: list[str] = []
+        for index, item in enumerate(payload[:5], start=1):
+            if not isinstance(item, dict):
+                continue
+            source = str(item.get("source_label", "")).strip() or "未知图片"
+            text = str(item.get("text", "")).strip().replace("\n", " ")
+            if len(text) > 300:
+                text = text[:300].rstrip() + "..."
+            lines.append(f"{index}. {source}" + (f"\n   {text}" if text else ""))
+        return "\n".join(lines) or "多模态索引中没有找到相关图片证据。"
+
+    @staticmethod
+    def _multimodal_tool_evidences(payload: object) -> list[Evidence]:
+        if not isinstance(payload, list):
+            return []
+        evidences: list[Evidence] = []
+        for index, item in enumerate(payload, start=1):
+            if not isinstance(item, dict):
+                continue
+            source = str(item.get("source_label", "")).strip()
+            if not source:
+                continue
+            evidences.append(Evidence(
+                chunk_id=str(item.get("evidence_id") or f"image_ev_{index}"),
+                doc_id=str(item.get("doc_id") or item.get("asset_id") or source),
+                source_label=source,
+                text=str(item.get("text", "")),
+                score=float(item.get("score", 0.0) or 0.0),
+                metadata={
+                    "asset_id": item.get("asset_id"),
+                    "page_number": item.get("page_number"),
+                    "bbox": item.get("bbox"),
+                    "modality": item.get("modality"),
+                },
+            ))
+        return evidences
 
     def _present_execution_result(self, question: str, output: dict[str, object]) -> str:
         """将命令结果作为数据呈现；常见标量查询不向用户暴露内部 JSON。"""

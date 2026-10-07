@@ -14,6 +14,7 @@ from deskpilot.core.agent import DocumentQAAgent
 from deskpilot.core.api_clients import local_hash_embedding
 from deskpilot.core.models import Document
 from deskpilot.intent import IntentRouter, SlotValidator
+from deskpilot.memory.session_store import SessionStore
 from deskpilot.rag.vector_index import DocumentIndex
 from deskpilot.tools.tool_registry import ToolParameter, ToolRegistry, ToolSpec
 
@@ -366,6 +367,39 @@ def test_document_agent_uses_intent_router_for_generic_tool_call(base: Path) -> 
     assert any(step.name == "route_intent" for step in result.steps)
     assert any(step.name == "execute_tool" for step in result.steps)
     assert any(step.name == "tool_result" for step in result.steps)
+
+
+def test_document_agent_promotes_text_multimodal_search_to_answer_tool(base: Path) -> None:
+    force_local_fallback()
+    agent = DocumentQAAgent(DocumentIndex(base / "multimodal" / "index.json"))
+    agent.session_store = SessionStore(base / "multimodal" / "sessions")
+    registry = ToolRegistry()
+    registry.register(ToolSpec(
+        name="knowledge.answer_multimodal", category="knowledge",
+        description="Answer from multimodal evidence.",
+        parameters=[
+            ToolParameter("query", "string", True),
+            ToolParameter("top_k", "integer", False, default=4),
+        ],
+        handler=lambda query, top_k=4: {
+            "answer": "活动截止日期为2026年9月30日，联系电话为400-636-6060。",
+            "evidences": [],
+        },
+    ))
+    agent.tool_registry = registry
+    session = agent.session_store.create_session()
+    user = agent.session_store.append_message(session.session_id, "user", "查询活动信息")
+    context = agent.context_assembler.assemble("查询活动信息", "", "", [], [])
+
+    result = agent._answer_generic_tool_intent(
+        "查询活动信息", "knowledge.search_multimodal",
+        {"query": "甘源活动", "top_k": 5}, [], session.session_id,
+        user.message_id, context,
+    )
+
+    assert "2026年9月30日" in result.answer
+    assert any(step.name == "normalize_tool_capability" for step in result.steps)
+    assert any("knowledge.answer_multimodal" in step.detail for step in result.steps if step.name == "execute_tool")
 
 
 def test_agent_routes_q_former_to_existing_index_without_llm_router(base: Path) -> None:

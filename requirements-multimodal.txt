@@ -1,0 +1,7 @@
+# DeskPilot 多模态 P1 的可选本地模型依赖。默认安装不包含这些大包。
+# 先安装 requirements.txt，再按需要安装本文件。
+paddleocr>=2.8.0
+paddlepaddle>=3.0.0
+torch>=2.4.0
+transformers>=4.51.0
+safetensors>=0.4.5

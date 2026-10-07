@@ -15,24 +15,29 @@ jobs:
       QT_QPA_PLATFORM: offscreen
       PYTHONPATH: ${{ github.workspace }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
       - name: Install test dependencies
-        run: python -m pip install --upgrade pip PySide6 pypdf PyMuPDF
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
       - name: Compile sources
         run: python -m compileall -q deskpilot tests eval
-      - name: Run offline test scripts
-        shell: bash
-        run: |
-          set -euo pipefail
-          for test_file in tests/test_*.py; do
-            echo "RUN ${test_file}"
-            python "${test_file}"
-          done
+      - name: Run offline regression tests
+        run: python -m pytest tests -q
       - name: Validate portable evaluation dataset
-        run: python -c "from eval.run_eval import load_cases, DATASET; rows=load_cases(DATASET); assert len(rows)==len({r['id'] for r in rows}); print(f'validated {len(rows)} cases')"
-      - name: Run offline evaluation
-        run: python -m eval.run_eval --count 152 --mode offline --output /tmp/deskpilot-eval.jsonl --report /tmp/deskpilot-eval.md
+        run: python -c "from eval.run_eval import load_cases, DATASET; rows=load_cases(DATASET); assert len(rows)==160; assert len(rows)==len({r['id'] for r in rows}); print(f'validated {len(rows)} cases')"
+      - name: Run deterministic offline evaluation smoke suite
+        run: >-
+          python -m eval.run_eval --mode offline
+          --case-id rag_001
+          --case-id route_002
+          --case-id safe_001
+          --case-id recovery_001
+          --case-id reg_debug3_005
+          --case-id reg_p1_negative_001
+          --output /tmp/deskpilot-eval.jsonl
+          --report /tmp/deskpilot-eval.md

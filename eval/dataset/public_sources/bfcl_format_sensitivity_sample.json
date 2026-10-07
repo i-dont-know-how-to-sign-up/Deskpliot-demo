@@ -1,0 +1,14 @@
+{
+  "source_dataset": "BFCL v4",
+  "source_file": "bfcl_eval/data/BFCL_v4_format_sensitivity.json",
+  "source_url": "https://raw.githubusercontent.com/ShishirPatil/gorilla/main/berkeley-function-call-leaderboard/bfcl_eval/data/BFCL_v4_format_sensitivity.json",
+  "retrieved_at": "2026-09-08",
+  "license_note": "Refer to the upstream Gorilla/BFCL repository before redistribution.",
+  "sampled_case_ids": {
+    "simple_python": ["simple_python_58", "simple_python_94", "simple_python_96"],
+    "parallel": ["parallel_191", "parallel_23"],
+    "multiple": ["multiple_161", "multiple_191"],
+    "parallel_multiple": ["parallel_multiple_137", "parallel_multiple_91"]
+  },
+  "adaptation_note": "The upstream file is a category-to-case-id index rather than a directly executable DeskPilot task. The IDs are retained as provenance; executable cases in deskpilot_bench.jsonl are adapted to DeskPilot's local tool schema."
+}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import threading
 from pathlib import Path
@@ -10,7 +11,9 @@ from .core.config import ROOT_DIR, ensure_dirs
 from .rag.vector_index import DocumentIndex
 
 try:
-    from PySide6.QtCore import QAbstractListModel, QModelIndex, QObject, Property, Qt, Signal, Slot, QUrl
+    from PySide6.QtCore import (
+        QAbstractListModel, QBuffer, QIODevice, QModelIndex, QObject, Property, Qt, Signal, Slot, QUrl,
+    )
     from PySide6.QtWidgets import QApplication, QFileDialog
     from PySide6.QtGui import QFont
     from PySide6.QtQml import QQmlApplicationEngine
@@ -43,13 +46,17 @@ class ChatMessageModel(QAbstractListModel):
 
     MessageRole = Qt.UserRole + 1
     ContentRole = Qt.UserRole + 2
+    AttachmentsRole = Qt.UserRole + 3
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
-        self._items: list[dict[str, str]] = []
+        self._items: list[dict[str, Any]] = []
 
     def roleNames(self) -> dict[int, bytes]:  # noqa: N802 - Qt API 命名
-        return {self.MessageRole: b"messageRole", self.ContentRole: b"messageContent"}
+        return {
+            self.MessageRole: b"messageRole", self.ContentRole: b"messageContent",
+            self.AttachmentsRole: b"messageAttachments",
+        }
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
         return 0 if parent.isValid() else len(self._items)
@@ -62,9 +69,11 @@ class ChatMessageModel(QAbstractListModel):
             return item.get("role", "assistant")
         if role in {self.ContentRole, Qt.DisplayRole}:
             return item.get("content", "")
+        if role == self.AttachmentsRole:
+            return item.get("attachments", [])
         return None
 
-    def reset_messages(self, messages: list[dict[str, str]]) -> None:
+    def reset_messages(self, messages: list[dict[str, Any]]) -> None:
         self.beginResetModel()
         self._items = [dict(item) for item in messages]
         self.endResetModel()
@@ -88,6 +97,7 @@ class DeskPilotBridge(QObject):
     statusChanged = Signal()
     busyChanged = Signal()
     contextChanged = Signal()
+    pendingAttachmentsChanged = Signal()
     confirmRequested = Signal(str, str, str)
     errorRaised = Signal(str)
     _resultReady = Signal(object)
@@ -113,6 +123,7 @@ class DeskPilotBridge(QObject):
         self._context = ""
         self._live_stream_received = False
         self._pending_action: dict[str, Any] | None = None
+        self._pending_attachments: list[dict[str, Any]] = []
         # 所有后台任务都通过 signal 回到 Qt 主线程，再更新 QML 属性。
         self._resultReady.connect(self._start_stream)
         self._streamEvent.connect(self._handle_stream_event)
@@ -133,6 +144,9 @@ class DeskPilotBridge(QObject):
     status = Property("QString", lambda self: self._get("status"), notify=statusChanged)
     busy = Property(bool, lambda self: self._busy, notify=busyChanged)
     context = Property("QString", lambda self: self._get("context"), notify=contextChanged)
+    pendingAttachments = Property(
+        "QVariantList", lambda self: self._pending_attachments, notify=pendingAttachmentsChanged
+    )
 
     def _set_status(self, value: str) -> None:
         self._status = value
@@ -203,7 +217,13 @@ class DeskPilotBridge(QObject):
     def _load_session_messages(self) -> None:
         messages = self.agent.session_store.read_messages(self.current_session_id)
         self._messages = [
-            {"role": item.role, "content": item.content}
+            {
+                "role": item.role, "content": item.content,
+                "attachments": [
+                    view for asset_id in item.metadata.get("attachment_ids", [])
+                    if (view := self.agent.multimodal.attachment_view(str(asset_id))) is not None
+                ] if isinstance(item.metadata, dict) else [],
+            }
             for item in messages
         ]
         self._message_model.reset_messages(self._messages)
@@ -223,7 +243,7 @@ class DeskPilotBridge(QObject):
         self.stepsChanged.emit()
         self.evidencesChanged.emit()
 
-    def _set_messages(self, messages: list[dict[str, str]]) -> None:
+    def _set_messages(self, messages: list[dict[str, Any]]) -> None:
         self._messages = list(messages)
         self._message_model.reset_messages(self._messages)
 
@@ -309,23 +329,31 @@ class DeskPilotBridge(QObject):
     @Slot(str)
     def ask(self, question: str) -> None:
         question = question.strip()
-        if not question or not self._begin_operation("正在处理"):
+        if (not question and not self._pending_attachments) or not self._begin_operation("正在处理"):
             return
         session_id = self.current_session_id
+        attachments = list(self._pending_attachments)
+        asset_ids = [str(item["assetId"]) for item in attachments]
+        self._pending_attachments = []
+        self.pendingAttachmentsChanged.emit()
         self._steps = []
         self._evidences = []
         self._live_stream_received = False
         self.stepsChanged.emit()
         self.evidencesChanged.emit()
-        self._set_messages(self._messages + [{"role": "user", "content": question}, {"role": "assistant", "content": ""}])
-        threading.Thread(target=self._run_answer, args=(question, session_id), daemon=True).start()
+        self._set_messages(self._messages + [
+            {"role": "user", "content": question or "请描述这些图片。", "attachments": attachments},
+            {"role": "assistant", "content": "", "attachments": []},
+        ])
+        threading.Thread(target=self._run_answer, args=(question, session_id, asset_ids), daemon=True).start()
 
-    def _run_answer(self, question: str, session_id: str) -> None:
+    def _run_answer(self, question: str, session_id: str, asset_ids: list[str] | None = None) -> None:
         try:
-            result = self.agent.answer(
-                question,
-                session_id=session_id,
-                event_callback=lambda event: self._streamEvent.emit(event),
+            callback = lambda event: self._streamEvent.emit(event)
+            result = (
+                self.agent.answer_multimodal(question, asset_ids, session_id=session_id, event_callback=callback)
+                if asset_ids else
+                self.agent.answer(question, session_id=session_id, event_callback=callback)
             )
             self._resultReady.emit(result)
         except Exception as exc:  # pragma: no cover - 防止后台异常让 GUI 无响应
@@ -356,6 +384,8 @@ class DeskPilotBridge(QObject):
         self._steps = []
         self._evidences = []
         self._context = ""
+        self._pending_attachments = []
+        self.pendingAttachmentsChanged.emit()
         self.stepsChanged.emit()
         self.evidencesChanged.emit()
         self.contextChanged.emit()
@@ -423,7 +453,8 @@ class DeskPilotBridge(QObject):
         if not self._begin_operation("正在建立索引"):
             return
         path, _ = QFileDialog.getOpenFileName(
-            None, "选择文档", str(ROOT_DIR), "Documents (*.pdf *.docx *.pptx *.xlsx *.csv *.md *.txt);;All files (*)"
+            None, "选择文档或图片", str(ROOT_DIR),
+            "Documents and images (*.pdf *.docx *.pptx *.xlsx *.csv *.md *.txt *.png *.jpg *.jpeg *.webp);;All files (*)"
         )
         if path:
             threading.Thread(target=self._index_file, args=(Path(path),), daemon=True).start()
@@ -442,10 +473,87 @@ class DeskPilotBridge(QObject):
 
     def _index_file(self, path: Path) -> None:
         try:
-            document, count = self.index.add_file(path)
-            self._indexReady.emit(f"{document.title}: {count} 个片段")
+            if path.suffix.casefold() in {".png", ".jpg", ".jpeg", ".webp"}:
+                results = self.agent.multimodal.index_file(path)
+                self._indexReady.emit(f"{path.name}: {len(results)} 个多模态片段")
+            else:
+                document, count = self.index.add_file(path)
+                # PDF 同时建立文本索引；页图索引由显式多模态工具处理，避免普通索引意外增加成本。
+                self._indexReady.emit(f"{document.title}: {count} 个片段")
         except Exception as exc:
             self._errorReady.emit(str(exc))
+
+    @Slot()
+    def chooseImageAttachments(self) -> None:
+        if self._busy:
+            return
+        paths, _ = QFileDialog.getOpenFileNames(
+            None, "选择图片", str(ROOT_DIR), "Images (*.png *.jpg *.jpeg *.webp)"
+        )
+        if not paths:
+            return
+        self._add_image_paths([Path(path) for path in paths])
+
+    def _add_image_paths(self, paths: list[Path]) -> None:
+        try:
+            max_count = max(1, min(int(__import__("os").getenv("IMAGE_MAX_COUNT_PER_TURN", "4")), 12))
+            for path in paths:
+                if len(self._pending_attachments) >= max_count:
+                    raise ValueError(f"单轮最多选择 {max_count} 张图片")
+                asset = self.agent.multimodal.add_chat_attachment(path)
+                if any(item["assetId"] == asset.asset_id for item in self._pending_attachments):
+                    continue
+                view = self.agent.multimodal.attachment_view(asset.asset_id)
+                if view:
+                    self._pending_attachments.append(view)
+            self.pendingAttachmentsChanged.emit()
+            self._set_status(f"已选择 {len(self._pending_attachments)} 张图片")
+        except Exception as exc:
+            self.errorRaised.emit(str(exc))
+
+    @Slot(str)
+    def addImageUrls(self, encoded_urls: str) -> None:
+        """接收 QML DropArea 的 URL；仅处理本地图片文件。"""
+        try:
+            values = json.loads(encoded_urls)
+            paths = [Path(QUrl(str(value)).toLocalFile()) for value in values]
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            self.errorRaised.emit(f"无法解析拖入的图片：{exc}")
+            return
+        self._add_image_paths([path for path in paths if str(path)])
+
+    @Slot()
+    def pasteImageAttachment(self) -> None:
+        image = QApplication.clipboard().image()
+        if image.isNull():
+            self.errorRaised.emit("剪贴板中没有图片。")
+            return
+        buffer = QBuffer()
+        buffer.open(QIODevice.WriteOnly)
+        try:
+            max_count = max(1, min(int(__import__("os").getenv("IMAGE_MAX_COUNT_PER_TURN", "4")), 12))
+            if len(self._pending_attachments) >= max_count:
+                raise ValueError(f"单轮最多选择 {max_count} 张图片")
+            if not image.save(buffer, "PNG"):
+                raise ValueError("剪贴板图片编码失败")
+            asset = self.agent.multimodal.add_chat_attachment_bytes(bytes(buffer.data()))
+            if not any(item["assetId"] == asset.asset_id for item in self._pending_attachments):
+                view = self.agent.multimodal.attachment_view(asset.asset_id)
+                if view:
+                    self._pending_attachments.append(view)
+                    self.pendingAttachmentsChanged.emit()
+            self._set_status(f"已选择 {len(self._pending_attachments)} 张图片")
+        except Exception as exc:
+            self.errorRaised.emit(str(exc))
+        finally:
+            buffer.close()
+
+    @Slot(str)
+    def removePendingAttachment(self, asset_id: str) -> None:
+        self._pending_attachments = [
+            item for item in self._pending_attachments if item.get("assetId") != asset_id
+        ]
+        self.pendingAttachmentsChanged.emit()
 
     def _index_folder(self, path: Path) -> None:
         try:

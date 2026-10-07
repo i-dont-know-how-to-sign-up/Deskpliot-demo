@@ -1,0 +1,12 @@
+{"id":"mm_safe_001","subset":"Multimodal-Safety","source":"synthetic","task":"asset_dedup","input":"同一图片使用不同文件名重复添加。","expected":{"same_asset_id":true}}
+{"id":"mm_safe_002","subset":"Multimodal-Safety","source":"synthetic","task":"invalid_image","input":"扩展名为 PNG、内容为普通文本的伪图片。","expected":{"rejected":true}}
+{"id":"mm_safe_003","subset":"Multimodal-Safety","source":"synthetic","task":"pixel_limit","input":"像素数量超过限制的图片。","expected":{"rejected":true}}
+{"id":"mm_safe_004","subset":"Multimodal-Safety","source":"synthetic","task":"space_isolation","input":"使用不同模型或不同维度的图片向量执行检索。","expected":{"foreign_vectors_excluded":true}}
+{"id":"mm_safe_005","subset":"Multimodal-Safety","source":"synthetic","task":"catalog_privacy","input":"检查资产数据库是否写入图片 Base64。","expected":{"base64_absent":true}}
+{"id":"mm_rag_001","subset":"Multimodal-RAG","source":"synthetic","task":"text_to_image","input":"查找包含 ATLAS-503 过载恢复说明的红色截图。","expected":{"top_source":"atlas.png","must_include":["ATLAS-503"]}}
+{"id":"mm_rag_002","subset":"Multimodal-RAG","source":"synthetic","task":"text_to_image","input":"查找包含 NEBULA-204 缓存策略的蓝色截图。","expected":{"top_source":"nebula.png","must_include":["NEBULA-204"]}}
+{"id":"mm_rag_003","subset":"Multimodal-RAG","source":"synthetic","task":"image_to_image","input":"使用红色查询图搜索相似图片。","expected":{"top_source":"atlas.png"}}
+{"id":"mm_rag_004","subset":"Multimodal-RAG","source":"synthetic","task":"rrf_fusion","input":"融合 OCR、关键词和视觉向量检索 ATLAS 页面。","expected":{"min_channel_hits":2}}
+{"id":"mm_qa_001","subset":"Multimodal-QA","source":"synthetic","task":"vision_qa","input":"图片中显示的错误码是什么？","expected":{"must_include":["ATLAS-503"],"citation":"[图片1]"},"runtime":{"requires_vlm":true}}
+{"id":"mm_qa_002","subset":"Multimodal-QA","source":"synthetic","task":"vision_qa","input":"比较两张图片的主色，并分别引用来源。","expected":{"must_include":["红","蓝"],"citations":["[图片1]","[图片2]"]},"runtime":{"requires_vlm":true}}
+{"id":"mm_qa_003","subset":"Multimodal-QA","source":"synthetic","task":"vision_qa","input":"第二张图中的系统代号是什么？","expected":{"must_include":["NEBULA-204"],"citation":"[图片2]"},"runtime":{"requires_vlm":true}}

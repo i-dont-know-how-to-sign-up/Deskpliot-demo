@@ -23,11 +23,14 @@ class ModelTokenizer:
         self._tokenizer: Any = None
         requested = provider.strip().lower()
         openai_family = model.casefold().startswith(("gpt-", "o1", "o3", "o4"))
-        if requested == "auto" and not openai_family:
-            self._try_transformers()
-        if self._tokenizer is None and requested in {"auto", "tiktoken"}:
+        # auto 必须保持启动轻量。对 OpenAI 系列尝试较轻的 tiktoken；Qwen 等
+        # OpenAI-compatible 模型没有稳定的本地 tokenizer 映射，启动时导入
+        # transformers 会连带加载 torch，最终通常仍因本地无同名 tokenizer 而失败。
+        if requested == "auto" and openai_family:
             self._try_tiktoken()
-        if self._tokenizer is None and requested in {"auto", "transformers"}:
+        elif requested == "tiktoken":
+            self._try_tiktoken()
+        elif requested == "transformers":
             self._try_transformers()
 
     def count(self, text: str) -> int:
