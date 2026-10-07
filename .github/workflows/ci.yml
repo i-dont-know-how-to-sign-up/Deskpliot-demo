@@ -7,7 +7,8 @@ on:
 
 jobs:
   offline-regression:
-    runs-on: ubuntu-latest
+    # 固定系统镜像，避免 ubuntu-latest 迁移导致 Qt 系统运行库漂移。
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       ALLOW_LOCAL_FALLBACK: "true"
@@ -20,10 +21,16 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+      - name: Install Linux Qt runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
+      - name: Verify headless Qt runtime
+        run: python -c "from PySide6.QtCore import QObject; from PySide6.QtGui import QGuiApplication; from PySide6.QtQml import QQmlApplicationEngine; print('PySide6 headless imports succeeded')"
       - name: Compile sources
         run: python -m compileall -q deskpilot tests eval
       - name: Run offline regression tests
