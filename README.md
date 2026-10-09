@@ -2,9 +2,9 @@
 
 > 当前版本：`0.9.0`
 
-DeskPilot 是一个本地优先、面向个人办公场景的桌面 Agent。它将本地文档 RAG、会话记忆、网页调研、邮件处理、文件与终端工具、权限控制和多智能体编排整合到一个 PySide6 + Qt Quick 桌面应用中。
+DeskPilot 是一个本地优先的多模态桌面办公 Agent，支持文档与图文问答、跨会话记忆、网页调研、邮件和本地文件操作，使用 PySide6 + Qt Quick 构建桌面界面。
 
-项目当前以“可运行、可审计、可评测”为目标：简单问题直接回答，单工具任务由语义路由器选择工具，复杂任务进入 Plan-and-Execute / Multi-Agent 流程；检索证据、计划、工具步骤、权限请求和上下文统计都可以在桌面端查看。
+简单请求由语义路由器直接回答或调用工具，复杂任务进入 Plan-and-Execute 多智能体流程。计划、证据、工具结果、人工审批和上下文统计均可在界面中查看。
 
 > 当前仍是个人项目和实验性 Demo，不应直接用于无人值守的生产环境，也不应在未检查权限策略的情况下处理重要邮箱或系统文件。
 
@@ -12,165 +12,145 @@ DeskPilot 是一个本地优先、面向个人办公场景的桌面 Agent。它�
 
 ![DeskPilot 桌面端运行界面](docs/assets/deskpilot-desktop.png)
 
+## 系统架构
+
+![DeskPilot 系统架构图：桌面交互、上下文与意图路由、单工具和多智能体执行、领域能力、模型与存储](docs/assets/deskpilot-architecture.png)
+
+主链路是“桌面输入 → 上下文构建 → 意图路由 → 直接回答 / 单工具 / 多步骤计划 → 结果与记忆”。权限审批、评测和工程优化贯穿对应执行路径；图中三条分支并非每轮都会执行。
+
 ## 主要能力
 
 ### 桌面对话与会话管理
 
-- 使用 PySide6 + Qt Quick/QML 构建三栏桌面界面。
-- 支持新建、重命名、置顶、删除和导出会话。
-- 保存历史对话，切换会话后可恢复消息。
-- 对话区支持鼠标滚轮、文本选择和复制，并以渐进方式展示长回答。
-- 右侧面板展示 Agent Steps、引用证据、记忆和上下文统计。
-- 高风险操作在聊天区域内请求确认，不依赖阻塞式系统弹窗。
+- 支持会话历史、新建、重命名、置顶、删除和导出，以及图片选择、粘贴和拖入。
+- 文本与视觉回答支持真实 SSE 增量输出；聊天和 Steps 可滚动、选择和复制，风险操作在聊天内审批。
 
-实现入口：`deskpilot/qt_app.py`、`deskpilot/qml/Main.qml`、`deskpilot/memory/session_store.py`。
+实现：[`qt_app.py`](deskpilot/qt_app.py)、[`Main.qml`](deskpilot/qml/Main.qml)。
 
-### 意图识别与 Agent 主流程
+### 意图识别与任务编排
 
-- 第一级判断 `direct_answer`、`tool_call`、`clarify` 或 `plan_task`。
-- 第二级在 Tool Registry 中选择具体工具，并根据工具 Schema 填充和校验槽位。
-- 简单问答和简单工具调用跳过 Planner，减少延迟与 Token 消耗。
-- 只有多步骤依赖任务才进入 Planner，例如“搜索资料 -> 写报告 -> 作为附件发送邮件”。
-- 本地索引只向 Router 提供有数量和长度限制的候选摘要，不发送全量文件名或全文。
-- 对 LLM 路由结果增加结构、安全和证据一致性校验，避免无工具名调用、无索引候选误检索等问题。
+- LLM 将请求分为 `direct_answer`、`tool_call`、`clarify`、`plan_task`，依据注册工具 Schema 选择工具并校验参数。简单问答可复用 Router 回答，跳过 Planner。
+- 复杂任务由 Planner 生成依赖图，经过 PlanRepair 校验/修订后，由 PlanExecutor + Supervisor 执行受控节点；已覆盖邮件复合任务、网页写报告、索引报告和多文档摘要，其他路径仍保留兼容执行链。
+- Supervisor 管理依赖、有限重试、预算和等待人工确认状态；TaskLedger 记录任务及节点结果。Planner 仅在需要定位文件时接收有数量、目录和 Token 限制的候选列表。
+- 提供 Knowledge、Communication、Reflection 等角色组件；Reflection 已有路由入口和审查接口，完整自动质量审查闭环仍待完善。
 
-实现入口：`deskpilot/core/agent.py`、`deskpilot/intent/`、`deskpilot/tools/tool_registry.py`。
+实现：[`core/`](deskpilot/core/)、[`intent/`](deskpilot/intent/)、[`multi_agent/`](deskpilot/multi_agent/)。
 
 ### 本地文档 RAG
 
 支持 `.txt`、`.md`、`.csv`、`.docx`、`.pptx`、`.xlsx` 和 `.pdf`。
 
-当前 RAG 流程：
-
 ```text
-文档解析
-  -> 结构分块 / 语义分块
-  -> Parent Chunk + Sentence Window 元数据
-  -> Embedding 与 SQLite Catalog
-  -> Query Analyzer / Query Rewrite
-  -> Dense + SQLite FTS5/BM25
-  -> RRF 融合
-  -> Lexical / Cross-Encoder / ColBERT / API Reranker
-  -> Sentence Window / Parent 上下文扩展
-  -> 相关性阈值 + 覆盖感知 MMR
-  -> Evidence 上下文
-  -> LLM 回答
-  -> 引用完整性校验与来源列表
+结构/语义分块 -> SQLite Catalog + Embedding + FTS5
+查询分析/多查询 -> Dense + BM25 -> RRF -> 可插拔精排
+Sentence Window/Parent 扩展 -> 覆盖感知 MMR -> 证据回答与引用校验
 ```
 
-主要实现：
+- 结构文档按标题、段落、表格或页分块，非结构文本支持相邻句向量的语义断点与完整句 overlap；索引保存版本、元数据、父块、句子窗口和向量缓存。
+- 默认采用精确向量扫描与 SQLite FTS5/BM25 混合检索；复杂查询可触发 Multi-Query，HyDE 默认关闭。精排默认 `lexical`，可选本地 Cross-Encoder 或 API，失败回退 RRF。
+- 按问题类型扩展句子窗口或父块，再以相关性、文档/子查询覆盖和 MMR 选择证据。引用校验失败时尝试一次修订；记忆和历史模型回答不能替代文档证据。
 
-- Markdown、Office 文档优先按标题、段落、列表、表格、页、Slide 或 Sheet 边界分块。
-- PDF/TXT 支持基于相邻句 Embedding 距离的语义断点，并保留完整句 overlap。
-- SQLite Catalog 保存文档版本、Chunk、Parent、Sentence Window、元数据、Embedding Cache 和 FTS5 索引。
-- 小型个人知识库默认使用精确向量扫描，稀疏检索使用 SQLite FTS5/BM25。
-- 多查询检索只在复杂任务触发；HyDE 已实现但默认关闭。
-- RRF 后通过统一 Reranker 接口重排有界 child 候选；默认 `lexical` 零依赖实现，真实 Cross-Encoder 和 API provider 按配置启用，provider 故障自动回退 RRF。
-- 事实/步骤问题使用 Sentence Window，总结/比较问题使用 Parent expansion；扩展不跨结构 parent，并受单条 Evidence token 预算约束。
-- 最终以相关性阈值、显式文档覆盖、子查询覆盖和 MMR 选择证据，同 parent 窗口会合并。
-- 回答必须引用真实 Evidence；会话记忆不能冒充文档证据。引用失败会尝试一次受限修订，仍失败才降级为本地证据摘要。
-- API 不可用时可使用本地 hash embedding 和抽取式摘要维持基础 Demo。
-
-实现入口：`deskpilot/rag/`。
+实现：[`rag/`](deskpilot/rag/)。
 
 ### 会话记忆与上下文工程
 
-- 原始消息以会话形式持久化，支持最近对话窗口和滚动摘要。
-- 从对话中提取事实、偏好、决策、待办和产物等结构化记忆。
-- Memory Gate 会跳过低价值的简单问答抽取，减少额外模型延迟；工具副作用、明确偏好/决策和有证据结果仍会进入抽取。
-- 记忆具有 `pending`、`active`、`superseded`、`deleted` 等生命周期状态。
-- 偏好与决策按稳定 `topic:*` 标签优先消解冲突；任务、产物和事实按类型与作用域设置默认 TTL，过期项不再参与检索。
-- 低置信度信息进入待审批区；“不要记住”“只是举例”等内容会被过滤。
-- 支持 SQLite 内置向量存储，也可选择 Chroma。
-- Context Builder 按角色为 Router、Planner、Answer、Memory 等组件装配不同上下文。
-- 使用 Token 预算、优先级、去重、相关性、压缩和淘汰机制控制长上下文。
-- 记录上下文成本、截断情况和质量指标，防止历史助手幻觉进入 RAG Evidence。
+- 短期上下文由最近消息和滚动摘要组成；长期记忆保存事实、偏好、决策、待办及产物，使用 SQLite 向量存储或可选 Chroma 检索。
+- Memory Gate 控制抽取时机，结合低置信度审批、冲突替代、类型/作用域 TTL 和删除状态管理生命周期。
+- ContextBuilder 按角色与任务复杂度分配 Token 预算，通过 Gather → Select → Structure → Compress 选择相关信息，压缩工具输出并保留直接依赖结果。
+- 记录 selected/dropped、成本、摘要一致性和上下文质量；文档问答隔离事实型记忆与历史助手回答，降低错误内容回流风险。
 
-实现入口：`deskpilot/memory/`、`deskpilot/context/`。
+实现：[`memory/`](deskpilot/memory/)、[`context/`](deskpilot/context/)。
 
 ### 网页搜索与调研报告
 
-- 支持 DuckDuckGo HTML、Bing API、Tavily API 和 Playwright Browser 四种搜索方式。
-- 支持直接读取 URL、抽取网页正文、清理重复结果并将网页内容加入临时检索链路。
-- 可生成带链接和引用来源的 Markdown 调研报告。
-- Playwright 模式可复用本机 Chrome，也可以使用 Playwright Chromium 读取动态网页。
+- 支持 DuckDuckGo、Bing、Tavily 和 Playwright 搜索/阅读；浏览器可复用本机 Chrome 或 Playwright Chromium。
+- 抽取网页正文、去重并构建检索证据，生成带来源链接的 Markdown 调研报告；可与文件、邮件工具组合执行。
 
-实现入口：`deskpilot/rag/web_research.py`。
+实现：[`web_research.py`](deskpilot/rag/web_research.py)。
 
 ### 多模态图片问答与检索
 
-- 聊天输入区支持选择、粘贴和拖入 PNG/JPEG/WebP 图片，单轮默认最多 4 张。
-- 图片经过真实格式、大小、像素和 EXIF 方向校验，使用 SHA-256 去重并生成缩略图。
-- 会话只保存 `attachment_id`，不会把 Base64 写入消息、日志或 Steps。
-- 支持 OpenAI-compatible 视觉模型的单图/多图问答，并使用 `[图片N]` 标记来源。
-- 图片与显式 PDF 页图可进入独立多模态索引；OCR、文本向量和视觉向量通过 RRF 融合。
-- 本地 SigLIP2 和 PaddleOCR 为可选延迟加载 Provider，不会随基础安装下载大型模型。
-- 多模态入库按图片 SHA-256 和向量空间幂等复用；重复导入不会再次运行 OCR 或视觉编码。
-- 纯文本多模态问答使用 `knowledge.answer_multimodal` 完成检索和 VLM 综合；原始证据审计与以图搜图使用 `knowledge.search_multimodal`。
-- OCR 与视觉向量是独立入库通道：本地视觉模型资源不足时保留可用 OCR 索引，并返回明确的降级状态。
-- 长 PDF 的 OCR 和视觉编码按整批任务启动一次模型 worker，再在 worker 内按上限分批推理，避免逐页重复加载模型。
-- OCR 文本在配置 Embedding API 时使用真实语义向量；无 API 时明确降级为版本化的本地 hash fallback，不将其标记为语义检索。
-- 剪贴板和截图默认视为敏感图片，云端 VLM 调用按 `block|confirm|allow` 策略处理；默认在聊天内单次确认。
-- 多模态 SQLite 启用 WAL 与 busy timeout；删除资产时同步清理原图、缩略图、OCR chunk 和向量。
-- 用户显式要求记住图片时创建待审批视觉记忆；审批后支持跨会话文本召回和相似图片关联召回，记忆仅保存事实摘要与资产/证据引用。
-- 视觉记忆进入上下文前受图片数量和总像素预算约束；截图、剪贴板图片及含密码、Token、验证码、身份证号或银行卡号的内容禁止长期保存。
-- 删除被视觉记忆引用的资产必须在聊天内确认，并显式允许级联删除相关记忆。
+- 支持单图/多图 VLM 问答，以及图片和显式 PDF 页图索引；通过 RRF 融合 OCR 关键词、OCR 文本向量和 SigLIP2 视觉向量，提供文本搜图、图搜图与检索增强图文问答。
+- 原图、缩略图、元数据与向量分离存储，按 SHA-256 和向量空间复用缓存；PDF 页图在单任务 worker 内受限批处理，资源不足时保留 OCR 通道并标记降级。
+- 显式“记住图片”创建待审批视觉记忆，审批后支持跨会话文本及相似图片召回；上下文受文本 Token、图片数量和像素预算约束，删除引用资产需确认级联清理。
+- 图片上云默认关闭，剪贴板/截图默认逐次审批；敏感图片和含凭证等信息的图片禁止长期保存，会话只保存资产引用，不保存 Base64。
 
-云端图片上传默认关闭。使用前必须配置视觉模型并显式设置 `ALLOW_CLOUD_IMAGE_UPLOAD=true`。
+`knowledge.answer_multimodal` 用于检索与 VLM 综合回答，`knowledge.search_multimodal` 用于查看原始证据或图搜图。可靠文本搜图需启用 SigLIP2，中文图片文字检索需启用 PaddleOCR；详见[多模态模块说明](deskpilot/multimodal/README.md)。
 
-实现入口：`deskpilot/multimodal/`、`deskpilot/memory/visual_memory.py`。
-
-多模态索引采用独立 SQLite catalog，图片二进制存放在受控资产目录，数据库只保存元数据、OCR chunk 和向量。检索结果记录 `ocr_lexical`、`ocr_semantic`（或 `ocr_dense_fallback`）、`vision_text`、`vision_image` 通道，文字问答存在可靠 OCR 字面命中时会过滤仅由弱视觉相似度召回的无关页面。
+实现：[`multimodal/`](deskpilot/multimodal/)、[`visual_memory.py`](deskpilot/memory/visual_memory.py)。
 
 ### 邮件 MCP
 
-- 支持 163、QQ、Outlook 及本地 Mock Provider。
-- 支持查看最近/未读邮件、读取线程、搜索、分类和摘要。
-- 支持创建回复草稿、保存服务器草稿、发送邮件和添加本地附件。
-- 可选择邮件模板生成正文。
-- 保存草稿和发送邮件都会进入人工确认流程。
-- 发送后通过 SMTP 投递，并尝试将邮件同步到服务器“已发送”文件夹。
+- 支持 163、QQ、Outlook 和 Mock Provider，提供最近/未读邮件、线程读取、搜索、分类、摘要、模板正文、草稿与附件发送。
+- 使用 IMAP/SMTP 读写邮箱；保存草稿和发送邮件均需确认，发送后尝试同步服务器“已发送”文件夹。当前仅加载一个活动账号。
+- Demo 直接复用 MCP 业务层，无需单独启动服务器；外部 MCP Client 可通过 `deskpilot.mcp.email_server` 的 stdio 接入。
 
-DeskPilot 内部 Tool Registry 直接复用邮件 MCP 业务层，因此启动桌面 Demo 时不需要另行启动 MCP Server。只有外部 MCP Client 通过 stdio 接入时，才需要单独运行 `deskpilot.mcp.email_server`。
+实现：[`mcp/`](deskpilot/mcp/)。
 
-当前环境变量只配置一个活动邮箱账号；多账号切换尚未实现。
+### 工具调用与权限安全
 
-实现入口：`deskpilot/mcp/`。
+- ToolRegistry 统一注册文档定位/读取、TXT/MD/DOCX/PDF 写入、索引、网页、邮件、Python、Windows PowerShell/Linux Shell 及低风险桌面动作。
+- Shell 采用白名单、风险分级、工作目录约束和超时；Python 执行需审批，静态检查阻断部分危险语法，但不等同于系统沙箱。
+- 安全目录内新建文件通常无需审批；已有文件默认拒绝覆盖，显式 `overwrite=true` 可在安全目录内覆盖。移动文件、工作区外写入、邮件提交及中高风险执行按权限结果审批，受保护系统路径直接阻断。
+- 待审批参数保存在应用端，前端仅回传会话绑定、限时、一次性的 `action_id`；模型提供的 `confirm` 不能授予权限。
 
-### 文件、代码、终端与桌面工具
+实现：[`tools/`](deskpilot/tools/)、[`approval.py`](deskpilot/core/approval.py)。
 
-已注册的主要工具包括：
+## 测评结果
 
-- 文档定位、读取、文件夹扫描、分类和整理计划。
-- 写入 TXT、Markdown、DOCX、PDF，支持覆盖和附件产物。
-- 本地知识库检索和文件夹批量建索引。
-- Python 代码执行，带超时、明显危险语法静态检查和人工确认；静态检查不是安全沙箱。
-- Windows PowerShell / Linux Shell 命令执行，带白名单、风险分级、超时和工作目录限制。
-- 获取活动窗口标题、打开文件/目录、打开 URL。
-- 网页搜索、网页读取和主题调研。
-- 邮箱读取、草稿和发送工具。
+### 基线与最新运行对照
 
-权限策略：
+以下按测试时间区分新旧，版本标签保留报告原值：基线 B 为 **2026-10-09 02:22，报告版本 0.9.1**；最新 L 为 **2026-10-09 21:40，报告及当前代码版本 0.9.0**。两次均使用 `qwen3.8-max` 和 `text-embedding-v4`。L 的固定集列由全量运行结果按 B 的 36 个用例 ID 重新汇总。
 
-- 工作区安全目录内的新文件写入通常属于低风险。
-- 覆盖文件、移动文件、修改安全目录外内容属于中高风险，需要确认。
-- C 盘或工作区外写入会请求显式确认。
-- Python 与高风险命令执行必须通过应用生成的一次性审批请求确认；LLM 工具参数不能自行授予权限。
-- Shell 中明确的破坏性命令，以及 Python 中已识别的删除、子进程、动态执行和网络调用会被阻断；任意 Python 的完整隔离仍需容器或低权限执行环境。
+| 指标 | B：固定 API 集 | L：相同 ID 固定集 | L：全量 API 集 |
+|---|---:|---:|---:|
+| 有效样本 / 跳过 | 36 / 0 | 36 / 0 | 146 / 17 |
+| Accuracy | 69.44% | 100.00% | **83.56%** |
+| 平均 Task Completion | 0.8250 | 0.9931 | **0.9120** |
+| Token F1 | 0.2163（n=2） | 0.2163（n=2） | 0.1419（n=4） |
+| 未捕获执行错误率 | 0.00% | 0.00% | 0.00% |
+| 平均响应时间 | 8.97 s | 10.04 s | 10.85 s |
+| P95 响应时间 | 18.62 s | 24.39 s | 25.69 s |
+| 平均 Token / 有效样本 | 6,504 | 7,036 | 7,475 |
+| 总 Token | 234,151 | 253,303 | 1,091,370 |
 
-实现入口：`deskpilot/tools/`。
+B 禁用本地降级，L 允许降级，且两次数据集 SHA-256 不同；相同 ID 不保证用例内容及环境完全一致，因此这是**历史运行对照，不是受控版本提升实验**。固定集质量结果更高，同时耗时和 Token 也更高。网页、邮件等外部依赖部分使用 fixture/mock，不代表真实互联网或私人邮箱上的成功率。
 
-### Plan-and-Execute 与多智能体
+### 最新 API 分模块表现
 
-- Planner 先生成结构化执行计划和步骤依赖。
-- MultiAgentRouter 根据任务复杂度、预计耗时、外部工具依赖和结果质量要求决定执行方式。
-- 当前使用知识、执行和提交等较粗粒度角色，避免 Agent 划分过细。
-- 邮件类“资料获取 → 正文生成 → 发送/草稿审批”复合任务已由 PlanExecutor 绑定节点 handler，并通过 Supervisor 执行依赖、重试、工具/Token/时间预算和人工确认状态。
-- 其他计划任务仍由 Orchestrator 兼容执行链处理，将按工作流逐步迁移，避免一次性替换造成已有文件和 RAG 功能回归。
-- 简单或实时任务不使用 Reflection；高质量、低实时性任务为后续 Reflection Agent 预留接口。
-- 外部副作用仍由统一权限层和人工确认控制。
+以下均为 L 全量运行的有效样本，排除跳过项；Token 为各模块全部模型调用的服务端 usage 累计。
 
-实现入口：`deskpilot/multi_agent/`、`deskpilot/core/runtime.py`。
+| 模块 | 有效样本 | Accuracy | Task Completion | 平均响应 / s | 总 Token |
+|---|---:|---:|---:|---:|---:|
+| 直接问答 | 13 | 100.00% | 1.0000 | 9.60 | 67,864 |
+| 意图路由 | 14 | 85.71% | 0.9583 | 7.31 | 72,384 |
+| 文档问答 | 37 | 83.78% | 0.9365 | 13.68 | 258,125 |
+| 会话记忆 | 10 | 100.00% | 1.0000 | 9.61 | 97,131 |
+| 上下文工程 | 19 | 89.47% | 0.9474 | 14.29 | 271,357 |
+| 工具调用 | 14 | 71.43% | 0.8036 | 5.09 | 73,360 |
+| 复合操作 | 11 | 90.91% | 0.9091 | 17.06 | 83,088 |
+| 多智能体 P0 | 6 | 66.67% | 0.7500 | 14.70 | 45,570 |
+| 多智能体 P1 | 5 | 60.00% | 0.7333 | 9.76 | 32,536 |
+| 网页调研 | 3 | 100.00% | 1.0000 | 8.87 | 19,501 |
+| 安全权限 | 11 | 54.55% | 0.7879 | 4.36 | 55,531 |
+| 故障恢复 | 3 | 100.00% | 1.0000 | 4.12 | 14,923 |
+| **合计** | **146** | **83.56%** | **0.9120** | **10.85** | **1,091,370** |
+
+Accuracy 是按用例验收规则计算的任务通过比例，Task Completion 是声明断言的完成比例；错误率只统计未捕获执行错误，不等于任务失败率。Token F1 只统计有参考答案的少量用例，不代表开放式问答或意图分类的 Macro-F1。全量集的安全权限、多智能体与工具调用仍是主要改进项。
+
+### 专项数据集与性能
+
+| 数据集 / 测试 | 已记录指标 | 范围与条件 |
+|---|---|---|
+| RAG P2 检索集，2026-09-20 | 来源 Recall **1.00**；事实项 Recall **1.00**；Precision@K **0.6528**；MRR / nDCG **1.00**；平均 **144 ms** | 12 条合成检索用例，以 lexical 精排为主，含 provider fallback；不等于端到端回答质量 |
+| 多模态 P2 离线集，2026-10-09 | 任务 Accuracy **100.00%**；平均 **309 ms** | 22 条中执行 18 条，4 条 VLM 用例跳过；合成图片/fixture，覆盖资产安全、检索和视觉记忆 |
+| 固定 VLM API 集，2026-10-09 02:28 | 任务 Accuracy **100.00%**；平均 **5.34 s** | 3 条分级图文问答，真实视觉 API；尚无后续同配置 VLM 对比运行 |
+| 本机 Qt Bridge 冷启动 | **7.03 s → 0.96 s** | 模型懒加载；测试含 28 个会话、当前会话 1,580 条历史消息 |
+| 本机同图重复入库 | **约 33 s → 49 ms** | SHA-256 + 向量空间缓存命中，不包含首次 OCR/视觉推理成本 |
+
+主数据集含公开数据采样/改编和自建回归用例，属于 DeskPilotBench，不是 GAIA/BFCL 官方榜单成绩；数据说明见 [`eval/dataset/README.md`](eval/dataset/README.md)。其他项目的 CLIP/Qwen 微调指标未计入本项目结果。
+
+数据来源：B 的 `eval/baselines/deskpilot_baseline_v0.9.1_20261009T022038+0800/`，L 的 `eval/runs/deskpilotbench_v0.9.0_api_20261009T214014+0800.jsonl`，以及 `eval/reports/rag_p2_latest.md`、`eval/reports/multimodal_p2_offline.md`。原始报告和运行日志不提交；下方命令可重新生成结果。
 
 ## 技术栈
 
@@ -178,14 +158,14 @@ DeskPilot 内部 Tool Registry 直接复用邮件 MCP 业务层，因此启动�
 |---|---|
 | 语言 | Python 3.11 |
 | 桌面 UI | PySide6、Qt Quick、QML |
-| LLM / Embedding | OpenAI-compatible HTTP API，默认示例为 DashScope/Qwen |
+| LLM / Embedding | OpenAI-compatible HTTP/SSE API，默认示例为 DashScope/Qwen |
 | 多模态 | Pillow、OpenAI-compatible VLM、可选 SigLIP2/PaddleOCR |
 | 文档解析 | PyMuPDF、pypdf，以及基于 ZIP/XML 的 Office 文档解析 |
 | RAG 存储 | JSON 兼容快照、SQLite Catalog、SQLite FTS5/BM25 |
 | 记忆存储 | JSONL、SQLite、可选 Chroma |
 | 浏览器 | Playwright，可复用 Chrome/Chromium |
 | 邮件 | IMAP、SMTP、可选 MCP stdio Server |
-| 测试与评测 | Python 回归脚本、163 条 DeskPilotBench、22 条多模态专项集、分级真实 API 套件、GitHub Actions CI |
+| 测试与评测 | pytest、163 条 DeskPilotBench、22 条多模态专项集、固定分级 API 套件、GitHub Actions CI |
 
 当前核心实现没有引入 LangChain、LlamaIndex 或 LangGraph，以便直接观察路由、检索、上下文和 Agent Loop 的内部行为。
 
@@ -232,15 +212,7 @@ python -m pip install -r requirements.txt
 .\.conda\deskpilot-py311\python.exe -m pip install -r requirements.txt
 ```
 
-`requirements.txt` 中的主要依赖：
-
-- `PySide6`：桌面 UI。
-- `requests`：HTTP API 与网页请求。
-- `PyMuPDF`、`pypdf`：PDF 解析与 PDF 写入。
-- `playwright`：浏览器搜索和动态网页读取。
-- `mcp`：可选邮件 MCP stdio Server。
-- `pytest`：执行完整测试模块和版本基线。
-- `Pillow`：图片校验、方向修正、推理副本和缩略图。
+基础依赖包含 PySide6、requests、PyMuPDF/pypdf、Pillow、Playwright、MCP 和 pytest；本地 OCR、视觉编码和 Cross-Encoder 依赖单独安装。
 
 可选依赖：
 
@@ -257,6 +229,9 @@ python -m pip install transformers
 
 # 多模态本地 OCR 与 SigLIP2；会安装 PaddlePaddle、PyTorch 等大型依赖
 python -m pip install -r requirements-multimodal.txt
+
+# 本地 Cross-Encoder 精排；模型目录另行配置
+python -m pip install -r requirements-rerank.txt
 ```
 
 模型默认缓存到各依赖的系统缓存目录。磁盘空间有限时，建议在 `.env` 或系统环境变量中把缓存迁移到空间充足的磁盘，例如：
@@ -329,7 +304,7 @@ RAG_MMR_LAMBDA=0.72
 
 ```env
 VISION_PROVIDER=openai_compatible
-VISION_MODEL=qwen3.8-omni-flash
+VISION_MODEL=qwen-vl-max-latest
 VISION_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 VISION_API_KEY=
 ALLOW_CLOUD_IMAGE_UPLOAD=false
@@ -351,13 +326,9 @@ IMAGE_EMBEDDING_MIN_AVAILABLE_COMMIT_GB=5
 MULTIMODAL_RETRY_MISSING_VISION=false
 ```
 
-- 云端发送图片必须显式启用 `ALLOW_CLOUD_IMAGE_UPLOAD=true`；图片 Base64 只存在于请求体，不写入会话和日志。
-- `SENSITIVE_IMAGE_POLICY=confirm` 为默认值。剪贴板/截图发送云端前在聊天内创建一次性审批；`block` 完全禁止敏感图上云，`allow` 仅适合可信环境。
-- Windows 下 PaddleOCR 默认使用单线程并关闭文字方向分类，降低原生访问冲突和冷启动成本；需要旋转文字识别时可显式开启方向分类。
-- OCR 和 SigLIP2 默认使用短生命周期子进程，避免 Paddle/Torch 与 Qt 主进程叠加占用提交内存。PDF 页图采用一次 worker 调用和受限批大小，避免逐页冷启动。
-- SigLIP2 启动前检查 Windows 可用提交内存；不足时跳过视觉向量但保留 OCR 索引。增大页面文件后，将 `MULTIMODAL_RETRY_MISSING_VISION=true` 并重新导入可补齐向量。
-- OCR 文本复用主 RAG 的 Embedding API；未配置 API 时使用 `text/local-hash-v1` fallback，并在检索 trace 中标记为 `ocr_dense_fallback`。
-- 首次导入必须运行本地 OCR，耗时取决于图片文字量和 CPU；相同图片再次导入直接复用索引。当前测试机完整 Qt Bridge 冷启动约 1 秒，已完整索引图片的重复导入约 0.05 秒，该数据仅作为相对性能参考。
+- `VISION_MODEL` 必须选择服务商实际支持图片输入的型号；上云需开启 `ALLOW_CLOUD_IMAGE_UPLOAD=true`。`SENSITIVE_IMAGE_POLICY=confirm` 默认要求剪贴板/截图单次审批，也可设为 `block` 或 `allow`。
+- Windows 默认 OCR 单线程、关闭文字方向分类与 MKLDNN；OCR/SigLIP2 使用隔离 worker 和受限批大小。首次推理包含模型加载成本，缓存命中时复用结果。
+- 提交内存不足时保留 OCR、跳过视觉向量；资源充足后可设置 `MULTIMODAL_RETRY_MISSING_VISION=true` 补算。OCR 文本无 Embedding API 时标记为本地 hash fallback。
 
 ### 网页搜索配置
 
@@ -431,53 +402,42 @@ EMAIL_ATTACHMENTS_TOTAL_MAX_MB=25
 
 ## 测试
 
-编译检查：
+完整回归和编译检查：
 
 ```powershell
+.\.conda\deskpilot-py311\python.exe -m pytest tests -q
 .\.conda\deskpilot-py311\python.exe -m compileall -q deskpilot eval tests
-```
-
-关键回归脚本不强制依赖 pytest，可以直接运行：
-
-```powershell
-.\.conda\deskpilot-py311\python.exe tests\test_agent_runtime.py
-.\.conda\deskpilot-py311\python.exe tests\test_intent_router.py
-.\.conda\deskpilot-py311\python.exe tests\test_memory_p0.py
-.\.conda\deskpilot-py311\python.exe tests\test_memory_p1.py
-.\.conda\deskpilot-py311\python.exe tests\test_rag_p0.py
-.\.conda\deskpilot-py311\python.exe tests\test_rag_p1.py
-.\.conda\deskpilot-py311\python.exe tests\test_rag_grounding.py
-.\.conda\deskpilot-py311\python.exe tests\test_tool_registry.py
-.\.conda\deskpilot-py311\python.exe tests\test_email_mcp.py
-.\.conda\deskpilot-py311\python.exe tests\test_multi_agent_p0.py
 ```
 
 DeskPilotBench 离线模式不会调用真实模型、网页或邮箱：
 
 ```powershell
-.\.conda\deskpilot-py311\python.exe -m eval.run_eval --count 20 --mode offline
+.\.conda\deskpilot-py311\python.exe -m eval.run_eval --count 163 --mode offline
 ```
 
-生成当前版本的完整可复现基线（当前 36 个测试模块、163 条离线评测、22 条多模态离线评测、36 条分级文本 API 用例和 3 条分级 VLM API 用例）：
+离线模式用于确定性逻辑与回归检查，不能替代模型能力测评。完整基线包含 36 个测试模块、163 条主离线用例、22 条多模态离线用例、36 条分级文本 API 和 3 条分级 VLM API：
 
 ```powershell
 .\.conda\deskpilot-py311\python.exe -m eval.run_baseline `
   --project-version 0.9.0 `
   --api-suite baseline_api_v0.9.0 `
   --multimodal-api-suite baseline_multimodal_api_v0.9.0 `
-  --compare-baseline D:\broagent\eval\baselines\deskpilot_baseline_v0.8.0_20261006T191333+0800 `
-  --change-summary "完成P0执行安全与敏感图片上云审批" `
-  --change-summary "完成P1 Router单调用、多模态批处理、语义OCR向量、WAL与VLM流式"
+  --compare-baseline .\eval\baselines\deskpilot_baseline_v0.9.1_20261009T022038+0800 `
+  --change-summary "修复API基线中的路由、计划和工具执行问题" `
+  --change-summary "完成多模态P2视觉记忆、审批和跨会话召回"
 ```
 
-完整基线会消耗真实 LLM、Embedding 和 VLM API 配额，且强制禁用本地 fallback。运行前还需设置 `ALLOW_CLOUD_IMAGE_UPLOAD=true`。报告按版本和带时区时间戳写入 `eval/baselines/`，该目录包含模型输出和本机运行信息，已从 Git 排除。
+完整基线会消耗真实 LLM、Embedding 和 VLM API 配额，并强制禁用本地 fallback；网页资料、邮件副作用使用 fixture/mock，不实际发信。需配置三类模型并开启 `ALLOW_CLOUD_IMAGE_UPLOAD=true`，VLM 输入为合成测试图片。对比目录需在本机存在，首次运行可去掉 `--compare-baseline`；`--project-version` 应与待测版本一致。报告按版本和带时区时间戳写入 `eval/baselines/`。
 
-使用真实模型 API 或运行单例：
+真实 API 全量、固定集或单例（`.env` 设置 `ALLOW_LOCAL_FALLBACK=false` 后可按严格模式复测）：
 
 ```powershell
-.\.conda\deskpilot-py311\python.exe -m eval.run_eval --count 20 --mode api
+.\.conda\deskpilot-py311\python.exe -m eval.run_eval --count 163 --mode api
+.\.conda\deskpilot-py311\python.exe -m eval.run_eval --suite baseline_api_v0.9.0 --mode api
 .\.conda\deskpilot-py311\python.exe -m eval.run_eval --case-id reg_rag_route_005 --mode api
 ```
+
+API 模式先检查 LLM/Embedding 连接，运行中持续连接或限流失败会熔断。评测进度与逐例结果持续写入 `eval/runs/`、`eval/reports/`，详见 [`eval/README.md`](eval/README.md)。
 
 RAG 检索层消融：
 
@@ -497,9 +457,7 @@ RAG 检索层消融：
 .\.conda\deskpilot-py311\python.exe -m eval.run_multimodal_eval --mode api --suite baseline_multimodal_api_v0.9.0 --report eval\reports\multimodal_v0.9.0_api.md
 ```
 
-GitHub Actions 使用 Python 3.11 安装 `requirements.txt`，执行完整 `pytest` 回归、163 条可移植主数据集的数量/唯一 ID 校验，以及一组确定性离线 smoke 用例。全量离线评测用于能力基线和版本对比，其中包含 API 专用跳过项及当前未满分用例，不作为零失败 CI 门禁。`eval/dataset/*.jsonl` 及其小型合成 fixture 是版本化测试输入，必须提交；`eval/reports/`、`eval/runs/`、本地论文和个人图片不提交。
-
-评测报告默认写入 `eval/reports/`，逐用例明细写入 `eval/runs/`。报告和运行结果属于生成产物，不应提交。
+GitHub Actions 使用 Python 3.11 执行完整 pytest、163 条主集的数量/唯一 ID 校验，以及确定性离线 smoke；全量能力集不作为零失败 CI 门禁。`eval/dataset/*.jsonl` 和小型合成 fixture 是版本化测试输入，原始运行结果与个人数据不提交。
 
 ## 数据与安全
 
@@ -512,19 +470,13 @@ GitHub Actions 使用 Python 3.11 安装 `requirements.txt`，执行完整 `pyte
 
 ## 当前局限
 
-- 多模态 P0/P1/P2 已支持图片问答、小型知识库精确扫描、单任务内批处理和受审批控制的图片长期记忆；Office 内嵌图、后台任务队列和 ANN 尚未完成。
-- 默认 `basic` 图片向量只适合离线图搜图验证；可靠文本搜图需要启用 SigLIP2，中文截图检索需要启用 PaddleOCR。
-- PaddleOCR/SigLIP2 的首次本地推理存在模型冷启动和内存成本；低页面文件环境会自动保留 OCR 通道并降级视觉向量。
-- 当前精确 Dense 扫描适合个人小型知识库，文档规模增大后性能会下降。
-- Cross-Encoder 仅提供可选本地 provider，未随项目分发模型；当前 ColBERT 是用于接口和消融的 hash MaxSim 实验实现，不等同于训练版 ColBERT。
-- PDF 如果缺少正确的 Unicode 字体映射，仍可能出现无法恢复的乱码。
-- 网页搜索受网络、搜索引擎页面变化和反爬策略影响。
-- 邮箱目前一次只加载一个账号，Outlook OAuth、多账号隔离和账号切换尚未完成。
-- 多智能体目前主要覆盖结构化规划和工具协作，Reflection Agent 尚未正式启用。
-- Python 静态策略只能阻断明显危险语法，不能替代进程、账号或容器级沙箱。
-- 文本与视觉模型回答均支持 OpenAI-compatible SSE；经人工审批后重放的敏感图片调用当前仍以完整结果返回。
-- 本地 fallback 只能提供基础检索摘要，不能替代真实 LLM 的综合推理。
-- 当前没有 SFT、RLHF/DPO、Agentic RL 训练、vLLM 推理优化或端侧模型部署。
+- 文本和视觉索引使用精确扫描，适合个人小型知识库；Office 内嵌图、后台索引队列和 ANN 尚未完成。
+- `basic` 视觉向量与 hash 文本向量仅用于降级验证；首次 OCR/SigLIP2 推理有冷启动与内存成本，PDF 字体映射异常仍可能导致乱码。
+- Cross-Encoder 需自行提供本地权重；ColBERT 当前为 hash MaxSim 接口实验，并非训练版 ColBERT。
+- 多智能体仍有兼容执行路径，Reflection 尚无完整自动审查闭环；审批后重放的敏感图片调用尚未流式返回。
+- 网页受网络和反爬策略影响；邮箱仅支持单活动账号，Outlook OAuth 和多账号隔离待完成。
+- 执行安全依赖应用权限和静态检查，尚无完整系统沙箱；本地 fallback 不能替代真实模型推理。
+- 尚未在本项目接入 SFT、RLHF/DPO、Agentic RL 训练、vLLM 或端侧生成模型；独立训练实验不计为已集成功能。
 
 ## 后续工作
 
@@ -532,8 +484,8 @@ GitHub Actions 使用 Python 3.11 安装 `requirements.txt`，执行完整 `pyte
 - 多模态：继续完善会话孤立资产回收，并开发 Office 内嵌图、后台任务队列、ANN 和端侧 VLM。
 - Agent：按任务质量要求启用 Reflection，并完善失败恢复、预算和人工接管。
 - 邮件：多账号、OAuth、模板管理、附件策略和更完整的邮箱文件夹兼容。
-- UI：服务端原生流式输出、更清晰的计划图和工具审批历史。
-- 评测：扩大 GAIA/BFCL/RAGAS 风格样本，增加真实复合任务、成本和稳定性回归。
+- UI：补齐审批重放流式输出、计划图和工具审批历史。
+- 评测：先在相同数据、模型和降级策略下复测基线，再扩充参考答案、真实复合任务与多模态标注，完善 F1/Recall、成本和稳定性对比。
 - 模型工程：在数据和评测稳定后尝试 SFT、偏好优化、推理加速与端侧部署。
 
 ## License
