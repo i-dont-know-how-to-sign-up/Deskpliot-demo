@@ -1,0 +1,33 @@
+{
+  "name": "baseline-api-v0.9.0",
+  "description": "DeskPilot v0.9.0 分层真实模型 API 基线。12 个主功能模块各包含简单、中等、复杂 3 条；网页、邮箱和文件副作用使用隔离 fixture/mock。",
+  "case_ids": [
+    "direct_001", "gaia_001", "gaia_002",
+    "rag_003", "ragas_001", "ragas_005",
+    "route_005", "route_002", "reg_p1_route_001",
+    "tool_004", "tool_006", "tool_002",
+    "p2_web_fallback_001", "api_web_medium_001", "api_web_complex_001",
+    "memory_001", "memory_002", "memory_gate_002",
+    "context_001", "context_006", "context_p3_003",
+    "multi_001", "reg_debug3_003", "api_multi_file_001",
+    "multi_exec_001", "reg_p1_mock_isolation_001", "multi_p1_003",
+    "composite_002", "composite_003", "composite_006",
+    "safe_002", "safe_009", "safe_011",
+    "recovery_001", "recovery_002", "recovery_004"
+  ],
+  "cases": [
+    {"id":"direct_001","difficulty":"simple"},{"id":"gaia_001","difficulty":"medium"},{"id":"gaia_002","difficulty":"complex"},
+    {"id":"rag_003","difficulty":"simple"},{"id":"ragas_001","difficulty":"medium"},{"id":"ragas_005","difficulty":"complex"},
+    {"id":"route_005","difficulty":"simple"},{"id":"route_002","difficulty":"medium"},{"id":"reg_p1_route_001","difficulty":"complex"},
+    {"id":"tool_004","difficulty":"simple"},{"id":"tool_006","difficulty":"medium"},{"id":"tool_002","difficulty":"complex"},
+    {"id":"p2_web_fallback_001","difficulty":"simple"},{"id":"api_web_medium_001","difficulty":"medium"},{"id":"api_web_complex_001","difficulty":"complex"},
+    {"id":"memory_001","difficulty":"simple"},{"id":"memory_002","difficulty":"medium"},{"id":"memory_gate_002","difficulty":"complex"},
+    {"id":"context_001","difficulty":"simple"},{"id":"context_006","difficulty":"medium"},{"id":"context_p3_003","difficulty":"complex"},
+    {"id":"multi_001","difficulty":"simple"},{"id":"reg_debug3_003","difficulty":"medium"},{"id":"api_multi_file_001","difficulty":"complex"},
+    {"id":"multi_exec_001","difficulty":"simple"},{"id":"reg_p1_mock_isolation_001","difficulty":"medium"},{"id":"multi_p1_003","difficulty":"complex"},
+    {"id":"composite_002","difficulty":"simple"},{"id":"composite_003","difficulty":"medium"},{"id":"composite_006","difficulty":"complex"},
+    {"id":"safe_002","difficulty":"simple"},{"id":"safe_009","difficulty":"medium"},{"id":"safe_011","difficulty":"complex"},
+    {"id":"recovery_001","difficulty":"simple"},{"id":"recovery_002","difficulty":"medium"},{"id":"recovery_004","difficulty":"complex"}
+  ],
+  "multimodal_suite": "baseline_multimodal_api_v0.9.0"
+}

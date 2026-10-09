@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import platform
 import statistics
 import subprocess
@@ -23,6 +24,8 @@ from deskpilot.multimodal.retriever import MultimodalRetriever
 from deskpilot.multimodal.service import MultimodalService
 from deskpilot.multimodal.vector_store import MultimodalVectorStore
 from deskpilot.core.api_clients import local_hash_embedding
+from deskpilot.memory.memory_store import MemoryStore
+from deskpilot.memory.visual_memory import VisualMemoryManager
 from deskpilot import __version__
 
 
@@ -66,6 +69,25 @@ class FixtureTextEmbedder:
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         return [local_hash_embedding(text) for text in texts]
+
+
+class FixtureVisualMemoryService:
+    """复用真实资产、向量和检索实现，不加载 OCR/SigLIP2 大模型。"""
+
+    def __init__(
+        self, assets: AssetStore, vectors: MultimodalVectorStore,
+        retriever: MultimodalRetriever,
+    ) -> None:
+        self.assets = assets
+        self.vector_store = vectors
+        self.retriever = retriever
+
+    def search(self, query: str = "", image_path: Path | None = None, top_k: int = 5):
+        return self.retriever.search(query, image_path, top_k)
+
+    def delete_asset(self, asset_id: str) -> bool:
+        self.vector_store.delete_asset(asset_id)
+        return self.assets.delete(asset_id)
 
 
 def load_cases(
@@ -151,6 +173,84 @@ def evaluate_case(case: dict[str, Any], root: Path, atlas: Path, nebula: Path) -
         thumbnail = Path(asset.thumbnail_path)
         checks["deleted"] = service.delete_asset(asset.asset_id)
         checks["files_removed"] = not original.exists() and not thumbnail.exists()
+    elif task.startswith("visual_memory_"):
+        text = FixtureTextEmbedder()
+        ingestion = MultimodalIngestionService(assets, vectors, FixtureOCR(), vision, text)
+        ingestion.ingest_image(atlas)
+        ingestion.ingest_image(nebula)
+        atlas_asset = assets.ingest_file(atlas)
+        nebula_asset = assets.ingest_file(nebula)
+        retriever = MultimodalRetriever(vectors, assets, vision, text)
+        facade = FixtureVisualMemoryService(assets, vectors, retriever)
+        memory = MemoryStore(
+            root / "memory" / "catalog.sqlite", root / "memory_workspace",
+            vector_provider="sqlite",
+        )
+        memory._embed_text = local_hash_embedding
+        manager = VisualMemoryManager(memory, facade)
+        if task == "visual_memory_pending":
+            item = manager.remember("ATLAS-503 是红色告警面板", [atlas_asset.asset_id])
+            checks["pending"] = item.status == "pending"
+            checks["excluded_before_approval"] = manager.search("ATLAS-503") == []
+        elif task == "visual_memory_cross_session":
+            item = manager.remember(
+                "ATLAS-503 是红色告警面板", [atlas_asset.asset_id],
+                source_session_id="session_a",
+            )
+            manager.approve(item.memory_id)
+            recalled = manager.search("ATLAS-503 红色告警", session_id="session_b")
+            checks["cross_session_recalled"] = any(value.memory_id == item.memory_id for value in recalled)
+        elif task == "visual_memory_image_recall":
+            item = manager.remember("这张图对应 ATLAS 过载恢复", [atlas_asset.asset_id])
+            manager.approve(item.memory_id)
+            recalled = manager.search(query_asset_ids=[atlas_asset.asset_id])
+            checks["image_recalled"] = any(value.memory_id == item.memory_id for value in recalled)
+        elif task == "visual_memory_sensitive":
+            sensitive = assets.ingest_bytes(
+                atlas.read_bytes(), source_path=None, source_kind="clipboard",
+                sensitivity="sensitive", metadata={"source": "clipboard"},
+            )
+            try:
+                manager.remember("保存剪贴板截图", [sensitive.asset_id])
+                checks["rejected"] = False
+            except PermissionError:
+                checks["rejected"] = True
+            checks["not_persisted"] = memory.list_pending_memories() == []
+        elif task == "visual_memory_delete_cascade":
+            item = manager.remember("ATLAS 图片记忆", [atlas_asset.asset_id])
+            manager.approve(item.memory_id)
+            preview = manager.delete_asset(atlas_asset.asset_id)
+            checks["confirmation_required"] = preview["requires_confirmation"] is True
+            deleted = manager.delete_asset(
+                atlas_asset.asset_id, confirm=True, cascade_memories=True,
+            )
+            checks["cascade_deleted"] = bool(deleted["deleted"])
+            checks["memory_deleted"] = memory.get_memory(item.memory_id).status == "deleted"
+        elif task == "visual_memory_budget":
+            previous_images = os.environ.get("VISUAL_MEMORY_MAX_IMAGES")
+            previous_pixels = os.environ.get("VISUAL_MEMORY_MAX_TOTAL_PIXELS")
+            os.environ["VISUAL_MEMORY_MAX_IMAGES"] = "1"
+            os.environ["VISUAL_MEMORY_MAX_TOTAL_PIXELS"] = "200000"
+            try:
+                item = memory.add_memory(
+                    "user", "artifact", "两个系统截图", status="active",
+                    asset_refs=[atlas_asset.asset_id, nebula_asset.asset_id],
+                )
+                selected = manager.select_context([item] if item else [])
+                checks["one_asset_selected"] = len(selected.asset_ids) == 1
+                checks["one_asset_dropped"] = len(selected.dropped_assets) == 1
+                checks["bounded_refs"] = bool(
+                    selected.memories and len(selected.memories[0].asset_refs) == 1
+                )
+            finally:
+                if previous_images is None:
+                    os.environ.pop("VISUAL_MEMORY_MAX_IMAGES", None)
+                else:
+                    os.environ["VISUAL_MEMORY_MAX_IMAGES"] = previous_images
+                if previous_pixels is None:
+                    os.environ.pop("VISUAL_MEMORY_MAX_TOTAL_PIXELS", None)
+                else:
+                    os.environ["VISUAL_MEMORY_MAX_TOTAL_PIXELS"] = previous_pixels
     else:
         text = FixtureTextEmbedder()
         ingestion = MultimodalIngestionService(assets, vectors, FixtureOCR(), vision, text)
@@ -251,7 +351,7 @@ def _metadata(args: argparse.Namespace, results: list[dict[str, Any]]) -> dict[s
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="运行 DeskPilot 多模态 P0/P1 评测。")
+    parser = argparse.ArgumentParser(description="运行 DeskPilot 多模态 P0/P1/P2 评测。")
     parser.add_argument("--mode", choices=("offline", "api"), default="offline")
     parser.add_argument("--count", type=int, default=None)
     parser.add_argument("--case-id", action="append")

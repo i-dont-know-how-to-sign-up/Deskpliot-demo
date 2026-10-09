@@ -1,0 +1,10 @@
+{
+  "name": "baseline-multimodal-api-v0.9.0",
+  "description": "固定的真实 VLM API 用例，分别覆盖简单文字识别、中等多图比较和复杂图文关系推理。",
+  "case_ids": ["mm_qa_001", "mm_qa_002", "mm_qa_004"],
+  "cases": [
+    {"id":"mm_qa_001","difficulty":"simple"},
+    {"id":"mm_qa_002","difficulty":"medium"},
+    {"id":"mm_qa_004","difficulty":"complex"}
+  ]
+}

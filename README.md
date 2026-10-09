@@ -112,10 +112,13 @@ DeskPilot 是一个本地优先、面向个人办公场景的桌面 Agent。它�
 - OCR 文本在配置 Embedding API 时使用真实语义向量；无 API 时明确降级为版本化的本地 hash fallback，不将其标记为语义检索。
 - 剪贴板和截图默认视为敏感图片，云端 VLM 调用按 `block|confirm|allow` 策略处理；默认在聊天内单次确认。
 - 多模态 SQLite 启用 WAL 与 busy timeout；删除资产时同步清理原图、缩略图、OCR chunk 和向量。
+- 用户显式要求记住图片时创建待审批视觉记忆；审批后支持跨会话文本召回和相似图片关联召回，记忆仅保存事实摘要与资产/证据引用。
+- 视觉记忆进入上下文前受图片数量和总像素预算约束；截图、剪贴板图片及含密码、Token、验证码、身份证号或银行卡号的内容禁止长期保存。
+- 删除被视觉记忆引用的资产必须在聊天内确认，并显式允许级联删除相关记忆。
 
 云端图片上传默认关闭。使用前必须配置视觉模型并显式设置 `ALLOW_CLOUD_IMAGE_UPLOAD=true`。
 
-实现入口：`deskpilot/multimodal/`。
+实现入口：`deskpilot/multimodal/`、`deskpilot/memory/visual_memory.py`。
 
 多模态索引采用独立 SQLite catalog，图片二进制存放在受控资产目录，数据库只保存元数据、OCR chunk 和向量。检索结果记录 `ocr_lexical`、`ocr_semantic`（或 `ocr_dense_fallback`）、`vision_text`、`vision_image` 通道，文字问答存在可靠 OCR 字面命中时会过滤仅由弱视觉相似度召回的无关页面。
 
@@ -182,7 +185,7 @@ DeskPilot 内部 Tool Registry 直接复用邮件 MCP 业务层，因此启动�
 | 记忆存储 | JSONL、SQLite、可选 Chroma |
 | 浏览器 | Playwright，可复用 Chrome/Chromium |
 | 邮件 | IMAP、SMTP、可选 MCP stdio Server |
-| 测试与评测 | Python 回归脚本、163 条 DeskPilotBench、16 条多模态专项集、分级真实 API 套件、GitHub Actions CI |
+| 测试与评测 | Python 回归脚本、163 条 DeskPilotBench、22 条多模态专项集、分级真实 API 套件、GitHub Actions CI |
 
 当前核心实现没有引入 LangChain、LlamaIndex 或 LangGraph，以便直接观察路由、检索、上下文和 Agent Loop 的内部行为。
 
@@ -455,7 +458,7 @@ DeskPilotBench 离线模式不会调用真实模型、网页或邮箱：
 .\.conda\deskpilot-py311\python.exe -m eval.run_eval --count 20 --mode offline
 ```
 
-生成当前版本的完整可复现基线（34 个测试模块、163 条离线评测、16 条多模态离线评测、36 条分级文本 API 用例和 3 条分级 VLM API 用例）：
+生成当前版本的完整可复现基线（当前 36 个测试模块、163 条离线评测、22 条多模态离线评测、36 条分级文本 API 用例和 3 条分级 VLM API 用例）：
 
 ```powershell
 .\.conda\deskpilot-py311\python.exe -m eval.run_baseline `
@@ -488,7 +491,8 @@ RAG 检索层消融：
 
 ```powershell
 .\.conda\deskpilot-py311\python.exe -m pytest tests\test_multimodal_p0_p1.py -q
-.\.conda\deskpilot-py311\python.exe -m eval.run_multimodal_eval --mode offline --count 16 --report eval\reports\multimodal_v0.9.0_offline.md
+.\.conda\deskpilot-py311\python.exe -m pytest tests\test_multimodal_memory_p2.py -q
+.\.conda\deskpilot-py311\python.exe -m eval.run_multimodal_eval --mode offline --count 22 --report eval\reports\multimodal_v0.9.0_offline.md
 # 需要配置视觉 API，并明确允许上传测试图片
 .\.conda\deskpilot-py311\python.exe -m eval.run_multimodal_eval --mode api --suite baseline_multimodal_api_v0.9.0 --report eval\reports\multimodal_v0.9.0_api.md
 ```
@@ -508,7 +512,7 @@ GitHub Actions 使用 Python 3.11 安装 `requirements.txt`，执行完整 `pyte
 
 ## 当前局限
 
-- 多模态 P0/P1 已支持图片问答、小型知识库精确扫描和单任务内批处理；图片长期记忆、Office 内嵌图、后台任务队列和 ANN 尚未完成。
+- 多模态 P0/P1/P2 已支持图片问答、小型知识库精确扫描、单任务内批处理和受审批控制的图片长期记忆；Office 内嵌图、后台任务队列和 ANN 尚未完成。
 - 默认 `basic` 图片向量只适合离线图搜图验证；可靠文本搜图需要启用 SigLIP2，中文截图检索需要启用 PaddleOCR。
 - PaddleOCR/SigLIP2 的首次本地推理存在模型冷启动和内存成本；低页面文件环境会自动保留 OCR 通道并降级视觉向量。
 - 当前精确 Dense 扫描适合个人小型知识库，文档规模增大后性能会下降。
@@ -525,7 +529,7 @@ GitHub Actions 使用 Python 3.11 安装 `requirements.txt`，执行完整 `pyte
 ## 后续工作
 
 - RAG：校准各 reranker 阈值，使用真实中英文 Cross-Encoder 做消融，并在知识库规模增长后接入成熟 ANN Provider。
-- 多模态：继续完成视觉记忆、Office 内嵌图、后台任务队列、ANN 和端侧 VLM。
+- 多模态：继续完善会话孤立资产回收，并开发 Office 内嵌图、后台任务队列、ANN 和端侧 VLM。
 - Agent：按任务质量要求启用 Reflection，并完善失败恢复、预算和人工接管。
 - 邮件：多账号、OAuth、模板管理、附件策略和更完整的邮箱文件夹兼容。
 - UI：服务端原生流式输出、更清晰的计划图和工具审批历史。

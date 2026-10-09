@@ -149,22 +149,23 @@ GAIA/Ragas 改编来源清单位于 dataset/public_sources/gaia_ragas_adaptation
 
 P1 用例沿用同一 JSONL 模板，新增字段可放在 `expected` 中，例如 `parallelizable`、`recovery_required` 和 `reflection_policy`。评测 runner 未识别字段时应忽略它们，不影响已有用例。
 
-## 多模态 P0/P1 数据集
+## 多模态 P0/P1/P2 数据集
 
-`multimodal_cases.jsonl` 是独立于 DeskPilotBench 主集的 16 条轻量数据，运行时由评测脚本生成红/蓝办公截图，不存放个人图片或大型公开数据集文件。真实 VLM 固定套件选择简单/中等/复杂各 1 条，并记录服务端返回的 Token usage。用例覆盖剪贴板敏感等级、SQLite WAL 和资产删除生命周期：
+`multimodal_cases.jsonl` 是独立于 DeskPilotBench 主集的 22 条轻量数据，运行时由评测脚本生成红/蓝办公截图，不存放个人图片或大型公开数据集文件。真实 VLM 固定套件选择简单/中等/复杂各 1 条，并记录服务端返回的 Token usage。用例覆盖剪贴板敏感等级、SQLite WAL、资产生命周期和视觉长期记忆：
 
 - `Multimodal-Safety` 8 条：内容去重、损坏文件、像素上限、向量空间隔离、Base64 不落盘、敏感图片、WAL 和资产删除。
 - `Multimodal-RAG` 4 条：文本搜图、以图搜图和 OCR/视觉 RRF 融合。
 - `Multimodal-QA` 4 条：单图读取、多图比较、图片引用和复杂跨图对应关系，需要真实视觉 API。
+- `Multimodal-Memory` 6 条：pending 门禁、跨会话文本召回、图片关联召回、敏感图片拒绝、引用感知级联删除和视觉上下文预算。
 
 离线结构评测：
 
 ```powershell
-python -m eval.run_multimodal_eval --mode offline --count 16
+python -m eval.run_multimodal_eval --mode offline --count 22
 ```
 
 真实 VLM 评测需要配置 `VISION_MODEL`、`VISION_API_KEY` 和 `ALLOW_CLOUD_IMAGE_UPLOAD=true`：
 
 ```powershell
-python -m eval.run_multimodal_eval --mode api --count 12
+python -m eval.run_multimodal_eval --mode api --count 22
 ```

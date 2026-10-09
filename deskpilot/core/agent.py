@@ -26,6 +26,7 @@ from ..memory.memory_extractor import MemoryExtractor
 from ..memory.memory_store import MemoryStore
 from ..memory.session_store import SessionStore
 from ..memory.turn_manager import MemoryTurnManager
+from ..memory.visual_memory import VisualMemoryManager
 from ..intent.router import IntentRouter
 from ..intent.schemas import IntentDecision
 from ..rag.vector_index import DocumentIndex
@@ -76,6 +77,7 @@ class DocumentQAAgent:
         self.usage_tracker = UsageCostTracker(LOG_DIR / "context_usage.jsonl")
         self.web_research_agent = WebResearchAgent(index)
         self.multimodal = MultimodalService()
+        self.visual_memory = VisualMemoryManager(self.memory_store, self.multimodal)
         self._operation_lock = threading.RLock()
         self._turn_usage_start = self.usage_tracker.snapshot(self._combined_usage())
         self.workspace_root = Path.cwd().resolve()
@@ -83,7 +85,7 @@ class DocumentQAAgent:
         self.task_ledger = TaskLedger(Path(self.index.index_file).parent / "task_ledger.json")
         self.tool_registry = build_default_tool_registry(
             index, self.web_research_agent, workspace_root=self.workspace_root,
-            multimodal_service=self.multimodal,
+            multimodal_service=self.multimodal, visual_memory=self.visual_memory,
         )
         self.pending_actions = PendingActionStore()
         self.runtime = PlanAndExecuteRuntime(default_max_retries=1)
@@ -120,9 +122,54 @@ class DocumentQAAgent:
             session = self.session_store.get_or_create(session_id)
             user_message = self.session_store.append_message(
                 session.session_id, "user", question or "请描述这些图片。",
-                metadata={"attachment_ids": list(dict.fromkeys(asset_ids)), "modality": "image"},
+                metadata={"modality": "image"},
+                attachment_ids=list(dict.fromkeys(asset_ids)),
             )
             sensitive = self.multimodal.sensitive_assets(asset_ids)
+            # 附件消息走独立视觉入口，因此在这里仍需让语义 Router 判断是否为显式记忆请求。
+            # 服务端覆盖 asset/session 参数，模型只负责选择意图和生成事实摘要，不能猜内部 ID。
+            visual_intent = (
+                self.intent_router.route(question, self.tool_registry)
+                if not sensitive else IntentDecision(
+                    mode="direct_answer",
+                    reason="敏感附件先执行本地策略检查，不调用外部意图模型。",
+                )
+            )
+            if (
+                visual_intent.mode == "tool_call"
+                and visual_intent.tool_name == ToolNames.MEMORY_REMEMBER_VISUAL
+            ):
+                arguments = dict(visual_intent.arguments)
+                arguments["asset_ids"] = list(dict.fromkeys(asset_ids))
+                arguments["source_session_id"] = session.session_id
+                arguments["content"] = str(arguments.get("content") or question).strip()
+                result = self.tool_registry.call(ToolNames.MEMORY_REMEMBER_VISUAL, **arguments)
+                status = StepStatus.SUCCESS if result.ok else StepStatus.FAILED
+                detail = (
+                    f"已创建待审批视觉记忆：{result.output['memory']['memory_id']}"
+                    if result.ok else f"视觉记忆未创建：{result.error}"
+                )
+                steps = [
+                    AgentStep(
+                        "route_visual_memory", StepStatus.SUCCESS,
+                        f"tool={visual_intent.tool_name}; reason={visual_intent.reason}",
+                    ),
+                    AgentStep("remember_visual", status, detail),
+                ]
+                answer = (
+                    "已将这张图片的事实加入待审批记忆。确认前它不会参与跨会话召回。\n\n"
+                    f"记忆 ID：{result.output['memory']['memory_id']}"
+                    if result.ok else f"无法保存视觉记忆：{result.error}"
+                )
+                self.session_store.append_message(
+                    session.session_id, "assistant", answer,
+                    metadata={"steps": [step.__dict__ for step in steps], "reply_to": user_message.message_id},
+                )
+                return AnswerResult(
+                    answer=answer, evidences=[], steps=steps, used_llm=False,
+                    session_id=session.session_id,
+                    memory_context="视觉记忆仅保存文本事实与受控资产引用。",
+                )
             capability = self.multimodal.stats()
             if sensitive and capability.get("sensitive_image_policy") == "confirm":
                 permission = self.multimodal.sensitive_permission(sensitive)
@@ -150,8 +197,19 @@ class DocumentQAAgent:
                 )
             if event_callback:
                 event_callback({"type": "model_start", "stage": "Vision Answer", "kind": "vision", "visible": True})
+            visual_memories = self.visual_memory.search(
+                question, query_asset_ids=asset_ids, session_id=session.session_id, top_k=4,
+            )
+            visual_context = self.visual_memory.select_context(visual_memories)
+            model_question = question
+            if visual_context.memories:
+                facts = "\n".join(f"- {item.content}" for item in visual_context.memories)
+                model_question = (
+                    f"{question}\n\n以下是已确认的历史视觉记忆，仅作为补充上下文；"
+                    f"若与当前图片冲突，以当前图片为准：\n{facts}"
+                )
             try:
-                answer = self.multimodal.answer(question, asset_ids, event_callback=event_callback)
+                answer = self.multimodal.answer(model_question, asset_ids, event_callback=event_callback)
             except Exception as exc:
                 if event_callback:
                     event_callback({
@@ -163,6 +221,12 @@ class DocumentQAAgent:
                 event_callback({"type": "model_end", "stage": "Vision Answer", "kind": "vision", "ok": True})
             steps = [
                 AgentStep("validate_attachments", "success", f"已校验并加载 {len(asset_ids)} 张受控图片资产。"),
+                AgentStep(
+                    "retrieve_visual_memory", "success",
+                    f"召回 {len(visual_context.memories)} 条已激活视觉记忆；"
+                    f"选择 {len(visual_context.asset_ids)} 个资产引用，"
+                    f"总像素 {visual_context.total_pixels}。",
+                ),
                 AgentStep("vision_answer", "success", f"由 {self.multimodal.vision_llm.model} 完成图文问答。"),
             ]
             assistant = self.session_store.append_message(
@@ -912,13 +976,34 @@ class DocumentQAAgent:
             recent_messages = recent_messages[:-1]
         recent_messages = recent_messages[-12:]
         retrieved_memories = self.memory_store.search(question, session_id=session_id, top_k=6)
-        return self.context_assembler.assemble(
+        visual_candidates = [item for item in retrieved_memories if item.asset_refs]
+        visual_context = self.visual_memory.select_context(visual_candidates)
+        selected_visual_ids = {item.memory_id for item in visual_context.memories}
+        retrieved_memories = [
+            item for item in retrieved_memories
+            if not item.asset_refs or item.memory_id in selected_visual_ids
+        ]
+        context = self.context_assembler.assemble(
             question=question,
             workspace_memory=workspace_memory,
             session_summary=session_summary,
             recent_messages=recent_messages,
             retrieved_memories=retrieved_memories,
         )
+        context.visual_asset_refs = visual_context.asset_ids
+        context.visual_total_pixels = visual_context.total_pixels
+        context.quality["visual_memory"] = {
+            "selected_memories": len(visual_context.memories),
+            "selected_assets": len(visual_context.asset_ids),
+            "total_pixels": visual_context.total_pixels,
+            "dropped_assets": len(visual_context.dropped_assets),
+        }
+        context.debug_lines.append(
+            "Visual memory: "
+            f"memories={len(visual_context.memories)}, assets={len(visual_context.asset_ids)}, "
+            f"pixels={visual_context.total_pixels}, dropped={len(visual_context.dropped_assets)}"
+        )
+        return context
 
     def _route_with_intent(
         self,

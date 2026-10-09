@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -69,7 +70,7 @@ class AssetStore:
                         "UPDATE assets SET sensitivity = ? WHERE asset_id = ?",
                         (sensitivity, existing.asset_id),
                     )
-                existing.sensitivity = sensitivity
+                existing = replace(existing, sensitivity=sensitivity)
             return existing
         asset_id = f"asset_{digest[:20]}"
         asset_dir = self.root / digest[:2]

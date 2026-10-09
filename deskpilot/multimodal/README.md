@@ -1,6 +1,6 @@
 # DeskPilot Multimodal
 
-该模块实现多模态 P0/P1，并保持原图、派生文本和向量分离：
+该模块实现多模态 P0/P1/P2，并保持原图、派生文本、记忆引用和向量分离：
 
 - `AssetStore` 将校验后的图片和缩略图放入受控资产目录，SQLite 只保存路径和元数据。
 - `VisionLLMProvider` 使用 OpenAI-compatible `image_url` 消息完成单图/多图问答，并支持 SSE 增量输出。
@@ -10,6 +10,9 @@
 - PDF 页图在一次 OCR worker 和一次视觉 worker 调用中批量处理；worker 内批大小由 `IMAGE_EMBEDDING_BATCH_SIZE` 限制。
 - OCR 文本优先复用 Embedding API 生成版本化语义向量；无 API 时降级为 `text/local-hash-v1`。
 - SQLite 使用 WAL 和 busy timeout；资产删除同步清理文件、chunk 与向量。
+- `VisualMemoryManager` 只在用户显式要求时创建 `pending` 视觉记忆；记忆保存文本事实、`asset_refs` 和 `evidence_refs`，不复制图片向量或 Base64。
+- 审批后的视觉记忆支持跨会话文本召回和相似图片关联召回；进入上下文前同时受文本 token、图片数量和总像素预算约束。
+- 剪贴板/截图、密码、Token、验证码、身份证号和银行卡号禁止进入长期视觉记忆；被记忆引用的资产删除需要人工确认和显式级联。
 
 ## 模型选择
 
@@ -51,3 +54,17 @@ OCR_PROVIDER=paddleocr
 ```
 
 `SENSITIVE_IMAGE_POLICY` 支持 `block|confirm|allow`。剪贴板/截图默认标记为敏感，默认策略会在聊天内请求单次人工确认。首次加载 SigLIP2 可能需要下载模型。DeskPilot 不会把 Base64、API Key 或原始图片写入会话 JSONL。
+
+视觉记忆预算可选配置：
+
+```dotenv
+VISUAL_MEMORY_MAX_IMAGES=4
+VISUAL_MEMORY_MAX_TOTAL_PIXELS=12000000
+```
+
+离线验证：
+
+```powershell
+python -m pytest tests\test_multimodal_memory_p2.py -q
+python -m eval.run_multimodal_eval --mode offline --count 22
+```

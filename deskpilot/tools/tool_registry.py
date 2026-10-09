@@ -20,6 +20,7 @@ from .write_tools import write_docx, write_file, write_markdown, write_pdf, writ
 from ..rag.web_research import WebResearchAgent, WebSearchClient
 from ..mcp.email_mcp import EmailMCPService
 from ..multimodal import MultimodalService
+from ..memory.visual_memory import VisualMemoryManager
 
 
 ToolHandler = Callable[..., Any]
@@ -190,6 +191,7 @@ def build_default_tool_registry(
     workspace_root: Path | None = None,
     email_service: EmailMCPService | None = None,
     multimodal_service: MultimodalService | None = None,
+    visual_memory: VisualMemoryManager | None = None,
 ) -> ToolRegistry:
     # 这里集中注册所有工具，意图路由器和 UI 都只需要依赖这一份工具清单。
     registry = ToolRegistry()
@@ -218,6 +220,98 @@ def build_default_tool_registry(
                 "answered": True,
             },
         ))
+
+    if visual_memory is not None:
+        registry.register(ToolSpec(
+            name="memory.remember_visual", category="memory",
+            description=(
+                "将用户明确要求记住的图片事实保存为待审批视觉记忆。"
+                "不会自动激活，也不会保存图片 Base64；敏感图片和凭证信息会被拒绝。"
+            ),
+            parameters=[
+                ToolParameter("content", "string", True, "需要长期记住的图片事实摘要"),
+                ToolParameter("asset_ids", "array", True, "已受控的图片资产 ID"),
+                ToolParameter("source_session_id", "string", False, "来源会话 ID", ""),
+                ToolParameter("evidence_refs", "array", False, "可核对的证据引用", []),
+                ToolParameter("tags", "array", False, "记忆标签", []),
+            ],
+            handler=lambda content, asset_ids, source_session_id="", evidence_refs=None, tags=None: {
+                "created": True,
+                "status": "pending",
+                "memory": visual_memory.remember(
+                    str(content), list(asset_ids),
+                    source_session_id=str(source_session_id) or None,
+                    evidence_refs=list(evidence_refs or []), tags=list(tags or []),
+                ).to_dict(),
+                "message": "视觉记忆已进入待审批队列，确认前不会参与长期记忆召回。",
+            },
+        ))
+        registry.register(ToolSpec(
+            name="memory.approve_visual", category="memory",
+            description="激活一条待审批视觉记忆；必须经过应用内人工确认。",
+            parameters=[ToolParameter("memory_id", "string", True, "待审批记忆 ID")],
+            handler=lambda memory_id: {
+                "approved": False,
+                "memory_id": str(memory_id),
+                "permission": {
+                    "requires_confirmation": True,
+                    "risk_level": "medium",
+                    "reasons": ["激活后该视觉事实可跨会话进入模型上下文。"],
+                },
+            },
+            approval_handler=lambda memory_id: {
+                "approved": visual_memory.approve(str(memory_id)),
+                "memory_id": str(memory_id),
+            },
+        ))
+        registry.register(ToolSpec(
+            name="memory.search_visual", category="memory",
+            description="按文本或图片资产检索已激活的视觉记忆；只读。",
+            parameters=[
+                ToolParameter("query", "string", False, "文本查询", ""),
+                ToolParameter("asset_ids", "array", False, "用于相似图片召回的资产 ID", []),
+                ToolParameter("source_session_id", "string", False, "当前会话 ID", ""),
+                ToolParameter("top_k", "integer", False, "返回数量", 5),
+            ],
+            handler=lambda query="", asset_ids=None, source_session_id="", top_k=5: [
+                item.to_dict() for item in visual_memory.search(
+                    str(query), query_asset_ids=list(asset_ids or []),
+                    session_id=str(source_session_id) or None, top_k=int(top_k),
+                )
+            ],
+        ))
+        registry.register(ToolSpec(
+            name="assets.delete", category="assets",
+            description=(
+                "删除受控图片资产。删除操作始终需要人工确认；若资产仍被记忆引用，"
+                "还必须显式允许级联删除相关记忆。"
+            ),
+            parameters=[
+                ToolParameter("asset_id", "string", True, "图片资产 ID"),
+                ToolParameter("cascade_memories", "boolean", False, "是否级联删除引用该资产的记忆", False),
+            ],
+            handler=lambda asset_id, cascade_memories=False: {
+                "deleted": False,
+                "asset_id": str(asset_id),
+                "references": [
+                    item.memory_id
+                    for item in visual_memory.memory_store.memories_referencing_asset(str(asset_id))
+                ],
+                "permission": {
+                    "requires_confirmation": True,
+                    "risk_level": "high",
+                    "reasons": [
+                        "删除图片会移除原图、缩略图和向量。",
+                        "被记忆引用时必须启用 cascade_memories 并级联删除引用。",
+                    ],
+                },
+            },
+            approval_handler=lambda asset_id, cascade_memories=False: visual_memory.delete_asset(
+                str(asset_id), confirm=True, cascade_memories=bool(cascade_memories),
+            ),
+        ))
+
+    if multimodal_service is not None:
         registry.register(ToolSpec(
             name="vision.inspect_image", category="vision",
             description="校验并检查本地图片，可选执行 OCR；只读源文件，结果不包含 Base64。",

@@ -28,6 +28,10 @@ class ToolNames:
     SHELL_EXECUTE_COMMAND = "shell.execute_command"
     CODE_EXECUTE_PYTHON = "code.execute_python"
     VISION_ANSWER_ATTACHMENTS = "vision.answer_attachments"
+    MEMORY_REMEMBER_VISUAL = "memory.remember_visual"
+    MEMORY_APPROVE_VISUAL = "memory.approve_visual"
+    MEMORY_SEARCH_VISUAL = "memory.search_visual"
+    ASSETS_DELETE = "assets.delete"
 
 
 SOURCE_TOOLS = frozenset({

@@ -183,6 +183,8 @@ class ContextBuilder:
         result.quality["packet_attribution"] = result.attribution
         result.quality["role_filtered_packets"] = len(role_filtered)
         result.debug_lines.append(f"Role filtered packets: {len(role_filtered)}")
+        result.visual_asset_refs = list(context.visual_asset_refs)
+        result.visual_total_pixels = context.visual_total_pixels
         return result
 
     def gather(
@@ -229,6 +231,10 @@ class ContextBuilder:
             packets.append(packet)
         for item in retrieved_memories:
             content = f"- [{item.memory_type}][{item.scope}][confidence={item.confidence:.2f}] {item.content}"
+            if item.asset_refs:
+                content += " [visual-assets=" + ",".join(item.asset_refs) + "]"
+            if item.evidence_refs:
+                content += " [evidence=" + ",".join(item.evidence_refs[:4]) + "]"
             packets.append(
                 self._packet(
                     "memory",

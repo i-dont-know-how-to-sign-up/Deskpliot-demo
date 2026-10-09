@@ -4,7 +4,7 @@
 
 ## 版本基线
 
-当前代码版本为 `0.9.0`，对比基线为 `0.8.0`。完整基线一次执行全部 `tests/test_*.py` 模块、163 条 DeskPilotBench 离线评测、16 条多模态离线评测，以及按简单/中等/复杂分层的 36 条文本 API 和 3 条 VLM API 用例：
+当前代码版本为 `0.9.0`，对比基线为 `0.8.0`。完整基线一次执行全部 `tests/test_*.py` 模块、163 条 DeskPilotBench 离线评测、22 条多模态离线评测，以及按简单/中等/复杂分层的 36 条文本 API 和 3 条 VLM API 用例：
 
 ```powershell
 D:\broagent\.conda\deskpilot-py311\python.exe -m eval.run_baseline `

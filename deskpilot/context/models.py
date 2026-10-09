@@ -57,3 +57,6 @@ class AssembledContext:
     output_budget: int = 0
     complexity: int = 0
     attribution: list[dict[str, Any]] = field(default_factory=list)
+    # 多模态记忆只向上下文暴露受预算约束的资产引用，不写入路径、二进制或 Base64。
+    visual_asset_refs: list[str] = field(default_factory=list)
+    visual_total_pixels: int = 0

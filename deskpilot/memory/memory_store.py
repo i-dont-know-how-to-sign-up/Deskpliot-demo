@@ -77,6 +77,8 @@ class MemoryStore:
         status: str = "active",
         tags: list[str] | None = None,
         expires_at: str | None = None,
+        asset_refs: list[str] | None = None,
+        evidence_refs: list[str] | None = None,
     ) -> MemoryItem | None:
         content = fix_mojibake(content).strip()
         if not content or self._is_sensitive(content):
@@ -99,6 +101,8 @@ class MemoryStore:
             created_at=now,
             updated_at=now,
             expires_at=expires_at or self.policy.default_expires_at(scope, memory_type, tags),
+            asset_refs=list(dict.fromkeys(asset_refs or [])),
+            evidence_refs=list(dict.fromkeys(evidence_refs or [])),
         )
         item.embedding = self._embed_text(content)
         self._supersede_conflicts(item)
@@ -109,7 +113,8 @@ class MemoryStore:
                     memory_id, scope, memory_type, content, source_session_id,
                     source_message_ids, confidence, status, tags, created_at,
                     updated_at, expires_at, embedding
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    , asset_refs, evidence_refs
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._to_row(item),
             )
@@ -124,6 +129,7 @@ class MemoryStore:
                 "status": item.status,
                 "confidence": item.confidence,
                 "tags": item.tags,
+                "asset_refs": item.asset_refs,
             },
         )
         return item
@@ -227,6 +233,8 @@ class MemoryStore:
                         "status": item.status,
                         "confidence": item.confidence,
                         "tags": item.tags,
+                        "asset_refs": item.asset_refs,
+                        "evidence_refs": item.evidence_refs,
                     },
                 )
             elif status == "deleted":
@@ -240,6 +248,34 @@ class MemoryStore:
         with self._connect() as conn:
             row = conn.execute("select * from memories where memory_id = ?", (memory_id,)).fetchone()
         return self._from_row(row) if row else None
+
+    def memories_referencing_asset(
+        self, asset_id: str, *, statuses: set[str] | None = None,
+    ) -> list[MemoryItem]:
+        """返回引用图片资产的记忆；JSON 解析避免 LIKE 对相近 asset ID 的误命中。"""
+        allowed = statuses or {"active", "pending"}
+        with self._connect() as conn:
+            rows = conn.execute("select * from memories").fetchall()
+        return [
+            item for item in (self._from_row(row) for row in rows)
+            if item.status in allowed and asset_id in item.asset_refs
+        ]
+
+    def search_by_asset_refs(
+        self, asset_ids: list[str], session_id: str | None = None, top_k: int = 5,
+    ) -> list[MemoryItem]:
+        wanted = set(asset_ids)
+        if not wanted:
+            return []
+        candidates = self.list_memories(session_id=session_id, status="active", limit=500)
+        scored: list[tuple[int, MemoryItem]] = []
+        for item in candidates:
+            overlap = len(wanted.intersection(item.asset_refs))
+            if overlap and not self._is_expired_or_inactive(item):
+                item.retrieval_score = min(1.0, 0.65 + overlap * 0.15)
+                scored.append((overlap, item))
+        scored.sort(key=lambda pair: (pair[0], pair[1].updated_at), reverse=True)
+        return [item for _, item in scored[:max(1, top_k)]]
 
     def stats(self) -> dict[str, int | str]:
         with self._connect() as conn:
@@ -283,6 +319,11 @@ class MemoryStore:
             )
             conn.execute("create index if not exists idx_memories_status on memories(status)")
             conn.execute("create index if not exists idx_memories_session on memories(source_session_id)")
+            columns = {str(row["name"]) for row in conn.execute("pragma table_info(memories)").fetchall()}
+            if "asset_refs" not in columns:
+                conn.execute("alter table memories add column asset_refs text not null default '[]'")
+            if "evidence_refs" not in columns:
+                conn.execute("alter table memories add column evidence_refs text not null default '[]'")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -308,6 +349,8 @@ class MemoryStore:
             item.updated_at,
             item.expires_at,
             json.dumps(item.embedding),
+            json.dumps(item.asset_refs, ensure_ascii=False),
+            json.dumps(item.evidence_refs, ensure_ascii=False),
         )
 
     def _from_row(self, row: sqlite3.Row) -> MemoryItem:
@@ -325,6 +368,8 @@ class MemoryStore:
             updated_at=row["updated_at"],
             expires_at=row["expires_at"],
             embedding=json.loads(row["embedding"] or "[]"),
+            asset_refs=json.loads(row["asset_refs"] or "[]") if "asset_refs" in row.keys() else [],
+            evidence_refs=json.loads(row["evidence_refs"] or "[]") if "evidence_refs" in row.keys() else [],
         )
 
     def _is_expired_or_inactive(self, item: MemoryItem) -> bool:

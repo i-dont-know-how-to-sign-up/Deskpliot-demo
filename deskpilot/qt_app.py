@@ -220,9 +220,12 @@ class DeskPilotBridge(QObject):
             {
                 "role": item.role, "content": item.content,
                 "attachments": [
-                    view for asset_id in item.metadata.get("attachment_ids", [])
+                    view for asset_id in (
+                        item.attachment_ids
+                        or (item.metadata.get("attachment_ids", []) if isinstance(item.metadata, dict) else [])
+                    )
                     if (view := self.agent.multimodal.attachment_view(str(asset_id))) is not None
-                ] if isinstance(item.metadata, dict) else [],
+                ],
             }
             for item in messages
         ]

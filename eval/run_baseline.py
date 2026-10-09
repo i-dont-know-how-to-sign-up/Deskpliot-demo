@@ -48,6 +48,7 @@ SUBSET_NAMES = {
     "Multimodal-Safety": "多模态安全",
     "Multimodal-RAG": "多模态检索",
     "Multimodal-QA": "多模态问答",
+    "Multimodal-Memory": "多模态记忆",
 }
 
 

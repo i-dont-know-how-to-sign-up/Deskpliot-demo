@@ -114,7 +114,10 @@ class SessionStore:
         output_path.write_text("\n".join(lines), encoding="utf-8")
         return output_path
 
-    def append_message(self, session_id: str, role: str, content: str, metadata: dict | None = None) -> SessionMessage:
+    def append_message(
+        self, session_id: str, role: str, content: str, metadata: dict | None = None,
+        attachment_ids: list[str] | None = None,
+    ) -> SessionMessage:
         info = self.get_or_create(session_id)
         message = SessionMessage(
             message_id=f"msg_{uuid.uuid4().hex}",
@@ -122,6 +125,7 @@ class SessionStore:
             role=role,
             content=_redact_value(fix_mojibake(content), max_text=12000),
             metadata=_redact_value(metadata or {}),
+            attachment_ids=list(dict.fromkeys(str(item) for item in (attachment_ids or []) if str(item))),
         )
         self._append_jsonl(self._session_dir(info.session_id) / "messages.jsonl", message.to_dict())
         self._touch_session(info.session_id, content if role == "user" else None)

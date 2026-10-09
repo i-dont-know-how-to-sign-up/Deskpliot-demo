@@ -31,7 +31,7 @@ def test_v090_multimodal_api_suite_has_three_difficulties() -> None:
     )
     rows = {item["id"]: item for item in load_multimodal_cases()}
 
-    assert len(rows) == 16
+    assert len(rows) == 22
     assert [rows[case_id]["difficulty"] for case_id in suite["case_ids"]] == [
         "simple", "medium", "complex",
     ]
