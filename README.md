@@ -1,6 +1,6 @@
 # DeskPilot
 
-> 当前版本：`0.8.1`
+> 当前版本：`0.9.0`
 
 DeskPilot 是一个本地优先、面向个人办公场景的桌面 Agent。它将本地文档 RAG、会话记忆、网页调研、邮件处理、文件与终端工具、权限控制和多智能体编排整合到一个 PySide6 + Qt Quick 桌面应用中。
 
@@ -108,12 +108,16 @@ DeskPilot 是一个本地优先、面向个人办公场景的桌面 Agent。它�
 - 多模态入库按图片 SHA-256 和向量空间幂等复用；重复导入不会再次运行 OCR 或视觉编码。
 - 纯文本多模态问答使用 `knowledge.answer_multimodal` 完成检索和 VLM 综合；原始证据审计与以图搜图使用 `knowledge.search_multimodal`。
 - OCR 与视觉向量是独立入库通道：本地视觉模型资源不足时保留可用 OCR 索引，并返回明确的降级状态。
+- 长 PDF 的 OCR 和视觉编码按整批任务启动一次模型 worker，再在 worker 内按上限分批推理，避免逐页重复加载模型。
+- OCR 文本在配置 Embedding API 时使用真实语义向量；无 API 时明确降级为版本化的本地 hash fallback，不将其标记为语义检索。
+- 剪贴板和截图默认视为敏感图片，云端 VLM 调用按 `block|confirm|allow` 策略处理；默认在聊天内单次确认。
+- 多模态 SQLite 启用 WAL 与 busy timeout；删除资产时同步清理原图、缩略图、OCR chunk 和向量。
 
 云端图片上传默认关闭。使用前必须配置视觉模型并显式设置 `ALLOW_CLOUD_IMAGE_UPLOAD=true`。
 
 实现入口：`deskpilot/multimodal/`。
 
-多模态索引采用独立 SQLite catalog，图片二进制存放在受控资产目录，数据库只保存元数据、OCR chunk 和向量。检索结果记录 `ocr_lexical`、`ocr_dense`、`vision_text`、`vision_image` 通道，文字问答存在可靠 OCR 字面命中时会过滤仅由弱视觉相似度召回的无关页面。
+多模态索引采用独立 SQLite catalog，图片二进制存放在受控资产目录，数据库只保存元数据、OCR chunk 和向量。检索结果记录 `ocr_lexical`、`ocr_semantic`（或 `ocr_dense_fallback`）、`vision_text`、`vision_image` 通道，文字问答存在可靠 OCR 字面命中时会过滤仅由弱视觉相似度召回的无关页面。
 
 ### 邮件 MCP
 
@@ -178,7 +182,7 @@ DeskPilot 内部 Tool Registry 直接复用邮件 MCP 业务层，因此启动�
 | 记忆存储 | JSONL、SQLite、可选 Chroma |
 | 浏览器 | Playwright，可复用 Chrome/Chromium |
 | 邮件 | IMAP、SMTP、可选 MCP stdio Server |
-| 测试与评测 | Python 回归脚本、160 条 DeskPilotBench、RAG P0/P1/P2 检索评测、GitHub Actions CI |
+| 测试与评测 | Python 回归脚本、163 条 DeskPilotBench、16 条多模态专项集、分级真实 API 套件、GitHub Actions CI |
 
 当前核心实现没有引入 LangChain、LlamaIndex 或 LangGraph，以便直接观察路由、检索、上下文和 Agent Loop 的内部行为。
 
@@ -326,6 +330,7 @@ VISION_MODEL=qwen3.8-omni-flash
 VISION_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 VISION_API_KEY=
 ALLOW_CLOUD_IMAGE_UPLOAD=false
+SENSITIVE_IMAGE_POLICY=confirm
 
 OCR_PROVIDER=paddleocr
 OCR_DETECTION_MODEL=PP-OCRv5_mobile_det
@@ -338,14 +343,17 @@ OCR_ISOLATED_PROCESS=true
 IMAGE_EMBEDDING_PROVIDER=siglip2
 IMAGE_EMBEDDING_MODEL=google/siglip2-base-patch16-224
 IMAGE_EMBEDDING_ISOLATED_PROCESS=true
+IMAGE_EMBEDDING_BATCH_SIZE=8
 IMAGE_EMBEDDING_MIN_AVAILABLE_COMMIT_GB=5
 MULTIMODAL_RETRY_MISSING_VISION=false
 ```
 
 - 云端发送图片必须显式启用 `ALLOW_CLOUD_IMAGE_UPLOAD=true`；图片 Base64 只存在于请求体，不写入会话和日志。
+- `SENSITIVE_IMAGE_POLICY=confirm` 为默认值。剪贴板/截图发送云端前在聊天内创建一次性审批；`block` 完全禁止敏感图上云，`allow` 仅适合可信环境。
 - Windows 下 PaddleOCR 默认使用单线程并关闭文字方向分类，降低原生访问冲突和冷启动成本；需要旋转文字识别时可显式开启方向分类。
-- OCR 和 SigLIP2 默认使用短生命周期子进程，避免 Paddle/Torch 与 Qt 主进程叠加占用提交内存。
+- OCR 和 SigLIP2 默认使用短生命周期子进程，避免 Paddle/Torch 与 Qt 主进程叠加占用提交内存。PDF 页图采用一次 worker 调用和受限批大小，避免逐页冷启动。
 - SigLIP2 启动前检查 Windows 可用提交内存；不足时跳过视觉向量但保留 OCR 索引。增大页面文件后，将 `MULTIMODAL_RETRY_MISSING_VISION=true` 并重新导入可补齐向量。
+- OCR 文本复用主 RAG 的 Embedding API；未配置 API 时使用 `text/local-hash-v1` fallback，并在检索 trace 中标记为 `ocr_dense_fallback`。
 - 首次导入必须运行本地 OCR，耗时取决于图片文字量和 CPU；相同图片再次导入直接复用索引。当前测试机完整 Qt Bridge 冷启动约 1 秒，已完整索引图片的重复导入约 0.05 秒，该数据仅作为相对性能参考。
 
 ### 网页搜索配置
@@ -447,18 +455,19 @@ DeskPilotBench 离线模式不会调用真实模型、网页或邮箱：
 .\.conda\deskpilot-py311\python.exe -m eval.run_eval --count 20 --mode offline
 ```
 
-生成当前版本的完整可复现基线（31 个测试模块、160 条离线评测和精选真实 API 套件）：
+生成当前版本的完整可复现基线（34 个测试模块、163 条离线评测、16 条多模态离线评测、36 条分级文本 API 用例和 3 条分级 VLM API 用例）：
 
 ```powershell
 .\.conda\deskpilot-py311\python.exe -m eval.run_baseline `
-  --project-version 0.8.1 `
-  --api-suite baseline_api_v0.8.0 `
+  --project-version 0.9.0 `
+  --api-suite baseline_api_v0.9.0 `
+  --multimodal-api-suite baseline_multimodal_api_v0.9.0 `
   --compare-baseline D:\broagent\eval\baselines\deskpilot_baseline_v0.8.0_20261006T191333+0800 `
-  --change-summary "完成P1基线整改与复杂任务Runtime统一" `
-  --change-summary "完成P1.5调用归因与P2质量性能闭环"
+  --change-summary "完成P0执行安全与敏感图片上云审批" `
+  --change-summary "完成P1 Router单调用、多模态批处理、语义OCR向量、WAL与VLM流式"
 ```
 
-完整基线会消耗真实 LLM/Embedding API 配额，且强制禁用本地 fallback。报告按版本和带时区时间戳写入 `eval/baselines/`，该目录包含模型输出和本机运行信息，已从 Git 排除。
+完整基线会消耗真实 LLM、Embedding 和 VLM API 配额，且强制禁用本地 fallback。运行前还需设置 `ALLOW_CLOUD_IMAGE_UPLOAD=true`。报告按版本和带时区时间戳写入 `eval/baselines/`，该目录包含模型输出和本机运行信息，已从 Git 排除。
 
 使用真实模型 API 或运行单例：
 
@@ -479,12 +488,12 @@ RAG 检索层消融：
 
 ```powershell
 .\.conda\deskpilot-py311\python.exe -m pytest tests\test_multimodal_p0_p1.py -q
-.\.conda\deskpilot-py311\python.exe -m eval.run_multimodal_eval --mode offline --count 12
+.\.conda\deskpilot-py311\python.exe -m eval.run_multimodal_eval --mode offline --count 16 --report eval\reports\multimodal_v0.9.0_offline.md
 # 需要配置视觉 API，并明确允许上传测试图片
-.\.conda\deskpilot-py311\python.exe -m eval.run_multimodal_eval --mode api --count 12
+.\.conda\deskpilot-py311\python.exe -m eval.run_multimodal_eval --mode api --suite baseline_multimodal_api_v0.9.0 --report eval\reports\multimodal_v0.9.0_api.md
 ```
 
-GitHub Actions 使用 Python 3.11 安装 `requirements.txt`，执行完整 `pytest` 回归、160 条可移植数据集的数量/唯一 ID 校验，以及一组确定性离线 smoke 用例。全量 160 条离线评测用于能力基线和版本对比，其中包含 API 专用跳过项及当前未满分用例，不作为零失败 CI 门禁。`eval/dataset/*.jsonl` 及其小型合成 fixture 是版本化测试输入，必须提交；`eval/reports/`、`eval/runs/`、本地论文和个人图片不提交。
+GitHub Actions 使用 Python 3.11 安装 `requirements.txt`，执行完整 `pytest` 回归、163 条可移植主数据集的数量/唯一 ID 校验，以及一组确定性离线 smoke 用例。全量离线评测用于能力基线和版本对比，其中包含 API 专用跳过项及当前未满分用例，不作为零失败 CI 门禁。`eval/dataset/*.jsonl` 及其小型合成 fixture 是版本化测试输入，必须提交；`eval/reports/`、`eval/runs/`、本地论文和个人图片不提交。
 
 评测报告默认写入 `eval/reports/`，逐用例明细写入 `eval/runs/`。报告和运行结果属于生成产物，不应提交。
 
@@ -499,7 +508,7 @@ GitHub Actions 使用 Python 3.11 安装 `requirements.txt`，执行完整 `pyte
 
 ## 当前局限
 
-- 多模态 P0/P1 已支持图片问答和小型知识库精确扫描；图片长期记忆、Office 内嵌图、后台批处理和 ANN 尚未完成。
+- 多模态 P0/P1 已支持图片问答、小型知识库精确扫描和单任务内批处理；图片长期记忆、Office 内嵌图、后台任务队列和 ANN 尚未完成。
 - 默认 `basic` 图片向量只适合离线图搜图验证；可靠文本搜图需要启用 SigLIP2，中文截图检索需要启用 PaddleOCR。
 - PaddleOCR/SigLIP2 的首次本地推理存在模型冷启动和内存成本；低页面文件环境会自动保留 OCR 通道并降级视觉向量。
 - 当前精确 Dense 扫描适合个人小型知识库，文档规模增大后性能会下降。
@@ -509,14 +518,14 @@ GitHub Actions 使用 Python 3.11 安装 `requirements.txt`，执行完整 `pyte
 - 邮箱目前一次只加载一个账号，Outlook OAuth、多账号隔离和账号切换尚未完成。
 - 多智能体目前主要覆盖结构化规划和工具协作，Reflection Agent 尚未正式启用。
 - Python 静态策略只能阻断明显危险语法，不能替代进程、账号或容器级沙箱。
-- 文本模型回答已支持 OpenAI-compatible SSE；视觉回答当前仍采用完整响应返回。
+- 文本与视觉模型回答均支持 OpenAI-compatible SSE；经人工审批后重放的敏感图片调用当前仍以完整结果返回。
 - 本地 fallback 只能提供基础检索摘要，不能替代真实 LLM 的综合推理。
 - 当前没有 SFT、RLHF/DPO、Agentic RL 训练、vLLM 推理优化或端侧模型部署。
 
 ## 后续工作
 
 - RAG：校准各 reranker 阈值，使用真实中英文 Cross-Encoder 做消融，并在知识库规模增长后接入成熟 ANN Provider。
-- 多模态：继续完成视觉记忆、Office 内嵌图、敏感图片 Gate、后台批处理和端侧 VLM。
+- 多模态：继续完成视觉记忆、Office 内嵌图、后台任务队列、ANN 和端侧 VLM。
 - Agent：按任务质量要求启用 Reflection，并完善失败恢复、预算和人工接管。
 - 邮件：多账号、OAuth、模板管理、附件策略和更完整的邮箱文件夹兼容。
 - UI：服务端原生流式输出、更清晰的计划图和工具审批历史。

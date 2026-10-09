@@ -49,7 +49,7 @@ jobs:
       - name: Run offline regression tests
         run: python -m pytest tests -q
       - name: Validate portable evaluation dataset
-        run: python -c "from eval.run_eval import load_cases, DATASET; rows=load_cases(DATASET); assert len(rows)==160; assert len(rows)==len({r['id'] for r in rows}); print(f'validated {len(rows)} cases')"
+        run: python -c "from eval.run_eval import load_cases, DATASET; rows=load_cases(DATASET); assert len(rows)==163; assert len(rows)==len({r['id'] for r in rows}); print(f'validated {len(rows)} cases')"
       - name: Run deterministic offline evaluation smoke suite
         run: >-
           python -m eval.run_eval --mode offline

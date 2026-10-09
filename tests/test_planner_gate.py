@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -98,6 +99,76 @@ def test_router_understands_planning_decision() -> None:
     assert decision.needs_workspace_files is True
 
 
+def test_router_parses_plan_contract_and_reflection_policy() -> None:
+    router = IntentRouter.__new__(IntentRouter)
+    decision = router._parse_response(
+        '{"mode":"plan_task","required_tools":["web.search","files.write_file"],'
+        '"requires_file_output":true,"requires_reflection":true}',
+    )
+    assert decision is not None
+    assert decision.required_tools == ["web.search", "files.write_file"]
+    assert decision.requires_reflection is True
+
+
+def test_router_repairs_reflection_protocol_contradiction() -> None:
+    response = (
+        '{"mode":"direct_answer","reason":"需要最终事实检查",'
+        '"direct_response":"该任务应设置 requires_reflection=true",'
+        '"requires_reflection":false}'
+    )
+    router = IntentRouter(SimpleNamespace(chat=lambda *args, **kwargs: response))
+
+    decision = router.route("核查高可靠调研结果", [])
+
+    assert decision.mode == "plan_task"
+    assert decision.requires_reflection is True
+    assert decision.direct_response == ""
+
+
+def test_simple_web_plan_has_executable_adapter() -> None:
+    decision = IntentDecision(mode="plan_task", explicit_web_retrieval=True)
+    preview = {"steps": [
+        {"id": "knowledge", "allowed_tools": ["web.research"],
+         "arguments": {"topic": "Agent 框架对比"}},
+        {"id": "communication", "allowed_tools": []},
+    ]}
+    request = DocumentQAAgent._planned_simple_web_request("调研 Agent 框架", preview, decision)
+    assert request == {"tool": "web.research", "query": "Agent 框架对比"}
+
+
+def test_simple_web_plan_accepts_optional_page_reader() -> None:
+    decision = IntentDecision(mode="plan_task", explicit_web_retrieval=True)
+    preview = {"steps": [
+        {"id": "research", "allowed_tools": ["web.research"],
+         "arguments": {"topic": "Agent 框架对比"}},
+        {"id": "read", "allowed_tools": ["web.read_page"], "depends_on": ["research"]},
+        {"id": "synthesize", "allowed_tools": [], "depends_on": ["read"]},
+    ]}
+
+    request = DocumentQAAgent._planned_simple_web_request("调研 Agent 框架", preview, decision)
+
+    assert request == {"tool": "web.research", "query": "Agent 框架对比"}
+
+
+def test_cross_document_chinese_fields_produce_routing_hints() -> None:
+    with tempfile.TemporaryDirectory() as folder:
+        root = Path(folder)
+        index = DocumentIndex(root / "index.json")
+        docs = [
+            Document("project", "project.txt", "project.txt", "txt", "负责人：李明"),
+            Document("memory", "memory.md", "memory.md", "md", "记忆包含 fact、preference 类型。"),
+        ]
+        chunks = [
+            Chunk("project_1", "project", docs[0].content, "project.txt#chunk-1", 1),
+            Chunk("memory_1", "memory", docs[1].content, "memory.md#记忆", 1),
+        ]
+        index.documents = {item.doc_id: item for item in docs}
+        index.chunks = {item.chunk_id: item for item in chunks}
+        hints = index.retrieval_hint("负责人和记忆类型分别来自哪份文档？")
+        assert {item["doc_id"] for item in hints} == {"project", "memory"}
+        assert IntentRouter._has_strong_multi_entity_index_match(hints) is True
+
+
 def test_complex_email_plan_does_not_list_files() -> None:
     with tempfile.TemporaryDirectory() as folder:
         agent = DocumentQAAgent(DocumentIndex(Path(folder) / "index.json"))
@@ -174,7 +245,6 @@ def test_readonly_index_summary_recovers_from_non_executable_plan() -> None:
         hint = [{"doc_id": "aurora", "strong_match": True}]
         with patch.object(agent.memory_store, "search", return_value=[]), patch.object(
             agent.intent_router, "route", return_value=decision
-        ), patch.object(agent.intent_router, "requires_output_file", return_value=False
         ), patch.object(agent.index, "retrieval_hint", return_value=hint), patch.object(
             agent, "plan_task", return_value=preview
         ), patch.object(agent, "_answer_rag_request", return_value="recovered") as rag:

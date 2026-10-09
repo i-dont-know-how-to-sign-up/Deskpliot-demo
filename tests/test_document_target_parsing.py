@@ -43,8 +43,20 @@ def test_report_filename_is_not_polluted_by_action_description() -> None:
     assert agent._normalize_file_write_target(raw) == "技术报告.md"
 
 
+def test_save_to_phrase_is_recognized_as_file_output() -> None:
+    agent = DocumentQAAgent.__new__(DocumentQAAgent)
+
+    request = agent._extract_file_write_request(
+        "搜索上海明天的天气，并保存到当前目录的上海天气.md。"
+    )
+
+    assert request is not None
+    assert request["path"] == "上海天气.md"
+
+
 if __name__ == "__main__":
     test_action_prefix_is_removed_from_document_target()
     test_multiple_document_targets_come_from_structured_plan()
     test_report_filename_is_not_polluted_by_action_description()
+    test_save_to_phrase_is_recognized_as_file_output()
     print("document target parsing passed")

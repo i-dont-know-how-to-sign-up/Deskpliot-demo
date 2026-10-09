@@ -216,8 +216,8 @@ def test_router_repairs_single_search_for_file_request() -> None:
     class Client:
         def __init__(self):
             self.responses = iter([
-                '{"mode":"tool_call","tool_name":"knowledge.search","arguments":{"query":"多模态论文"}}',
-                '{"requires_file_output":true}',
+                '{"mode":"tool_call","tool_name":"knowledge.search",'
+                '"arguments":{"query":"多模态论文"},"requires_file_output":true}'
             ])
 
         def chat(self, messages, temperature=0):
@@ -231,13 +231,15 @@ def test_router_repairs_single_search_for_file_request() -> None:
     assert decision.needs_index_catalog and decision.requires_file_output
 
 
-def test_output_requirement_accepts_fenced_json() -> None:
+def test_router_accepts_fenced_json_with_output_requirement() -> None:
     from deskpilot.intent.router import IntentRouter
     class Client:
         def chat(self, messages, temperature=0):
-            return '```json\n{"requires_file_output":true}\n```'
+            return '```json\n{"mode":"direct_answer","requires_file_output":true}\n```'
 
-    assert IntentRouter(Client()).requires_output_file("将报告保存到当前目录")
+    decision = IntentRouter(Client()).route("将报告保存到当前目录", [])
+    assert decision.mode == "plan_task"
+    assert decision.requires_file_output is True
 
 
 def test_missing_commit_is_repaired_instead_of_returning_five_rag_chunks() -> None:
@@ -277,9 +279,8 @@ def test_answer_recovers_search_only_route_and_saves_report() -> None:
         def chat(messages, **kwargs):
             role = messages[0]["content"]
             if "intent router" in role:
-                return '{"mode":"tool_call","tool_name":"knowledge.search","arguments":{"query":"multimodal papers"}}'
-            if "文件产物校验器" in role:
-                return '{"requires_file_output":true}'
+                return ('{"mode":"tool_call","tool_name":"knowledge.search",'
+                        '"arguments":{"query":"multimodal papers"},"requires_file_output":true}')
             if "任务规划器" in role:
                 return ('{"goal":"report","route":"single_agent","complexity_score":4,"steps":['
                         '{"step_id":"knowledge","agent":"knowledge","allowed_tools":["knowledge.search"],'

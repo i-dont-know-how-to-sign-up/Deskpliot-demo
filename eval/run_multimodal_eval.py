@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import platform
 import statistics
+import subprocess
 import tempfile
 import time
 from datetime import datetime
@@ -19,9 +22,12 @@ from deskpilot.multimodal.providers.ocr import OCRRegion
 from deskpilot.multimodal.retriever import MultimodalRetriever
 from deskpilot.multimodal.service import MultimodalService
 from deskpilot.multimodal.vector_store import MultimodalVectorStore
+from deskpilot.core.api_clients import local_hash_embedding
+from deskpilot import __version__
 
 
 DATASET = Path(__file__).parent / "dataset" / "multimodal_cases.jsonl"
+SUITES_DIR = Path(__file__).parent / "suites"
 
 
 class FixtureOCR:
@@ -52,9 +58,37 @@ class FixtureVision:
         return [[1.0, 0.0] if "ATLAS" in text.upper() else [0.0, 1.0] for text in texts]
 
 
-def load_cases(count: int | None = None) -> list[dict[str, Any]]:
+class FixtureTextEmbedder:
+    semantic = False
+    embedding_space = "text/local-hash-v1"
+    model_id = "deskpilot/local-hash"
+    model_revision = "1"
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return [local_hash_embedding(text) for text in texts]
+
+
+def load_cases(
+    count: int | None = None, case_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
     rows = [json.loads(line) for line in DATASET.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if case_ids:
+        by_id = {str(item["id"]): item for item in rows}
+        missing = [case_id for case_id in case_ids if case_id not in by_id]
+        if missing:
+            raise ValueError(f"Unknown multimodal case IDs: {', '.join(missing)}")
+        rows = [by_id[case_id] for case_id in dict.fromkeys(case_ids)]
     return rows[:count] if count is not None else rows
+
+
+def load_suite(name: str) -> dict[str, Any]:
+    path = SUITES_DIR / f"{name}.json"
+    if not path.is_file():
+        raise ValueError(f"Unknown multimodal evaluation suite: {name}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not isinstance(data.get("case_ids"), list):
+        raise ValueError(f"Invalid multimodal evaluation suite: {path}")
+    return data
 
 
 def make_fixture(path: Path, color: tuple[int, int, int], label: str) -> Path:
@@ -100,10 +134,29 @@ def evaluate_case(case: dict[str, Any], root: Path, atlas: Path, nebula: Path) -
     elif task == "catalog_privacy":
         assets.ingest_file(atlas)
         checks["base64_absent"] = "base64" not in assets.database.read_bytes().decode("latin-1", errors="ignore").casefold()
+    elif task == "clipboard_sensitivity":
+        service = MultimodalService(root)
+        asset = service.add_chat_attachment_bytes(atlas.read_bytes(), "clipboard.png")
+        checks["sensitive"] = asset.sensitivity == "sensitive"
+        checks["confirmation_required"] = service.sensitive_permission([asset])["requires_confirmation"] is True
+    elif task == "sqlite_wal":
+        with assets._connect() as connection:
+            checks["asset_wal"] = connection.execute("PRAGMA journal_mode").fetchone()[0].casefold() == "wal"
+        with vectors._connect() as connection:
+            checks["vector_wal"] = connection.execute("PRAGMA journal_mode").fetchone()[0].casefold() == "wal"
+    elif task == "asset_lifecycle":
+        service = MultimodalService(root)
+        asset = service.add_chat_attachment(atlas)
+        original = Path(asset.original_path)
+        thumbnail = Path(asset.thumbnail_path)
+        checks["deleted"] = service.delete_asset(asset.asset_id)
+        checks["files_removed"] = not original.exists() and not thumbnail.exists()
     else:
+        text = FixtureTextEmbedder()
+        ingestion = MultimodalIngestionService(assets, vectors, FixtureOCR(), vision, text)
         ingestion.ingest_image(atlas)
         ingestion.ingest_image(nebula)
-        retriever = MultimodalRetriever(vectors, assets, vision)
+        retriever = MultimodalRetriever(vectors, assets, vision, text)
         image_query = atlas if task == "image_to_image" else None
         query = case["input"] if task != "image_to_image" else ""
         evidence = retriever.search(query, image_query, top_k=2)
@@ -116,8 +169,11 @@ def evaluate_case(case: dict[str, Any], root: Path, atlas: Path, nebula: Path) -
                 evidence and evidence[0].metadata.get("channel_hits", 0) >= expected["min_channel_hits"]
             )
     return {
-        "id": case["id"], "subset": case["subset"], "status": "passed" if all(checks.values()) else "failed",
+        "case_id": case["id"], "subset": case["subset"],
+        "difficulty": case.get("difficulty", "unspecified"),
+        "status": "passed" if all(checks.values()) else "failed",
         "checks": checks, "latency_ms": round((time.perf_counter() - started) * 1000, 3),
+        "token_usage": {}, "usage_events": [],
     }
 
 
@@ -134,40 +190,81 @@ def evaluate_vlm_case(case: dict[str, Any], root: Path, atlas: Path, nebula: Pat
         "citations": all(value in answer for value in expected.get("citations", [expected.get("citation", "")]) if value),
     }
     return {
-        "id": case["id"], "subset": case["subset"], "status": "passed" if all(checks.values()) else "failed",
+        "case_id": case["id"], "subset": case["subset"],
+        "difficulty": case.get("difficulty", "unspecified"),
+        "status": "passed" if all(checks.values()) else "failed",
         "checks": checks, "answer": answer,
         "latency_ms": round((time.perf_counter() - started) * 1000, 3),
+        "token_usage": dict(service.vision_llm.last_usage),
+        "usage_events": ([{
+            "stage": "Vision Answer",
+            "success": True,
+            "usage_reported": True,
+            **service.vision_llm.last_usage,
+        }] if service.vision_llm.last_usage else []),
     }
 
 
-def write_report(results: list[dict[str, Any]], path: Path, mode: str) -> None:
+def write_report(
+    results: list[dict[str, Any]], path: Path, mode: str, *, version: str, suite: str,
+) -> None:
     completed = [item for item in results if item["status"] != "skipped"]
     passed = [item for item in completed if item["status"] == "passed"]
     latencies = [float(item["latency_ms"]) for item in completed]
     lines = [
-        "# DeskPilot 多模态 P0/P1 评测报告", "",
+        f"# DeskPilot {version} 多模态评测报告", "",
         f"- 时间：{datetime.now().astimezone().isoformat(timespec='seconds')}",
-        f"- 模式：{mode}", f"- 用例数：{len(results)}",
+        f"- 模式：{mode}", f"- 套件：{suite or '未指定'}", f"- 用例数：{len(results)}",
         f"- 完成/跳过：{len(completed)}/{len(results) - len(completed)}",
         f"- 通过率：{len(passed) / max(1, len(completed)):.2%}",
         f"- 平均响应时间：{statistics.mean(latencies) if latencies else 0.0:.2f} ms", "",
-        "| 用例 | 模块 | 状态 | 延迟(ms) |", "|---|---|---:|---:|",
+        "| 用例 | 模块 | 难度 | 状态 | 延迟(ms) | Token |", "|---|---|---|---:|---:|---:|",
     ]
     lines.extend(
-        f"| {item['id']} | {item['subset']} | {item['status']} | {item.get('latency_ms', 0)} |"
+        f"| {item['case_id']} | {item['subset']} | {item.get('difficulty', 'unspecified')} | "
+        f"{item['status']} | {item.get('latency_ms', 0)} | "
+        f"{item.get('token_usage', {}).get('total_tokens', 'N/A')} |"
         for item in results
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def main() -> None:
+def _metadata(args: argparse.Namespace, results: list[dict[str, Any]]) -> dict[str, Any]:
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
+            timeout=5, check=False,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        commit = "unknown"
+    return {
+        "project_version": args.project_version,
+        "mode": args.mode,
+        "suite": args.suite or "",
+        "dataset": str(DATASET),
+        "dataset_sha256": hashlib.sha256(DATASET.read_bytes()).hexdigest(),
+        "python_version": platform.python_version(),
+        "git_commit": commit or "unknown",
+        "result_count": len(results),
+    }
+
+
+def main() -> int:
     parser = argparse.ArgumentParser(description="运行 DeskPilot 多模态 P0/P1 评测。")
     parser.add_argument("--mode", choices=("offline", "api"), default="offline")
     parser.add_argument("--count", type=int, default=None)
+    parser.add_argument("--case-id", action="append")
+    parser.add_argument("--suite")
+    parser.add_argument("--project-version", default=__version__)
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--report", type=Path, default=Path("eval/reports/multimodal_latest.md"))
+    parser.add_argument("--metadata", type=Path)
     args = parser.parse_args()
-    cases = load_cases(args.count)
+    selected_ids = list(args.case_id or [])
+    if args.suite:
+        selected_ids.extend(str(item) for item in load_suite(args.suite)["case_ids"])
+    cases = load_cases(args.count, selected_ids)
     results: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
@@ -177,17 +274,45 @@ def main() -> None:
             print(f"[{index}/{len(cases)}] {case['id']}", flush=True)
             requires_vlm = bool(case.get("runtime", {}).get("requires_vlm"))
             if requires_vlm and args.mode != "api":
-                results.append({"id": case["id"], "subset": case["subset"], "status": "skipped", "latency_ms": 0})
+                results.append({
+                    "case_id": case["id"], "subset": case["subset"],
+                    "difficulty": case.get("difficulty", "unspecified"),
+                    "status": "skipped", "latency_ms": 0,
+                    "token_usage": {}, "usage_events": [],
+                })
                 continue
-            results.append(
-                evaluate_vlm_case(case, root / case["id"], atlas, nebula)
-                if requires_vlm else evaluate_case(case, root / case["id"], atlas, nebula)
-            )
-    write_report(results, args.report, args.mode)
-    failures = sum(item["status"] == "failed" for item in results)
-    print(f"评测完成：通过 {sum(item['status'] == 'passed' for item in results)}，失败 {failures}，报告 {args.report}")
-    raise SystemExit(1 if failures else 0)
+            try:
+                results.append(
+                    evaluate_vlm_case(case, root / case["id"], atlas, nebula)
+                    if requires_vlm else evaluate_case(case, root / case["id"], atlas, nebula)
+                )
+            except Exception as exc:
+                results.append({
+                    "case_id": case["id"], "subset": case["subset"],
+                    "difficulty": case.get("difficulty", "unspecified"),
+                    "status": "error", "error": repr(exc),
+                    "latency_ms": 0, "token_usage": {}, "usage_events": [],
+                })
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            "\n".join(json.dumps(item, ensure_ascii=False) for item in results) + "\n",
+            encoding="utf-8",
+        )
+    write_report(
+        results, args.report, args.mode,
+        version=args.project_version, suite=args.suite or "",
+    )
+    if args.metadata:
+        args.metadata.parent.mkdir(parents=True, exist_ok=True)
+        args.metadata.write_text(
+            json.dumps(_metadata(args, results), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    failures = sum(item["status"] in {"failed", "error"} for item in results)
+    print(f"评测完成：通过 {sum(item['status'] == 'passed' for item in results)}，失败/错误 {failures}，报告 {args.report}")
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

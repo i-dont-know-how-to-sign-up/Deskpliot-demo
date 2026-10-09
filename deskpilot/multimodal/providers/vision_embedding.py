@@ -91,11 +91,18 @@ class SigLIP2EmbeddingProvider:
     def _embed_images_in_process(self, paths: list[Path]) -> list[list[float]]:
         model, processor = self._load()
         import torch
-        images = [Image.open(path).convert("RGB") for path in paths]
-        inputs = processor(images=images, return_tensors="pt")
-        with torch.inference_mode():
-            values = model.get_image_features(**inputs)
-        return self._normalize(values)
+        batch_size = max(1, min(int(os.getenv("IMAGE_EMBEDDING_BATCH_SIZE", "8")), 64))
+        result: list[list[float]] = []
+        for start in range(0, len(paths), batch_size):
+            images = []
+            for path in paths[start:start + batch_size]:
+                with Image.open(path) as opened:
+                    images.append(opened.convert("RGB"))
+            inputs = processor(images=images, return_tensors="pt")
+            with torch.inference_mode():
+                values = model.get_image_features(**inputs)
+            result.extend(self._normalize(values))
+        return result
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         if self._use_isolated_process():
@@ -105,10 +112,14 @@ class SigLIP2EmbeddingProvider:
     def _embed_texts_in_process(self, texts: list[str]) -> list[list[float]]:
         model, processor = self._load()
         import torch
-        inputs = processor(text=texts, padding=True, return_tensors="pt")
-        with torch.inference_mode():
-            values = model.get_text_features(**inputs)
-        return self._normalize(values)
+        batch_size = max(1, min(int(os.getenv("IMAGE_EMBEDDING_BATCH_SIZE", "8")), 64))
+        result: list[list[float]] = []
+        for start in range(0, len(texts), batch_size):
+            inputs = processor(text=texts[start:start + batch_size], padding=True, return_tensors="pt")
+            with torch.inference_mode():
+                values = model.get_text_features(**inputs)
+            result.extend(self._normalize(values))
+        return result
 
     @staticmethod
     def _use_isolated_process() -> bool:

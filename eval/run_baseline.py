@@ -28,6 +28,8 @@ from eval.run_eval import (
     aggregate_stage_usage,
     load_cases,
 )
+from eval.run_multimodal_eval import DATASET as MULTIMODAL_DATASET, load_cases as load_multimodal_cases
+from eval.api_health import run_api_preflight
 
 
 SUBSET_NAMES = {
@@ -43,6 +45,9 @@ SUBSET_NAMES = {
     "Composite-Workflow": "复合操作",
     "Safety-Permission": "安全权限",
     "Recovery": "故障恢复",
+    "Multimodal-Safety": "多模态安全",
+    "Multimodal-RAG": "多模态检索",
+    "Multimodal-QA": "多模态问答",
 }
 
 
@@ -138,7 +143,7 @@ def _comparison_lines(
     current_results: list[dict[str, Any]], previous_results: list[dict[str, Any]], previous_path: Path,
 ) -> list[str]:
     lines = [
-        "", "## 7. 相对上一基线的差值", "", f"- 对比基线：`{previous_path}`", "",
+        "", "## 8. 相对上一基线的差值", "", f"- 对比基线：`{previous_path}`", "",
         "| 范围 | Accuracy Δ | P95 Δ | API 调用 Δ | 输入 Token Δ | 输出 Token Δ | 总 Token Δ |",
         "|---|---:|---:|---:|---:|---:|---:|",
     ]
@@ -169,7 +174,10 @@ def _render_baseline_report(
     test_results: list[dict[str, Any]],
     offline_results: list[dict[str, Any]],
     api_results: list[dict[str, Any]],
+    multimodal_offline_results: list[dict[str, Any]],
+    multimodal_api_results: list[dict[str, Any]],
     api_suite: str,
+    multimodal_api_suite: str,
     commands: list[list[str]],
     previous_results: list[dict[str, Any]] | None = None,
     previous_path: Path | None = None,
@@ -178,7 +186,11 @@ def _render_baseline_report(
     config = load_config()
     offline = aggregate_results(offline_results)
     api = aggregate_results(api_results)
-    combined_results = offline_results + api_results
+    multimodal_offline = aggregate_results(multimodal_offline_results)
+    multimodal_api = aggregate_results(multimodal_api_results)
+    combined_results = (
+        offline_results + api_results + multimodal_offline_results + multimodal_api_results
+    )
     combined = aggregate_results(combined_results)
     tests_passed = sum(item["status"] == "passed" for item in test_results)
     tests_collected = sum(int(item.get("collected_tests", 0)) for item in test_results)
@@ -201,6 +213,7 @@ def _render_baseline_report(
         f"- Embedding：`{config.embedding_model}`",
         f"- 数据集 SHA-256：`{_dataset_sha256(DATASET)}`",
         f"- 精选 API 套件：`{api_suite}`",
+        f"- 多模态 API 套件：`{multimodal_api_suite}`",
         "- 真实 API 本地 fallback：禁用（API 或 Embedding 失败将记为错误）",
         "- 本版本修改：",
         *[f"  - {item}" for item in changes],
@@ -212,6 +225,8 @@ def _render_baseline_report(
         f"| Python 测试模块 | {len(test_results)} | {len(test_results)} | {tests_passed} | {len(test_results) - tests_passed} | 0 | 0 |",
         f"| 离线评测 | {offline['requested']} | {offline['executed']} | {offline['passed']} | {offline['failed']} | {offline['errors']} | {offline['skipped']} |",
         f"| 精选真实 API 评测 | {api['requested']} | {api['executed']} | {api['passed']} | {api['failed']} | {api['errors']} | {api['skipped']} |",
+        f"| 多模态离线评测 | {multimodal_offline['requested']} | {multimodal_offline['executed']} | {multimodal_offline['passed']} | {multimodal_offline['failed']} | {multimodal_offline['errors']} | {multimodal_offline['skipped']} |",
+        f"| 多模态真实 API 评测 | {multimodal_api['requested']} | {multimodal_api['executed']} | {multimodal_api['passed']} | {multimodal_api['failed']} | {multimodal_api['errors']} | {multimodal_api['skipped']} |",
         "",
         f"> 测试模块累计耗时为 {test_seconds:.1f} 秒。离线模式按设计会跳过必须使用 LLM/联网的用例，跳过不等于失败。",
         f"> pytest 共收集 {tests_collected} 条测试，其中通过 {tests_cases_passed} 条；模块通过不再替代真实测试条数。",
@@ -221,7 +236,11 @@ def _render_baseline_report(
         "| 范围 | 执行数 | 累计响应时间 | 平均响应 | P50 | P95 | API 调用 | 输入 Token | 输出 Token | 总 Token |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    for label, stats in (("离线评测", offline), ("真实 API 评测", api), ("评测总计", combined)):
+    for label, stats in (
+        ("离线评测", offline), ("真实 API 评测", api),
+        ("多模态离线", multimodal_offline), ("多模态真实 API", multimodal_api),
+        ("评测总计", combined),
+    ):
         prompt = str(stats["prompt_tokens"]) if stats["reported_calls"] else "不适用"
         completion = str(stats["completion_tokens"]) if stats["reported_calls"] else "不适用"
         total = str(stats["total_tokens"]) if stats["reported_calls"] else "不适用"
@@ -250,10 +269,26 @@ def _render_baseline_report(
             f"{_format_ms(stats['latency_p50_ms'])} | {_format_ms(stats['latency_p95_ms'])} | "
             f"{stats['reported_calls']} | {prompt} | {completion} | {total} |"
         )
+    lines.extend([
+        "", "## 5. 分难度统计", "",
+        "| 难度 | 执行数 | 通过率 | 平均响应 | P95 | 总 Token |",
+        "|---|---:|---:|---:|---:|---:|",
+    ])
+    for difficulty in sorted({str(item.get("difficulty", "unspecified")) for item in combined_results}):
+        selected = [
+            item for item in combined_results
+            if str(item.get("difficulty", "unspecified")) == difficulty
+        ]
+        stats = aggregate_results(selected)
+        total = str(stats["total_tokens"]) if stats["reported_calls"] else "不适用"
+        lines.append(
+            f"| {difficulty} | {stats['executed']} | {stats['accuracy']:.4f} | "
+            f"{_format_ms(stats['latency_mean_ms'])} | {_format_ms(stats['latency_p95_ms'])} | {total} |"
+        )
     stage_stats = aggregate_stage_usage(combined_results)
     lines.extend([
         "",
-        "## 5. 模型调用阶段归因",
+        "## 6. 模型调用阶段归因",
         "",
         "| 阶段 | 调用数 | Usage 上报 | 错误 | 平均响应 | P50 | P95 | 输入 Token | 输出 Token | 总 Token |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
@@ -269,7 +304,7 @@ def _render_baseline_report(
         )
     lines.extend([
         "",
-        "## 6. 功能模块与调用阶段交叉统计",
+        "## 7. 功能模块与调用阶段交叉统计",
         "",
         "| 模块 | 阶段 | 调用数 | 平均响应 | P95 | 输入 Token | 输出 Token | 总 Token |",
         "|---|---|---:|---:|---:|---:|---:|---:|",
@@ -285,12 +320,12 @@ def _render_baseline_report(
     if previous_results is not None and previous_path is not None:
         lines.extend(_comparison_lines(combined_results, previous_results, previous_path))
     lines.extend([
-        "", "## 8. 测试模块明细", "",
+        "", "## 9. 测试模块明细", "",
         "| 模块 | 状态 | 耗时 |", "|---|---|---:|",
     ])
     for item in test_results:
         lines.append(f"| `{item['module']}` | {item['status']} | {item['duration_seconds']:.3f} s |")
-    lines.extend(["", "## 9. 失败与错误用例", ""])
+    lines.extend(["", "## 10. 失败与错误用例", ""])
     failures = [item for item in combined_results if item.get("status") in {"failed", "error"}]
     if not failures:
         lines.append("本次评测没有失败或运行时错误。")
@@ -302,7 +337,7 @@ def _render_baseline_report(
             )
             if item.get("error"):
                 lines.append(f"  - 错误：{item['error']}")
-    lines.extend(["", "## 10. 复现命令", ""])
+    lines.extend(["", "## 11. 复现命令", ""])
     for command in commands:
         lines.extend(["```powershell", subprocess.list2cmdline(command), "```", ""])
     return "\n".join(lines).rstrip() + "\n"
@@ -311,7 +346,11 @@ def _render_baseline_report(
 def main() -> int:
     parser = argparse.ArgumentParser(description="运行 DeskPilot 完整版本基线。")
     parser.add_argument("--project-version", default=__version__)
-    parser.add_argument("--api-suite", default="baseline_api_v0.8.0")
+    parser.add_argument("--api-suite", default="baseline_api_v0.9.0")
+    parser.add_argument(
+        "--multimodal-api-suite", default="baseline_multimodal_api_v0.9.0",
+        help="固定的真实 VLM API 用例套件。",
+    )
     parser.add_argument(
         "--change-summary", action="append", required=True,
         help="当前版本相对上一基线的修改，可重复传入。首个基线可写‘建立首个规范化基线’。",
@@ -324,16 +363,48 @@ def main() -> int:
     args = parser.parse_args()
     changes = list(args.change_summary)
     suite = _load_suite(args.api_suite)
+    multimodal_suite_path = ROOT / "eval" / "suites" / f"{_safe_name(args.multimodal_api_suite)}.json"
+    if not multimodal_suite_path.is_file():
+        parser.error(f"多模态 API 套件不存在：{multimodal_suite_path}")
+    multimodal_suite = json.loads(multimodal_suite_path.read_text(encoding="utf-8"))
+    if not isinstance(multimodal_suite.get("case_ids"), list):
+        parser.error("多模态 API 套件缺少 case_ids")
     dataset_cases = load_cases(DATASET)
+    multimodal_cases = load_multimodal_cases()
     dataset_ids = {str(case.get("id")) for case in dataset_cases}
     missing_suite_ids = [str(item) for item in suite["case_ids"] if str(item) not in dataset_ids]
     if missing_suite_ids:
         parser.error(f"API 套件包含不存在的用例：{', '.join(missing_suite_ids)}")
+    multimodal_ids = {str(case.get("id")) for case in multimodal_cases}
+    missing_multimodal_ids = [
+        str(item) for item in multimodal_suite["case_ids"] if str(item) not in multimodal_ids
+    ]
+    if missing_multimodal_ids:
+        parser.error(f"多模态 API 套件包含不存在的用例：{', '.join(missing_multimodal_ids)}")
     config = load_config()
     if importlib.util.find_spec("pytest") is None:
         parser.error("完整基线需要 pytest，请先执行 python -m pip install -r requirements.txt。")
     if not config.llm_api_key or not config.embedding_api_key:
         parser.error("完整基线包含真实 API 用例，请先在 .env 配置 LLM 和 Embedding API Key。")
+    vision_key = os.getenv("VISION_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
+    cloud_enabled = os.getenv("ALLOW_CLOUD_IMAGE_UPLOAD", "false").casefold() in {"1", "true", "yes", "on"}
+    if not vision_key or not cloud_enabled:
+        parser.error(
+            "v0.9 基线包含真实多模态 API 用例，请配置 VISION_API_KEY，并设置 "
+            "ALLOW_CLOUD_IMAGE_UPLOAD=true。"
+        )
+
+    print("[baseline] 执行 LLM 与 Embedding API 预检", flush=True)
+    api_preflight = run_api_preflight(config)
+    if not api_preflight.get("ok"):
+        parser.error(
+            "真实 API 预检失败，尚未执行测试模块或能力评测。"
+            f"阶段={api_preflight.get('stage')}；"
+            f"分类={api_preflight.get('category')}；"
+            f"原因={api_preflight.get('error')}；"
+            f"建议={api_preflight.get('guidance')}"
+        )
+    print("[baseline] API 预检通过", flush=True)
 
     started = datetime.now().astimezone()
     timestamp = started.strftime("%Y%m%dT%H%M%S%z")
@@ -380,9 +451,36 @@ def main() -> int:
         env_overrides={"ALLOW_LOCAL_FALLBACK": "false"},
     )
 
+    multimodal_offline_command = [
+        sys.executable, "-m", "eval.run_multimodal_eval", "--mode", "offline",
+        "--count", str(len(multimodal_cases)), "--project-version", args.project_version,
+        "--output", str(output_dir / "multimodal_offline_results.jsonl"),
+        "--report", str(output_dir / "multimodal_offline_report.md"),
+        "--metadata", str(output_dir / "multimodal_offline_metadata.json"),
+    ]
+    print(f"\n[baseline] 运行 {len(multimodal_cases)} 条多模态离线评测", flush=True)
+    multimodal_offline_code, _ = _run_streaming(
+        multimodal_offline_command, output_dir / "multimodal_offline_console.log",
+    )
+
+    multimodal_api_command = [
+        sys.executable, "-m", "eval.run_multimodal_eval", "--mode", "api",
+        "--suite", args.multimodal_api_suite, "--project-version", args.project_version,
+        "--output", str(output_dir / "multimodal_api_results.jsonl"),
+        "--report", str(output_dir / "multimodal_api_report.md"),
+        "--metadata", str(output_dir / "multimodal_api_metadata.json"),
+    ]
+    print("\n[baseline] 运行分级多模态真实 API 评测", flush=True)
+    multimodal_api_code, _ = _run_streaming(
+        multimodal_api_command, output_dir / "multimodal_api_console.log",
+        env_overrides={"ALLOW_LOCAL_FALLBACK": "false"},
+    )
+
     finished = datetime.now().astimezone()
     offline_results = _load_jsonl(output_dir / "offline_results.jsonl")
     api_results = _load_jsonl(output_dir / "api_results.jsonl")
+    multimodal_offline_results = _load_jsonl(output_dir / "multimodal_offline_results.jsonl")
+    multimodal_api_results = _load_jsonl(output_dir / "multimodal_api_results.jsonl")
     previous_results: list[dict[str, Any]] | None = None
     if args.compare_baseline:
         if not args.compare_baseline.is_dir():
@@ -403,8 +501,11 @@ def main() -> int:
             test_results=test_results,
             offline_results=offline_results,
             api_results=api_results,
+            multimodal_offline_results=multimodal_offline_results,
+            multimodal_api_results=multimodal_api_results,
             api_suite=args.api_suite,
-            commands=[offline_command, api_command],
+            multimodal_api_suite=args.multimodal_api_suite,
+            commands=[offline_command, api_command, multimodal_offline_command, multimodal_api_command],
             previous_results=previous_results,
             previous_path=args.compare_baseline,
         ),
@@ -418,10 +519,14 @@ def main() -> int:
         "changes": changes,
         "api_suite": args.api_suite,
         "api_case_ids": [str(item) for item in suite["case_ids"]],
+        "multimodal_api_suite": args.multimodal_api_suite,
+        "multimodal_api_case_ids": [str(item) for item in multimodal_suite["case_ids"]],
         "test_module_count": len(test_results),
         "test_failures": test_failures,
         "offline_returncode": offline_code,
         "api_returncode": api_code,
+        "multimodal_offline_returncode": multimodal_offline_code,
+        "multimodal_api_returncode": multimodal_api_code,
         "report": report_path.name,
         "compare_baseline": str(args.compare_baseline or ""),
     }
@@ -429,7 +534,9 @@ def main() -> int:
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     print(f"\nBaseline report: {report_path}", flush=True)
-    return 0 if test_failures == 0 and offline_code == 0 and api_code == 0 else 1
+    return 0 if all(code == 0 for code in (
+        test_failures, offline_code, api_code, multimodal_offline_code, multimodal_api_code,
+    )) else 1
 
 
 if __name__ == "__main__":

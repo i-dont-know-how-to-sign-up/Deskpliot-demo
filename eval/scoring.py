@@ -20,6 +20,7 @@ def infer_route(result: Any) -> str:
         "planner_agent" in names and (
             {"web_search", "write_file"} <= names
             or {"retrieve_index_collection", "write_report"} <= names
+            or "reflection" in names
         )
     ):
         return "multi_agent"
@@ -108,6 +109,10 @@ def score_case(
         "required_step_ok": not expected.get("must_have_step") or expected["must_have_step"] in names,
         "forbidden_step_ok": not expected.get("must_not_have_step") or expected["must_not_have_step"] not in names,
         "must_include_ok": _has_all(answer, expected.get("must_include", [])),
+        "must_include_any_ok": (
+            not expected.get("must_include_any")
+            or _has_any(answer, expected.get("must_include_any", []))
+        ),
         "must_not_include_ok": not _has_any(answer, expected.get("must_not_include", [])),
         "has_trace": bool(names),
     }
@@ -180,6 +185,7 @@ def score_case(
         checks["required_step_ok"],
         checks["forbidden_step_ok"],
         checks["must_include_ok"],
+        checks["must_include_any_ok"],
         checks["must_not_include_ok"],
         checks["confirmation_ok"],
         checks["has_trace"],
@@ -193,6 +199,7 @@ def score_case(
         ("must_have_step", "required_step_ok"),
         ("must_not_have_step", "forbidden_step_ok"),
         ("must_include", "must_include_ok"),
+        ("must_include_any", "must_include_any_ok"),
         ("must_not_include", "must_not_include_ok"),
         ("requires_confirmation", "confirmation_ok"),
     ):
@@ -227,6 +234,7 @@ def score_case(
         checks[name]
         for field, name in (
             ("must_include", "must_include_ok"),
+            ("must_include_any", "must_include_any_ok"),
             ("must_not_include", "must_not_include_ok"),
         )
         if field in expected
@@ -242,7 +250,12 @@ def score_case(
 
     required_facts = [str(item) for item in expected.get("must_include", [])]
     matched_facts = sum(_has_all(answer, [item]) for item in required_facts)
-    required_fact_recall = matched_facts / len(required_facts) if required_facts else None
+    if required_facts:
+        required_fact_recall = matched_facts / len(required_facts)
+    elif expected.get("must_include_any"):
+        required_fact_recall = float(checks["must_include_any_ok"])
+    else:
+        required_fact_recall = None
     retry_count = sum(str(getattr(item, "status", "")) == "retry" for item in getattr(result, "steps", []))
     failed_step_count = sum(str(getattr(item, "status", "")) == "failed" for item in getattr(result, "steps", []))
     communication_efficiency = task_completion / (1 + retry_count + failed_step_count)
@@ -266,6 +279,14 @@ def score_case(
         "metrics": metrics,
         "answer": answer,
         "steps": names,
+        "step_details": [
+            {
+                "name": str(getattr(item, "name", "")),
+                "status": str(getattr(item, "status", "")),
+                "detail": str(getattr(item, "detail", "")),
+            }
+            for item in getattr(result, "steps", [])
+        ],
         "checks": checks,
         "session_id": str(getattr(result, "session_id", "")),
         "used_llm": bool(getattr(result, "used_llm", False)),

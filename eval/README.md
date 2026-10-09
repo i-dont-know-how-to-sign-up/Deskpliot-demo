@@ -1,19 +1,22 @@
 # DeskPilotBench 评测脚本
 
+真实 API 模式会先执行 LLM 与 Embedding 健康预检。预检失败时，不会把连接、认证、限流或模型配置问题计为 Agent 能力失败；运行途中连续出现 3 个连接或限流错误时会触发熔断，剩余用例记录为 `skipped/api_circuit_open`。仅在调试预检本身时可使用 `--skip-api-preflight`，正式基线不应跳过。
+
 ## 版本基线
 
-当前代码版本为 `0.8.1`，对比基线为 `0.8.0`。完整基线一次执行全部 `tests/test_*.py` 模块、160 条 DeskPilotBench 离线评测，以及 `eval/suites/baseline_api_v0.8.0.json` 中保持不变的精选真实模型 API 用例：
+当前代码版本为 `0.9.0`，对比基线为 `0.8.0`。完整基线一次执行全部 `tests/test_*.py` 模块、163 条 DeskPilotBench 离线评测、16 条多模态离线评测，以及按简单/中等/复杂分层的 36 条文本 API 和 3 条 VLM API 用例：
 
 ```powershell
 D:\broagent\.conda\deskpilot-py311\python.exe -m eval.run_baseline `
-  --project-version 0.8.1 `
-  --api-suite baseline_api_v0.8.0 `
+  --project-version 0.9.0 `
+  --api-suite baseline_api_v0.9.0 `
+  --multimodal-api-suite baseline_multimodal_api_v0.9.0 `
   --compare-baseline D:\broagent\eval\baselines\deskpilot_baseline_v0.8.0_20261006T191333+0800 `
-  --change-summary "完成P1基线整改与复杂任务Runtime统一" `
-  --change-summary "完成P1.5调用归因与P2质量性能闭环"
+  --change-summary "完成P0执行安全与敏感图片上云审批" `
+  --change-summary "完成P1 Router单调用、多模态批处理、语义OCR向量、WAL与VLM流式"
 ```
 
-该命令会真实消耗模型和 Embedding API 配额，但网页资料和邮件副作用使用 fixture/mock，不连接私人邮箱，也不会真的发送邮件。执行前应在 `.env` 中配置可用的 LLM 与 Embedding Key。
+该命令会真实消耗 LLM、Embedding 和 VLM API 配额，但网页资料和邮件副作用使用 fixture/mock，不连接私人邮箱，也不会真的发送邮件。执行前应配置三类模型 Key，并设置 `ALLOW_CLOUD_IMAGE_UPLOAD=true`；VLM 只接收脚本生成的合成测试图片。
 
 首次运行前确认测试依赖已安装：
 
@@ -29,8 +32,10 @@ eval/baselines/deskpilot_baseline_v0.8.0_YYYYMMDDThhmmss+0800/
   manifest.json                                      # 机器可读运行元数据
   test_modules.json                                  # 测试模块结果
   test_logs/                                         # 每个测试模块的原始日志
-  offline_results.jsonl / offline_report.md          # 160 条离线评测
-  api_results.jsonl / api_report.md                  # 精选真实 API 评测
+  offline_results.jsonl / offline_report.md          # 163 条离线评测
+  api_results.jsonl / api_report.md                  # 36 条分级真实文本 API 评测
+  multimodal_offline_results.jsonl / multimodal_offline_report.md
+  multimodal_api_results.jsonl / multimodal_api_report.md  # 3 条分级真实 VLM 评测
   *_metadata.json                                    # 模型、数据集哈希、Git 状态等
   *_console.log                                      # 原始控制台输出
 ```
@@ -42,7 +47,8 @@ eval/baselines/deskpilot_baseline_v0.8.0_YYYYMMDDThhmmss+0800/
 ```powershell
 D:\broagent\.conda\deskpilot-py311\python.exe -m eval.run_baseline `
   --project-version 0.9.0 `
-  --api-suite baseline_api_v0.8.0 `
+  --api-suite baseline_api_v0.9.0 `
+  --multimodal-api-suite baseline_multimodal_api_v0.9.0 `
   --change-summary "将网页写文件工作流迁移到 PlanExecutor" `
   --change-summary "新增持久化 Task Ledger"
 ```
@@ -71,9 +77,9 @@ deskpilotbench_v<版本>_<模式>_<带时区时间戳>.metadata.json
 
 ## 常用命令
 
-运行当前全部 160 条：
+运行当前全部 163 条：
 
-    .\.conda\deskpilot-py311\python.exe -m eval.run_eval --count 160 --mode offline
+    .\.conda\deskpilot-py311\python.exe -m eval.run_eval --count 163 --mode offline
 
 只运行 RAG：
 

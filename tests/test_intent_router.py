@@ -33,8 +33,10 @@ class FakeClient:
         self.response = response
         self.last_error = ""
         self.config = type("Config", (), {"llm_api_key": "fake"})()
+        self.calls = 0
 
     def chat(self, messages: list[dict[str, str]], temperature: float = 0.2) -> str:
+        self.calls += 1
         self.last_error = ""
         return self.response
 
@@ -225,21 +227,22 @@ def test_router_rejects_unrequested_web_search_for_general_knowledge() -> None:
     assert "不依赖实时信息" in decision.reason
 
 
-def test_router_rechecks_false_explicit_web_claim() -> None:
-    router = IntentRouter(FakeClient(
+def test_router_uses_single_structured_decision_for_explicit_web_request() -> None:
+    client = FakeClient(
         '{"mode":"tool_call","reason":"联网补充模型架构","tool_name":"web.search",'
         '"arguments":{"query":"qwenVL workflow"},"missing_slots":[],"confidence":0.9,'
         '"explicit_web_retrieval":true,"requires_fresh_information":false}'
-    ))
+    )
+    router = IntentRouter(client)
     tools = [{
         "name": "web.search",
         "description": "Search the web.",
         "parameters": [{"name": "query", "type": "string", "required": True}],
     }]
-    with patch.object(router, "_verify_web_requirement", return_value=(False, False)):
-        decision = router.route("qwenVL 的工作流程是什么样的？", tools, index_hint=[])
-    assert decision.mode == "direct_answer"
-    assert "不依赖实时信息" in decision.reason
+    decision = router.route("请联网搜索 qwenVL 的工作流程。", tools, index_hint=[])
+    assert decision.mode == "tool_call"
+    assert decision.tool_name == "web.search"
+    assert client.calls == 1
 
 
 def test_router_allows_web_search_for_fresh_information() -> None:

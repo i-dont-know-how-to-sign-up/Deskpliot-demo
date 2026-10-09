@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from .contracts import StepStatus
 from .models import AgentStep
 
 
@@ -19,7 +20,7 @@ class PlanStep:
 
 
 @dataclass
-class PlanExecution:
+class SequentialExecution:
     values: dict[str, Any] = field(default_factory=dict)
     agent_steps: list[AgentStep] = field(default_factory=list)
     failed: bool = False
@@ -35,10 +36,10 @@ class PlanAndExecuteRuntime:
     def __init__(self, default_max_retries: int = 1):
         self.default_max_retries = max(0, int(default_max_retries))
 
-    def run(self, plan: list[PlanStep], initial_values: dict[str, Any] | None = None) -> PlanExecution:
-        execution = PlanExecution(values=dict(initial_values or {}))
+    def run(self, plan: list[PlanStep], initial_values: dict[str, Any] | None = None) -> SequentialExecution:
+        execution = SequentialExecution(values=dict(initial_values or {}))
         # 先把整条计划写进步骤列表，方便 UI 和日志直接看出执行路径。
-        execution.add_step("plan_task", "success", self._describe_plan(plan))
+        execution.add_step("plan_task", StepStatus.SUCCESS, self._describe_plan(plan))
         for step in plan:
             attempts = 0
             max_retries = step.max_retries if step.max_retries >= 0 else self.default_max_retries
@@ -53,15 +54,15 @@ class PlanAndExecuteRuntime:
                     detail = step.description or "step completed"
                     if attempts > 1:
                         detail = f"{detail}; retry_attempt={attempts}"
-                    execution.add_step(step.name, "success", detail)
+                    execution.add_step(step.name, StepStatus.SUCCESS, detail)
                     break
                 except Exception as exc:
                     message = str(exc) or exc.__class__.__name__
                     if step.retryable and attempts <= max_retries:
                         # 只对可恢复错误做小范围重试，不把单步失败直接扩大成整条计划失败。
-                        execution.add_step(step.name, "retry", f"{message}; retrying")
+                        execution.add_step(step.name, StepStatus.RETRY, f"{message}; retrying")
                         continue
-                    execution.add_step(step.name, "failed", message)
+                    execution.add_step(step.name, StepStatus.FAILED, message)
                     execution.failed = True
                     execution.failure = message
                     return execution

@@ -14,7 +14,7 @@ class RegressionDatasetTests(unittest.TestCase):
         cases = load_cases(DATASET)
         ids = [case["id"] for case in cases]
         self.assertEqual(len(ids), len(set(ids)))
-        self.assertEqual(len(cases), 160)
+        self.assertEqual(len(cases), 163)
         self.assertTrue(all({
             "requires_llm", "requires_network", "requires_email", "has_side_effect",
         } <= set(case["runtime"]) for case in cases))

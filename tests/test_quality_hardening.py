@@ -22,7 +22,7 @@ from deskpilot.core.config import load_config
 from deskpilot.core.json_utils import parse_json_value
 from deskpilot.memory.session_store import SessionStore
 from deskpilot.rag.web_research import SearchResult, WebResearchAgent
-from deskpilot.tools.permissions import assess_python_code
+from deskpilot.tools.permissions import assess_command, assess_python_code
 from deskpilot.tools.tool_registry import build_default_tool_registry
 
 
@@ -66,7 +66,21 @@ def test_python_static_policy_blocks_destructive_dynamic_and_network_code() -> N
     assert assess_python_code("import subprocess\nsubprocess.run(['whoami'])").blocked
     assert assess_python_code("import requests\nrequests.get('https://example.com')").blocked
     assert assess_python_code("eval('1 + 1')").blocked
+    assert assess_python_code("import importlib\nimportlib.import_module('os')").blocked
+    assert assess_python_code("import os\ngetattr(os, 'remove')('x')").blocked
+    assert assess_python_code("import os\nos.execv('x', [])").blocked
+    assert assess_python_code("globals()").blocked
     assert not assess_python_code("print(sum([1, 2, 3]))").blocked
+
+
+def test_find_side_effect_actions_cannot_use_readonly_whitelist() -> None:
+    assert assess_command("find . -name '*.py'").allowed_without_confirmation
+    for command in (
+        "find . -delete", "find . -exec touch {} +", "find . -execdir touch {} +",
+        "find . -ok touch {} +", "find . -chmod 777",
+    ):
+        decision = assess_command(command)
+        assert decision.blocked, command
 
 
 def test_pending_action_is_session_bound_one_time_and_hides_arguments() -> None:

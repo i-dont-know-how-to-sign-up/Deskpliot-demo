@@ -4,20 +4,25 @@ import os
 from collections import defaultdict
 from pathlib import Path
 
-from ..core.api_clients import local_hash_embedding
 from .asset_store import AssetStore
 from .models import VisualEvidence
 from .providers.vision_embedding import VisionEmbeddingProvider
 from .vector_store import MultimodalVectorStore
+from .text_embedding import MultimodalTextEmbedder
 
 
 class MultimodalRetriever:
     """OCR、跨模态和图像相似度多路召回，使用 RRF 融合不可比的原始分数。"""
 
-    def __init__(self, store: MultimodalVectorStore, assets: AssetStore, vision: VisionEmbeddingProvider) -> None:
+    def __init__(
+        self, store: MultimodalVectorStore, assets: AssetStore,
+        vision: VisionEmbeddingProvider, text_embedder: MultimodalTextEmbedder | None = None,
+    ) -> None:
         self.store = store
         self.assets = assets
         self.vision = vision
+        self.text_embedder = text_embedder or MultimodalTextEmbedder()
+        self._vision_available = True
 
     def search(self, query: str = "", image_path: Path | None = None, top_k: int = 5) -> list[VisualEvidence]:
         channels: list[tuple[str, list[tuple[str, float]]]] = []
@@ -27,10 +32,11 @@ class MultimodalRetriever:
                 "ocr_lexical",
                 lexical_results,
             ))
+            query_vector = self.text_embedder.embed([query])[0]
             channels.append((
-                "ocr_dense",
+                "ocr_semantic" if self.text_embedder.semantic else "ocr_dense_fallback",
                 self.store.search(
-                    local_hash_embedding(query), "text/local-hash-v1", limit=max(20, top_k * 4)
+                    query_vector, self.text_embedder.embedding_space, limit=max(20, top_k * 4)
                 ),
             ))
             low_memory = os.getenv("MULTIMODAL_LOW_MEMORY_MODE", "true").casefold() in {
@@ -39,11 +45,14 @@ class MultimodalRetriever:
             # OCR 已直接命中时，低内存模式无需再加载大型视觉编码器。
             if lexical_results and low_memory:
                 text_vector = []
-            else:
+            elif self._vision_available:
                 try:
                     text_vector = self.vision.embed_texts([query])[0]
                 except RuntimeError:
+                    self._vision_available = False
                     text_vector = []
+            else:
+                text_vector = []
             if text_vector:
                 channels.append((
                     "vision_text",

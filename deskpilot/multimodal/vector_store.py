@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterator
 
 from ..core.config import INDEX_DIR
+from ..core.sqlite_utils import connect_sqlite
 from .models import MultimodalChunk, VectorRecord
 
 
@@ -22,8 +23,7 @@ class MultimodalVectorStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.database)
-        connection.row_factory = sqlite3.Row
+        connection = connect_sqlite(self.database)
         try:
             yield connection
             connection.commit()
@@ -128,6 +128,22 @@ class MultimodalVectorStore:
             page_number=row["page_number"], bbox=tuple(bbox) if bbox else None,
             metadata=json.loads(row["metadata_json"] or "{}"),
         )
+
+    def list_chunks_for_asset(self, asset_id: str) -> list[MultimodalChunk]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM chunks WHERE asset_id = ? ORDER BY chunk_id", (asset_id,)
+            ).fetchall()
+        chunks: list[MultimodalChunk] = []
+        for row in rows:
+            bbox = json.loads(row["bbox_json"]) if row["bbox_json"] else None
+            chunks.append(MultimodalChunk(
+                chunk_id=row["chunk_id"], asset_id=row["asset_id"], doc_id=row["doc_id"],
+                modality=row["modality"], text=row["text"], source_label=row["source_label"],
+                page_number=row["page_number"], bbox=tuple(bbox) if bbox else None,
+                metadata=json.loads(row["metadata_json"] or "{}"),
+            ))
+        return chunks
 
     def has_vector(self, owner_id: str, embedding_space: str) -> bool:
         with self._connect() as connection:

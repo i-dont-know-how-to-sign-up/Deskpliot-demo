@@ -20,7 +20,7 @@ class SupervisorAgent:
     """P0 顺序 DAG Supervisor，负责依赖、预算和人工确认状态。"""
 
     def execute(
-        self, plan: TaskPlan, initial_values: dict[str, Any] | None = None, *, parallel: bool = True,
+        self, plan: TaskPlan, initial_values: dict[str, Any] | None = None, *, parallel: bool = False,
         on_result: Callable[[AgentResult], None] | None = None,
     ) -> SupervisorResult:
         started = time.monotonic()

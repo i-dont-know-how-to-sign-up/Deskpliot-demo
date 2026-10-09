@@ -409,7 +409,18 @@ class DocumentIndex:
             lexical = len(matched_terms) / max(1, len(query_terms))
             phrase_bonus = 0.45 if matched_entities else 0.0
             score = lexical + phrase_bonus
-            if not matched_entities and lexical < 0.22:
+            # 长中文问题会生成较多二元词，不能用全部 query terms 作分母后把跨文档
+            # 的明确字段（如“负责人”“记忆 + 类型”）稀释掉。
+            meaningful_phrase = any(3 <= len(term) <= 12 for term in matched_terms)
+            distributed_chinese_match = sum(
+                bool(re.fullmatch(r"[\u4e00-\u9fff]{2,}", term)) for term in matched_terms
+            ) >= 2
+            if (
+                not matched_entities
+                and lexical < 0.22
+                and not meaningful_phrase
+                and not distributed_chinese_match
+            ):
                 continue
             ranked.append((score, chunk, matched_terms[:8], matched_entities[:4]))
         ranked.sort(key=lambda item: item[0], reverse=True)
@@ -448,7 +459,9 @@ class DocumentIndex:
                 "source": chunk.source_label,
                 "matched_terms": terms,
                 "matched_entities": entities,
-                "strong_match": bool(entities) or score >= 0.5,
+                "strong_match": bool(entities) or score >= 0.5 or any(
+                    3 <= len(term) <= 12 for term in terms
+                ) or sum(bool(re.fullmatch(r"[\u4e00-\u9fff]{2,}", term)) for term in terms) >= 2,
                 "excerpt": fix_mojibake(chunk.text)[:max(80, min(excerpt_chars, 400))],
             })
             if len(hints) >= max(1, min(limit, 5)):

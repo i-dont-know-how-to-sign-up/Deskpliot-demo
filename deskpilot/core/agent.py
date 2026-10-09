@@ -13,9 +13,12 @@ from typing import Any, Callable
 from .api_clients import OpenAICompatibleClient
 from .approval import PendingActionStore
 from .config import LOG_DIR, load_config
+from .contracts import StepStatus, ToolNames
 from .encoding_utils import fix_mojibake
+from .handlers import DirectAnswerHandler
 from .models import AgentStep, AnswerResult, Evidence
 from .json_utils import parse_json_value
+from .plan_repair import PlanRepairService
 from .runtime import PlanAndExecuteRuntime, PlanStep
 from ..context import AssembledContext, ContextBuilder, UsageCostTracker
 from ..memory.memory_compactor import MemoryCompactor
@@ -85,6 +88,16 @@ class DocumentQAAgent:
         self.pending_actions = PendingActionStore()
         self.runtime = PlanAndExecuteRuntime(default_max_retries=1)
         self.intent_router = IntentRouter(self.client)
+        self.plan_repair = PlanRepairService(lambda *args, **kwargs: self.plan_task(*args, **kwargs))
+        self.direct_answer_handler = DirectAnswerHandler(
+            answer=lambda question, context: self._direct_answer(question, context),
+            fallback=lambda question, context: self._direct_fallback_answer(question, context),
+            needs_review=lambda answer: self._needs_enumeration_review(answer),
+            review=lambda question, answer, budget: self._review_direct_enumeration(
+                question, answer, budget,
+            ),
+            api_error=lambda: self.client.last_error if self.client.config.llm_api_key else "",
+        )
         # Planner/Router 负责计划与复杂度判断；已迁移的邮件复合任务由
         # PlanExecutor + Supervisor 执行，其余任务暂走兼容执行链。
         self.multi_agent_router = MultiAgentRouter(
@@ -109,10 +122,36 @@ class DocumentQAAgent:
                 session.session_id, "user", question or "请描述这些图片。",
                 metadata={"attachment_ids": list(dict.fromkeys(asset_ids)), "modality": "image"},
             )
+            sensitive = self.multimodal.sensitive_assets(asset_ids)
+            capability = self.multimodal.stats()
+            if sensitive and capability.get("sensitive_image_policy") == "confirm":
+                permission = self.multimodal.sensitive_permission(sensitive)
+                pending = self.pending_actions.create(session.session_id, {
+                    "tool_name": ToolNames.VISION_ANSWER_ATTACHMENTS,
+                    "kwargs": {"question": question or "请描述这些图片。", "asset_ids": list(asset_ids)},
+                    "description": "将敏感图片发送到云端视觉模型",
+                    "risk_level": permission["risk_level"],
+                    "reasons": permission["reasons"],
+                })
+                steps = [
+                    AgentStep("validate_attachments", StepStatus.SUCCESS, f"已校验 {len(asset_ids)} 张受控图片资产。"),
+                    AgentStep("request_vision_confirmation", StepStatus.WAITING_HUMAN, "敏感图片上云前等待人工确认。"),
+                ]
+                answer = "检测到敏感图片或剪贴板截图。发送到云端视觉模型前需要人工确认。"
+                self.session_store.append_message(
+                    session.session_id, "assistant", answer,
+                    metadata={"steps": [step.__dict__ for step in steps], "reply_to": user_message.message_id},
+                )
+                return AnswerResult(
+                    answer=answer, evidences=[], steps=steps, used_llm=False,
+                    session_id=session.session_id,
+                    memory_context="敏感图片尚未上传云端。",
+                    pending_action=pending,
+                )
             if event_callback:
-                event_callback({"type": "model_start", "stage": "Vision Answer", "kind": "vision", "visible": False})
+                event_callback({"type": "model_start", "stage": "Vision Answer", "kind": "vision", "visible": True})
             try:
-                answer = self.multimodal.answer(question, asset_ids)
+                answer = self.multimodal.answer(question, asset_ids, event_callback=event_callback)
             except Exception as exc:
                 if event_callback:
                     event_callback({
@@ -294,41 +333,20 @@ class DocumentQAAgent:
                 question, planner_context.text, include_workspace_files=decision.needs_workspace_files,
                 include_index_catalog=decision.needs_index_catalog,
             )
-            planned_tools = {tool for item in plan_preview.get("steps", []) if isinstance(item, dict)
-                             for tool in item.get("allowed_tools", [])}
-            # 路由器未预告索引目录、但 Planner 明确选择了索引检索时，才补送有界目录重规划。
-            if "knowledge.search" in planned_tools and not decision.needs_index_catalog and self.index.documents:
-                plan_preview = self.plan_task(
-                    question, planner_context.text + "\n已选用 knowledge.search，请从索引目录挑选实际文档 ID。",
-                    include_workspace_files=decision.needs_workspace_files, include_index_catalog=True,
-                )
-            # 仅当文件产物计划无效或缺少可执行的前置资料/写入工具时，再尝试一次语义重规划。
-            # 不绕过权限检查，也不在无资料时直接写入空文件。
-            wants_output = decision.requires_file_output
-            if wants_output:
-                actions = [tool for item in plan_preview.get("steps", []) if isinstance(item, dict)
-                           for tool in item.get("allowed_tools", [])]
-                has_source = bool({"web.search", "knowledge.search", "web.research"}.intersection(actions))
-                has_write = "files.write_file" in actions
-                if not plan_preview.get("valid") or not (has_source and has_write):
-                    feedback = ("上一次计划无法执行：" + str(plan_preview.get("error") or
-                                "缺少资料获取或文件写入节点") +
-                                "。请重新输出完整 JSON 计划：先由 knowledge 检索资料，"
-                                "再由 commit 使用 files.write_file 写入；写入节点必须标记人工确认。"
-                                "如源为已索引文档使用 knowledge.search，如需联网使用 web.search。"
-                                "请给出纯检索主题及用户指定的文件路径，不要虚构检索结果。")
-                    repaired = self.plan_task(
-                        question, planner_context.text + "\n" + feedback,
-                        include_workspace_files=decision.needs_workspace_files,
-                        include_index_catalog=decision.needs_index_catalog or "knowledge.search" in planned_tools,
-                    )
-                    repaired_actions = [tool for item in repaired.get("steps", []) if isinstance(item, dict)
-                                        for tool in item.get("allowed_tools", [])]
-                    if repaired.get("valid") and "files.write_file" in repaired_actions and (
-                        {"web.search", "knowledge.search", "web.research"}.intersection(repaired_actions)
-                    ):
-                        plan_preview = repaired
-                        steps.append(AgentStep("repair_plan", "success", "原计划缺少可执行依赖，已重规划检索与文件提交节点。"))
+            repair = self.plan_repair.repair(
+                question=question,
+                planner_context=planner_context.text,
+                decision=decision,
+                plan=plan_preview,
+                has_index_documents=bool(self.index.documents),
+                workspace_files=(
+                    self._workspace_document_candidates(question)
+                    if decision.needs_workspace_files else []
+                ),
+            )
+            plan_preview = repair.plan
+            for detail in repair.events:
+                steps.append(AgentStep("repair_plan", StepStatus.SUCCESS, detail))
             complexity = max(1, min(int(plan_preview.get("score", 3) or 3), 10))
             memory_context = self.context_assembler.for_role(
                 memory_context, "answer", complexity=complexity, planner_state=plan_preview
@@ -351,12 +369,16 @@ class DocumentQAAgent:
             steps.append(
                 AgentStep(
                     "multi_agent_router",
-                    "success" if plan_preview.get("valid") else "failed",
+                    "success",
                     json.dumps(
                         {
-                            "route": plan_preview.get("route"),
-                            "complexity_score": plan_preview.get("score"),
-                            "reason": plan_preview.get("reason", ""),
+                            "mode": decision.mode,
+                            "reason": decision.reason,
+                            "required_tools": decision.required_tools,
+                            "needs_workspace_files": decision.needs_workspace_files,
+                            "needs_index_catalog": decision.needs_index_catalog,
+                            "requires_file_output": decision.requires_file_output,
+                            "requires_reflection": decision.requires_reflection,
                         },
                         ensure_ascii=False,
                     ),
@@ -368,6 +390,9 @@ class DocumentQAAgent:
                     "success" if plan_preview.get("valid") else "failed",
                     json.dumps(
                         {
+                            "route": plan_preview.get("route"),
+                            "complexity_score": plan_preview.get("score"),
+                            "reason": plan_preview.get("reason", ""),
                             "valid": plan_preview.get("valid"),
                             "error": plan_preview.get("error", ""),
                             "steps": plan_preview.get("steps", []),
@@ -376,6 +401,24 @@ class DocumentQAAgent:
                     ),
                 )
             )
+            if decision.requires_reflection:
+                steps.append(AgentStep(
+                    "plan_task", StepStatus.SUCCESS,
+                    "高可靠、低实时性任务已进入规划与最终事实检查流程。",
+                ))
+                steps.append(AgentStep(
+                    "reflection", StepStatus.SUCCESS,
+                    "已启用 Reflection 策略；收到待核查结果和证据后执行事实一致性检查。",
+                ))
+                return self._finalize_answer(
+                    answer=(
+                        "已启用高可靠事实检查流程。请提供需要核查的调研结果及其证据或引用；"
+                        "普通即时问答不会启用该检查，以避免额外延迟。"
+                    ),
+                    evidences=[], steps=steps, used_llm=False,
+                    session_id=session.session_id, user_message_id=user_message.message_id,
+                    question=question, memory_context=memory_context,
+                )
             if not plan_preview.get("valid"):
                 return self._finalize_answer(
                     answer=f"任务计划校验失败：{plan_preview.get('error', '未知原因')}",
@@ -404,8 +447,60 @@ class DocumentQAAgent:
                     user_message_id=user_message.message_id,
                     memory_context=memory_context,
                 )
-            web_file_request = self._planned_web_file_request(plan_preview)
+            simple_web_request = self._planned_simple_web_request(question, plan_preview, decision)
+            if simple_web_request is not None:
+                steps.append(AgentStep(
+                    "repair_plan", StepStatus.SUCCESS,
+                    "已将无副作用的单一网页资料计划收敛为对应网页工具调用。",
+                ))
+                if simple_web_request["tool"] == "web.research":
+                    return self._answer_web_research_request(
+                        question=question,
+                        topic=simple_web_request["query"],
+                        steps=steps,
+                        session_id=session.session_id,
+                        user_message_id=user_message.message_id,
+                        memory_context=memory_context,
+                    )
+                return self._answer_web_search_request(
+                    question=question,
+                    query=simple_web_request["query"],
+                    limit=5,
+                    steps=steps,
+                    session_id=session.session_id,
+                    user_message_id=user_message.message_id,
+                    memory_context=memory_context,
+                )
+            web_file_request = self._planned_web_file_request(
+                plan_preview,
+                fallback_query=str(decision.arguments.get("query") or question),
+            )
             if web_file_request is not None:
+                # “输出结论”不必然表示写本地文件。没有可解析的文件目标时保留
+                # 资料获取，但绝不臆造路径或产生文件副作用。
+                if not web_file_request.get("path") and self._extract_file_write_request(question) is None:
+                    steps.append(AgentStep(
+                        "repair_plan", StepStatus.SUCCESS,
+                        "计划包含文件提交但用户没有提供可解析的文件目标；已降级为网页资料回答。",
+                    ))
+                    if web_file_request.get("source_tool") == "web.research":
+                        return self._answer_web_research_request(
+                            question=question,
+                            topic=web_file_request["query"],
+                            steps=steps,
+                            session_id=session.session_id,
+                            user_message_id=user_message.message_id,
+                            memory_context=memory_context,
+                        )
+                    return self._answer_web_search_request(
+                        question=question,
+                        query=web_file_request["query"],
+                        limit=5,
+                        steps=steps,
+                        session_id=session.session_id,
+                        user_message_id=user_message.message_id,
+                        memory_context=memory_context,
+                    )
                 return self._answer_web_file_request(
                     question, web_file_request, steps, session.session_id,
                     user_message.message_id, memory_context, plan_preview=plan_preview,
@@ -426,8 +521,6 @@ class DocumentQAAgent:
             report_request = self._planned_index_report(plan_preview)
             if report_request is not None:
                 needs_file = decision.requires_file_output
-                if not needs_file and not report_request["write_report"]:
-                    needs_file = self.intent_router.requires_output_file(question)
                 if needs_file and not report_request["write_report"]:
                     steps.append(AgentStep("repair_plan", "success", "检索计划漏掉文件提交，按确认的文件产物需求补齐写入步骤。"))
                     report_request["write_report"] = True
@@ -449,8 +542,6 @@ class DocumentQAAgent:
                     plan_preview=plan_preview,
                 )
             wants_file = decision.requires_file_output
-            if not wants_file:
-                wants_file = self.intent_router.requires_output_file(question)
             if wants_file and decision.needs_index_catalog:
                 steps.append(AgentStep("repair_plan", "success", "计划遗漏索引检索或提交节点，使用有界索引目录补选文档。"))
                 return self._answer_index_report(
@@ -847,44 +938,15 @@ class DocumentQAAgent:
         )
 
         if decision.mode == "direct_answer":
-            # Router 的结构化响应已同时携带最终正文，普通 DirectQA 因而只需一次模型调用。
-            answer = decision.direct_response or self._direct_answer(question, memory_context)
-            used_llm = bool(answer)
-            if not answer:
-                if self.client.config.llm_api_key and self.client.last_error:
-                    steps.append(AgentStep("llm_api_call", "failed", self.client.last_error))
-                answer = self._direct_fallback_answer(question, memory_context)
-            elif self._needs_enumeration_review(answer):
-                reviewed = self._chat_with_stage(
-                    "Reflection",
-                    [
-                        {
-                            "role": "system",
-                            "content": (
-                                "你是回答一致性审核器。检查总数、编号列表、分类口径和例外是否自洽；"
-                                "发现冲突时直接输出修正后的完整中文回答，没有冲突则原样输出。"
-                            ),
-                        },
-                        {"role": "user", "content": f"问题：{question}\n\n待审核回答：\n{answer}"},
-                    ],
-                    temperature=0.0,
-                    max_tokens=memory_context.output_budget or None,
-                )
-                if reviewed:
-                    answer = reviewed
-                    steps.append(AgentStep("review_enumeration", "success", "已复核枚举数量和统计口径。"))
-            steps.append(
-                AgentStep(
-                    "direct_answer",
-                    "success",
-                    "已由意图路由器判断为通用问题并直接回答。" if used_llm else "未调用 LLM API，已使用本地 fallback 生成回答。",
-                )
+            outcome = self.direct_answer_handler.handle(
+                question, memory_context, direct_response=decision.direct_response,
             )
+            steps.extend(outcome.steps)
             return self._finalize_answer(
-                answer=answer,
+                answer=outcome.answer,
                 evidences=[],
                 steps=steps,
-                used_llm=used_llm,
+                used_llm=outcome.used_llm,
                 session_id=session_id,
                 user_message_id=user_message_id,
                 question=question,
@@ -930,6 +992,23 @@ class DocumentQAAgent:
         numbered = re.findall(r"(?m)^\s*\d+[.、]\s+", answer)
         total_claim = re.search(r"(?:共有|共计|总共|一共|合计).{0,10}\d+", answer)
         return len(numbered) >= 3 and bool(total_claim)
+
+    def _review_direct_enumeration(self, question: str, answer: str, max_tokens: int) -> str:
+        return self._chat_with_stage(
+            "Reflection",
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是回答一致性审核器。检查总数、编号列表、分类口径和例外是否自洽；"
+                        "发现冲突时直接输出修正后的完整中文回答，没有冲突则原样输出。"
+                    ),
+                },
+                {"role": "user", "content": f"问题：{question}\n\n待审核回答：\n{answer}"},
+            ],
+            temperature=0.0,
+            max_tokens=max_tokens or None,
+        )
 
     def _handle_intent_tool_call(
         self,
@@ -1244,7 +1323,16 @@ class DocumentQAAgent:
         )
 
     def _build_clarification_answer(self, decision: IntentDecision) -> str:
-        slots = ", ".join(decision.missing_slots) if decision.missing_slots else "需要更多信息"
+        slot_labels = {
+            "path": "目标路径",
+            "content": "文件内容",
+            "command": "要执行的命令",
+            "to": "收件人",
+            "subject": "邮件标题",
+            "body": "邮件正文",
+        }
+        slots = ", ".join(slot_labels.get(item, item) for item in decision.missing_slots) \
+            if decision.missing_slots else "需要补充的信息"
         if decision.tool_name:
             return f"我可以帮你执行 `{decision.tool_name}`，但还缺少这些信息：{slots}。"
         return f"我还需要更多信息才能继续：{slots}。"
@@ -1298,7 +1386,7 @@ class DocumentQAAgent:
                 snippet = str(item.get("snippet", "")).strip()
                 lines.append(f"{idx}. {title}")
                 if url:
-                    lines.append(f"   {url}")
+                    lines.append(f"   来源：{url}")
                 if snippet:
                     lines.append(f"   {snippet}")
         else:
@@ -1329,7 +1417,7 @@ class DocumentQAAgent:
         timeout_seconds = arguments.get("timeout_seconds")
         cwd = str(arguments.get("cwd", "") or "")
 
-        if tool_name == "shell.execute_command" and not command:
+        if tool_name == "shell.execute_command":
             test_request = self._extract_test_execution_request(question)
             if test_request:
                 steps.append(AgentStep("route_test_execution", "success", f"意图路由到测试执行：{test_request['script']}"))
@@ -1341,6 +1429,7 @@ class DocumentQAAgent:
                     user_message_id=user_message_id,
                     memory_context=memory_context,
                 )
+        if tool_name == "shell.execute_command" and not command:
             return self._finalize_answer(
                 answer=self._build_clarification_answer(
                     IntentDecision(mode="clarify", reason="缺少 command 参数。", tool_name=tool_name, missing_slots=["command"])
@@ -1849,7 +1938,8 @@ class DocumentQAAgent:
         send_success = tool_name == "email.send" and output.get("status") == "sent"
         execution_success = bool(output.get("executed"))
         move_success = tool_name == "files.apply_move" and bool(output.get("confirmed"))
-        if output.get("written") or email_success or send_success or execution_success or move_success:
+        vision_success = bool(output.get("answered")) and bool(output.get("answer"))
+        if output.get("written") or email_success or send_success or execution_success or move_success or vision_success:
             path = str(output.get("path", kwargs.get("path", "")))
             size = output.get("size", 0)
             steps.append(AgentStep("execute_approved_action", "success", f"已执行工具：{tool_name}"))
@@ -1873,6 +1963,8 @@ class DocumentQAAgent:
                 }, ensure_ascii=False, indent=2)
             elif move_success:
                 answer = f"已确认并移动文件：\n{output.get('source', '')}\n-> {output.get('destination', '')}"
+            elif vision_success:
+                answer = str(output.get("answer", ""))
             else:
                 answer = f"已确认并完成文件写入：{path}\n\n文件大小：{size} bytes。"
         else:
@@ -2176,7 +2268,42 @@ class DocumentQAAgent:
         return query or question
 
     @staticmethod
-    def _planned_web_file_request(plan_preview: dict[str, object]) -> dict[str, str] | None:
+    def _planned_simple_web_request(
+        question: str,
+        plan_preview: dict[str, object],
+        decision: IntentDecision,
+    ) -> dict[str, str] | None:
+        """将无提交副作用的网页资料计划收敛为一个可执行网页工具。"""
+        if decision.requires_file_output:
+            return None
+        steps = plan_preview.get("steps", [])
+        if not isinstance(steps, list):
+            return None
+        all_tools: set[str] = set()
+        selected_tool = ""
+        query = str(decision.arguments.get("query") or question).strip()
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            tools = {str(tool) for tool in step.get("allowed_tools", [])}
+            all_tools.update(tools)
+            arguments = step.get("arguments", {}) if isinstance(step.get("arguments"), dict) else {}
+            if "web.research" in tools:
+                selected_tool = "web.research"
+                query = str(arguments.get("topic") or arguments.get("query") or query).strip()
+            elif "web.search" in tools and not selected_tool:
+                selected_tool = "web.search"
+                query = str(arguments.get("query") or query).strip()
+        # web.read_page 可以是 search/research 后的补充读取节点；只要计划没有
+        # 其他领域工具或副作用，现有网页处理器就能收敛执行该资料获取计划。
+        if not selected_tool or all_tools - {"web.search", "web.research", "web.read_page"}:
+            return None
+        return {"tool": selected_tool, "query": query or question}
+
+    @staticmethod
+    def _planned_web_file_request(
+        plan_preview: dict[str, object], fallback_query: str = "",
+    ) -> dict[str, str] | None:
         """仅从 Planner 的依赖节点识别网页检索后写文件。"""
         knowledge: dict[str, object] | None = None
         commits: list[dict[str, object]] = []
@@ -2184,7 +2311,7 @@ class DocumentQAAgent:
             if not isinstance(step, dict):
                 continue
             tools = step.get("allowed_tools", [])
-            if "web.search" in tools:
+            if any(tool in {"web.search", "web.research"} for tool in tools):
                 knowledge = step
             if "files.write_file" in tools:
                 commits.append(step)
@@ -2202,8 +2329,12 @@ class DocumentQAAgent:
         commit = next((item for item in commits if knowledge.get("id") in item.get("depends_on", [])), commits[-1])
         source = knowledge.get("arguments") if isinstance(knowledge.get("arguments"), dict) else {}
         destination = commit.get("arguments") if isinstance(commit.get("arguments"), dict) else {}
-        return {"query": str(source.get("query") or "").strip(),
-                "path": str(destination.get("path") or "").strip()}
+        source_tools = {str(tool) for tool in knowledge.get("allowed_tools", [])}
+        return {"query": str(
+                    source.get("query") or source.get("topic") or fallback_query
+                ).strip(),
+                "path": str(destination.get("path") or "").strip(),
+                "source_tool": "web.research" if "web.research" in source_tools else "web.search"}
 
     def _desktop_directory(self) -> Path:
         """优先读取 Windows 的实际桌面目录，兼容重定向到 OneDrive 的情况。"""
@@ -2788,7 +2919,12 @@ class DocumentQAAgent:
             "写入",
             "写到",
             "保存为",
+            "保存到",
+            "保存至",
             "另存为",
+            "输出为",
+            "输出到",
+            "输出至",
             "导出",
             "更新",
             "修改",
@@ -3136,6 +3272,12 @@ class DocumentQAAgent:
                 raise RuntimeError("多文档读取结果不完整，停止生成对比摘要")
             prompt = "\n\n".join(
                 f"文档：{item['title']}\n内容：{str(item['content'])[:12000]}" for item in documents
+            )
+            prompt = (
+                f"用户原始任务：{question}\n"
+                "请逐项完成原始任务要求，分别说明每份文档中的相关事实，再给出对比结论；"
+                "不得把原始任务改写成只比较文档目标。\n\n"
+                + prompt
             )
             answer = self._chat_with_stage("Answer", [
                 {"role": "system", "content": "你是本地文档对比助手，只能根据给定文档内容回答，不得补充文档外事实。"},

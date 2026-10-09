@@ -24,6 +24,7 @@ class OCRProvider(Protocol):
     provider: str
 
     def recognize(self, image_path: Path) -> list[OCRRegion]: ...
+    def recognize_many(self, image_paths: list[Path]) -> list[list[OCRRegion]]: ...
 
 
 class DisabledOCRProvider:
@@ -31,6 +32,9 @@ class DisabledOCRProvider:
 
     def recognize(self, image_path: Path) -> list[OCRRegion]:
         return []
+
+    def recognize_many(self, image_paths: list[Path]) -> list[list[OCRRegion]]:
+        return [[] for _ in image_paths]
 
 
 class PaddleOCRProvider:
@@ -98,6 +102,63 @@ class PaddleOCRProvider:
         if self._get_major_version() >= 3 and isolated:
             return self._recognize_isolated(image_path)
         return self._recognize_in_process(image_path)
+
+    def recognize_many(self, image_paths: list[Path]) -> list[list[OCRRegion]]:
+        if not image_paths:
+            return []
+        isolated = os.getenv("OCR_ISOLATED_PROCESS", "true").casefold() in {
+            "1", "true", "yes", "on",
+        }
+        if self._get_major_version() >= 3 and isolated:
+            return self._recognize_many_isolated(image_paths)
+        return [self._recognize_in_process(path) for path in image_paths]
+
+    def _recognize_many_isolated(self, image_paths: list[Path]) -> list[list[OCRRegion]]:
+        cache_root = Path(os.getenv("PADDLE_PDX_CACHE_HOME", tempfile.gettempdir()))
+        temporary_root = cache_root / "deskpilot_ocr_temp"
+        temporary_root.mkdir(parents=True, exist_ok=True)
+        input_path: Path | None = None
+        output_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                suffix=".json", dir=temporary_root, delete=False, mode="w", encoding="utf-8"
+            ) as temporary:
+                input_path = Path(temporary.name)
+                json.dump({"image_paths": [str(path.resolve()) for path in image_paths]}, temporary)
+            with tempfile.NamedTemporaryFile(suffix=".json", dir=temporary_root, delete=False) as temporary:
+                output_path = Path(temporary.name)
+            environment = dict(os.environ)
+            environment["OCR_ISOLATED_PROCESS"] = "false"
+            environment["PYTHONUTF8"] = "1"
+            timeout = max(30, min(int(os.getenv("OCR_TIMEOUT_SECONDS", "180")), 1200))
+            result = self._run_batch_worker(input_path, output_path, environment, timeout)
+            if result.returncode != 0:
+                detail = self._process_detail(result)[-3000:]
+                raise RuntimeError(f"PaddleOCR 批处理子进程失败（exit={result.returncode}）：{detail}")
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+            rows = payload.get("results") if isinstance(payload, dict) else None
+            if not isinstance(rows, list) or len(rows) != len(image_paths):
+                raise RuntimeError("PaddleOCR 批处理返回的结果数量不正确")
+            return [[OCRRegion(
+                text=str(item.get("text", "")), confidence=float(item.get("confidence", 0.0)),
+                bbox=tuple(item["bbox"]) if item.get("bbox") else None,
+            ) for item in group] for group in rows]
+        finally:
+            if input_path is not None:
+                input_path.unlink(missing_ok=True)
+            if output_path is not None:
+                output_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _run_batch_worker(
+        input_path: Path, output_path: Path, environment: dict[str, str], timeout: int,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "deskpilot.multimodal.providers.ocr_worker", str(input_path), str(output_path)],
+            cwd=str(Path(__file__).resolve().parents[3]), env=environment,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, check=False,
+        )
 
     def _recognize_in_process(self, image_path: Path) -> list[OCRRegion]:
         engine = self._load()

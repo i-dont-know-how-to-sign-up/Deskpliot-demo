@@ -17,6 +17,7 @@ from ..core.api_clients import OpenAICompatibleClient, cosine_similarity
 from ..core.config import MEMORY_INDEX_DIR, MEMORY_VECTOR_DIR, MEMORY_WORKSPACE_DIR, ensure_dirs, load_config
 from ..core.encoding_utils import fix_mojibake
 from ..core.models import utc_now
+from ..core.sqlite_utils import connect_sqlite
 
 
 CATALOG_FILE = MEMORY_INDEX_DIR / "memory_catalog.sqlite"
@@ -285,8 +286,7 @@ class MemoryStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.db_file)
-        conn.row_factory = sqlite3.Row
+        conn = connect_sqlite(self.db_file)
         try:
             yield conn
             conn.commit()

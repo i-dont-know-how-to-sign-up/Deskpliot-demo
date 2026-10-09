@@ -43,6 +43,35 @@ class IntentRouter:
         if decision is None:
             # 模型输出无法解析时，退回到保守规则，保证路由器不会直接失效。
             return self._fallback_route(question, full_tool_specs, response, index_hint or [])
+        # Router 偶尔会在自然语言结果中明确要求 requires_reflection=true，
+        # 却把同名结构化字段留为 false。这里仅修复协议自相矛盾，不重新解析用户意图。
+        protocol_text = f"{decision.reason}\n{decision.direct_response}".replace(" ", "").casefold()
+        if (
+            decision.mode == "direct_answer"
+            and not decision.requires_reflection
+            and "requires_reflection=true" in protocol_text
+        ):
+            decision.mode = "plan_task"
+            decision.requires_reflection = True
+            decision.direct_response = ""
+            decision.reason = "Router 的自然语言结论要求 Reflection，已修复结构化字段矛盾。"
+        available_tools = {
+            str(item.get("name", "")) for item in full_tool_specs if item.get("name")
+        }
+        # 执行契约只接受注册表中的精确名称；语义相近但不存在的工具不能进入 Planner。
+        decision.required_tools = [
+            name for name in decision.required_tools if name in available_tools
+        ]
+        self._complete_plan_contract(decision)
+        if decision.mode == "direct_answer" and decision.requires_reflection:
+            return IntentDecision(
+                mode="plan_task",
+                reason="高可靠且允许较高延迟的任务需要 Planner 与 Reflection。",
+                confidence=max(decision.confidence, 0.8),
+                raw_response=response,
+                requires_reflection=True,
+                required_tools=decision.required_tools,
+            )
         explicit_local = (
             decision.explicit_local_retrieval
             or decision.knowledge_scope == "local_index"
@@ -59,6 +88,7 @@ class IntentRouter:
                 explicit_local_retrieval=True,
                 knowledge_scope="local_index",
                 arguments={"query": question},
+                required_tools=["knowledge.search"],
                 confidence=max(decision.confidence, 0.85),
                 raw_response=response,
             )
@@ -100,13 +130,14 @@ class IntentRouter:
         ):
             # “检索后写文件”是复合任务。即使路由提示未携带索引候选，也应先保留
             # 文件产物需求交给 Planner，不能提前降级为 direct_answer。
-            if decision.requires_file_output or self.requires_output_file(question):
+            if decision.requires_file_output:
                 return IntentDecision(
                     mode="plan_task",
                     reason="Indexed evidence must be written to a file after retrieval.",
                     needs_index_catalog=True,
                     requires_file_output=True,
                     arguments={"query": decision.arguments.get("query", question)},
+                    required_tools=["knowledge.search", "files.write_file"],
                     raw_response=response,
                 )
             # Router 不能在索引探测为零时，仅凭“这是技术问题”臆测本地知识库可回答。
@@ -121,11 +152,8 @@ class IntentRouter:
             decision.mode == "tool_call"
             and decision.tool_name in {"web.search", "web.research", "web.read_page"}
         ):
-            web_required = self._verify_web_requirement(question)
             explicit_web = decision.explicit_web_retrieval
             fresh = decision.requires_fresh_information
-            if web_required is not None:
-                explicit_web, fresh = web_required
             if not explicit_web and not fresh:
                 return IntentDecision(
                     mode="direct_answer",
@@ -139,19 +167,20 @@ class IntentRouter:
             return IntentDecision(
                 mode="plan_task", reason="File output cannot be fulfilled by a direct chat response.",
                 needs_index_catalog=decision.needs_index_catalog,
-                requires_file_output=True, raw_response=response,
+                requires_file_output=True,
+                required_tools=list(dict.fromkeys([*decision.required_tools, "files.write_file"])),
+                raw_response=response,
             )
         if decision.mode == "tool_call" and decision.tool_name == "knowledge.search":
             # 知识库请求可能同时要求落盘。仅对 knowledge.search 做一次窄范围语义复核，
             # 避免把“检索 -> 写文件”悄悄降级成只检索。
             wants_file = decision.requires_file_output
-            if not wants_file:
-                wants_file = self.requires_output_file(question)
             if wants_file:
                 return IntentDecision(
                     mode="plan_task", reason="Indexed evidence must be written to a file after retrieval.",
                     needs_index_catalog=True, requires_file_output=True,
-                    arguments={"query": decision.arguments.get("query", question)}, raw_response=response,
+                    arguments={"query": decision.arguments.get("query", question)},
+                    required_tools=["knowledge.search", "files.write_file"], raw_response=response,
                 )
         if decision.mode == "tool_call":
             # 第二步做槽位校验，缺参就转成 clarify，而不是硬调用工具。
@@ -187,47 +216,23 @@ class IntentRouter:
         decision.raw_response = response
         return decision
 
-    def requires_output_file(self, question: str) -> bool:
-        """仅判断是否要求实际创建文件；失败时保守返回 false，由计划执行层显式报错。"""
-        with self._client_stage("Router"):
-            response = self.client.chat([
-                {"role": "system", "content": "你是文件产物校验器，只输出 JSON。"},
-                {"role": "user", "content": (
-                    "用户是否要求助手实际创建、写入或保存本地文件？只是展示回答或引用不算。"
-                    '只返回 {"requires_file_output":true|false}。\n用户请求：' + question
-                )},
-            ], temperature=0.0)
-        match = re.search(r"\{[^{}]*\}", response or "")
-        if not match:
-            return False
-        try:
-            data = json.loads(match.group(0))
-        except (ValueError, AttributeError):
-            return False
-        return data.get("requires_file_output") is True
-
-    def _verify_web_requirement(self, question: str) -> tuple[bool, bool] | None:
-        """复核网页工具的必要性，防止 Router 自行把普通知识问答解释成联网请求。"""
-        with self._client_stage("Router"):
-            response = self.client.chat([
-                {"role": "system", "content": "你是联网必要性校验器，只输出 JSON。"},
-                {"role": "user", "content": (
-                    "判断用户是否明确要求搜索/浏览互联网，以及答案是否依赖实时变化的信息。"
-                    "普通原理、模型架构、历史知识不属于实时信息。只返回："
-                    '{"explicit_web_retrieval":true|false,"requires_fresh_information":true|false}\n'
-                    f"用户请求：{question}"
-                )},
-            ], temperature=0.0)
-        match = re.search(r"\{[^{}]*\}", response or "")
-        if not match:
-            return None
-        try:
-            data = json.loads(match.group(0))
-        except (ValueError, TypeError):
-            return None
-        if "explicit_web_retrieval" not in data or "requires_fresh_information" not in data:
-            return None
-        return data["explicit_web_retrieval"] is True, data["requires_fresh_information"] is True
+    @staticmethod
+    def _complete_plan_contract(decision: IntentDecision) -> None:
+        """根据 Router 的结构化标志补全最低工具契约，不分析用户措辞。"""
+        if decision.mode != "plan_task":
+            return
+        required = list(decision.required_tools)
+        if decision.needs_workspace_files:
+            required.append("files.read_document")
+        if decision.needs_index_catalog:
+            required.append("knowledge.search")
+        if decision.explicit_web_retrieval and not any(
+            item in {"web.search", "web.research", "web.read_page"} for item in required
+        ):
+            required.append("web.search")
+        if decision.requires_file_output:
+            required.append("files.write_file")
+        decision.required_tools = list(dict.fromkeys(item for item in required if item))
 
     def _summarize_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [
@@ -246,6 +251,15 @@ class IntentRouter:
 
     @staticmethod
     def _has_strong_multi_entity_index_match(index_hint: list[dict[str, Any]]) -> bool:
+        strong_documents = {
+            str(item.get("doc_id"))
+            for item in index_hint
+            if item.get("strong_match") is True
+            and item.get("doc_id")
+            and item.get("matched_terms")
+        }
+        if len(strong_documents) >= 2:
+            return True
         """用索引探测信号识别具体领域问题，避免把通用单术语定义强制路由到 RAG。"""
         for item in index_hint:
             if item.get("strong_match") is not True:
@@ -273,6 +287,18 @@ class IntentRouter:
             "otherwise set false. Do not guess file names.\n"
             "For plan_task set needs_index_catalog=true if the task must select multiple documents already "
             "in the knowledge index; this is different from searching workspace files.\n"
+            "For plan_task, required_tools must list the exact registered tools needed to complete the task in "
+            "execution order. Examples: web search then file output requires [\"web.search\",\"files.write_file\"]; "
+            "reading a local attachment then sending it requires [\"files.read_document\",\"email.send\"]. "
+            "Do not add files.write_file unless the user explicitly requests a file artifact.\n"
+            "Attaching an existing local file to an email is not file output: set needs_workspace_files=true, "
+            "requires_file_output=false, and include files.read_document plus email.send/email.save_draft in "
+            "required_tools. Never replace the requested email commit with files.write_file.\n"
+            "Set requires_reflection=true only for high-reliability final fact checking, scientific/deep analysis, "
+            "or critical code review when the user accepts higher latency. Keep it false for ordinary realtime Q&A.\n"
+            "A request to perform final fact checking on a high-reliability research result is plan_task with "
+            "requires_reflection=true even when the result/evidence is still missing; do not merely explain that "
+            "the policy would be enabled later.\n"
             "For summaries spanning several documents already indexed, use plan_task with needs_index_catalog=true "
             "to select the relevant document IDs; add a commit step only when the user requests file output.\n"
             "For one factual or explanatory question that can be answered by an indexed document, choose tool_call "
@@ -308,7 +334,7 @@ class IntentRouter:
             "Chinese answer in direct_response. Do not mention routing, tools, context packets, or internal policy. "
             "For every other mode direct_response must be an empty string.\n"
             "Output a single JSON object only with keys:\n"
-            '{"mode":"direct_answer|tool_call|clarify|plan_task","reason":"...","direct_response":"final answer or empty","tool_name":"...","arguments":{},"missing_slots":[],"confidence":0.0,"needs_workspace_files":false,"needs_index_catalog":false,"requires_file_output":false,"explicit_local_retrieval":false,"explicit_web_retrieval":false,"requires_fresh_information":false,"knowledge_scope":"general|local_index|workspace|web"}\n\n'
+            '{"mode":"direct_answer|tool_call|clarify|plan_task","reason":"...","direct_response":"final answer or empty","tool_name":"...","arguments":{},"missing_slots":[],"confidence":0.0,"needs_workspace_files":false,"needs_index_catalog":false,"requires_file_output":false,"explicit_local_retrieval":false,"explicit_web_retrieval":false,"requires_fresh_information":false,"required_tools":[],"requires_reflection":false,"knowledge_scope":"general|local_index|workspace|web"}\n\n'
             f"Runtime context (contains the current task and selected memory):\n{memory_context or question}\n\n"
             f"Runtime operating system: {platform.system()} ({platform.platform()}). "
             "For shell.execute_command, generate syntax for this operating system and prefer one simple command.\n"
@@ -341,6 +367,9 @@ class IntentRouter:
         knowledge_scope = str(data.get("knowledge_scope", "general")).strip()
         if knowledge_scope not in {"general", "local_index", "workspace", "web"}:
             knowledge_scope = "general"
+        required_tools = data.get("required_tools", [])
+        if not isinstance(required_tools, list):
+            required_tools = []
         return IntentDecision(
             mode=mode,
             reason=str(data.get("reason", "")).strip(),
@@ -355,6 +384,10 @@ class IntentRouter:
             explicit_local_retrieval=data.get("explicit_local_retrieval") is True,
             explicit_web_retrieval=data.get("explicit_web_retrieval") is True,
             requires_fresh_information=data.get("requires_fresh_information") is True,
+            required_tools=list(dict.fromkeys(
+                str(item).strip() for item in required_tools if str(item).strip()
+            )),
+            requires_reflection=data.get("requires_reflection") is True,
             knowledge_scope=knowledge_scope,
             direct_response=str(data.get("direct_response", "")).strip() if mode == "direct_answer" else "",
         )

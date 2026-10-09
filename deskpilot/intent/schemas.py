@@ -20,6 +20,10 @@ class IntentDecision:
     explicit_local_retrieval: bool = False
     explicit_web_retrieval: bool = False
     requires_fresh_information: bool = False
+    # 复合任务由 Router 声明完成任务所必需的工具，Planner 必须满足这一契约。
+    required_tools: list[str] = field(default_factory=list)
+    # 仅在高可靠、低实时性任务中启用最终反思，不由 Planner 自行猜测。
+    requires_reflection: bool = False
     # 用户要求答案依据哪类资料；用于阻止“根据知识库”被降级为无证据直接回答。
     knowledge_scope: str = "general"
     # 简单问答由 Router 在同一次模型调用中返回正文，避免 Router + Answer 双调用。

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from ..core.contracts import SOURCE_TOOLS, ToolNames
 from .schemas import TaskPlan, TaskPlanStep
 from .supervisor import SupervisorAgent, SupervisorResult
 from .task_ledger import TaskLedger
@@ -110,7 +111,7 @@ class PlanExecutor:
             self.task_ledger.finish(task_id, result.status, result.error)
             result.values["task_id"] = task_id
         commit = next((item for item in result.results if item.output.get("tool_name") in {
-            "email.send", "email.save_draft",
+            ToolNames.EMAIL_SEND, ToolNames.EMAIL_SAVE_DRAFT,
         }), None)
         if commit is None:
             return PlanExecution(result)
@@ -126,12 +127,11 @@ class PlanExecutor:
     ) -> TaskPlan:
         raw_steps = plan_preview.get("steps", [])
         normalized_steps = [item for item in raw_steps if isinstance(item, dict)]
-        email_tool = str(request.get("email_tool") or "email.send")
+        email_tool = str(request.get("email_tool") or ToolNames.EMAIL_SEND)
         commit_raw = next((item for item in normalized_steps if email_tool in item.get("allowed_tools", [])), {})
-        source_tools = {"web.research", "web.search", "files.read_document", "knowledge.search"}
-        source_raw = [item for item in normalized_steps if source_tools.intersection(item.get("allowed_tools", []))]
+        source_raw = [item for item in normalized_steps if SOURCE_TOOLS.intersection(item.get("allowed_tools", []))]
         if not source_raw:
-            source_raw = [{"id": "knowledge", "agent": "knowledge", "allowed_tools": ["web.research"],
+            source_raw = [{"id": "knowledge", "agent": "knowledge", "allowed_tools": [ToolNames.WEB_RESEARCH],
                            "arguments": {"query": request.get("request", "")}}]
         steps: list[TaskPlanStep] = []
         source_ids: list[str] = []
@@ -175,14 +175,14 @@ class PlanExecutor:
         attach_report = bool(request.get("attach_report", False))
 
         def handler(_values: dict[str, Any]) -> dict[str, Any]:
-            if "files.read_document" in tools:
+            if ToolNames.FILES_READ_DOCUMENT in tools:
                 paths = arguments.get("paths") or arguments.get("path") or request.get("attachment_paths") or []
                 if isinstance(paths, str):
                     paths = [paths]
                 documents: list[str] = []
                 resolved_paths: list[str] = []
                 for path in paths:
-                    result = self.tool_call("files.read_document", path=str(path))
+                    result = self.tool_call(ToolNames.FILES_READ_DOCUMENT, path=str(path))
                     if not getattr(result, "ok", False):
                         raise RuntimeError(str(getattr(result, "error", "本地文档读取失败")))
                     output = getattr(result, "output", {})
@@ -192,7 +192,7 @@ class PlanExecutor:
                 if not documents:
                     raise RuntimeError("本地文档读取节点没有提供可用路径")
                 return {"evidence": "\n\n".join(documents), "resolved_paths": resolved_paths, "_tool_calls": len(documents)}
-            if "web.research" in tools or (attach_report and "web.research" in tools):
+            if ToolNames.WEB_RESEARCH in tools or (attach_report and ToolNames.WEB_RESEARCH in tools):
                 result = self.research(query)
                 report = str(getattr(result, "report", ""))
                 if not report.strip():
@@ -202,9 +202,9 @@ class PlanExecutor:
                     "artifact_path": str(getattr(result, "artifact_path", "")),
                     "_tool_calls": 1,
                 }
-            tool_name = "web.search" if "web.search" in tools else tools[0]
+            tool_name = ToolNames.WEB_SEARCH if ToolNames.WEB_SEARCH in tools else tools[0]
             call_arguments = {"query": query, "limit": 5}
-            if tool_name == "knowledge.search":
+            if tool_name == ToolNames.KNOWLEDGE_SEARCH:
                 call_arguments = {"query": query, "top_k": 5}
             result = self.tool_call(tool_name, **call_arguments)
             if not getattr(result, "ok", False):

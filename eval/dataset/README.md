@@ -1,6 +1,6 @@
 # DeskPilotBench Dataset
 
-> 主数据集现为 v0.8，共 160 条；除既有复合操作、索引感知路由和 RAG 回归用例外，新增 Supervisor 真实执行链、Memory Gate、`debug3.md` 历史问题、P1 基线修复以及 P1.5/P2 调用归因与可靠性看护用例。完整统计、运行模式与 mock 说明以 `../数据集描述文档.md` 为准。旧版 92/140/146/152/156 条统计仅为历史记录；`offline` 现禁用外部 API，不能和历史报告的同名模式直接比较。另有 3 条可选的 `local_multimodal_cases.jsonl` 本地真实 PDF 用例。
+> 主数据集现为 v0.9，共 163 条；新增 2 条固定网页 API 用例和 1 条多智能体网页写文件用例，全部使用 fixture/mock。完整统计、运行模式与 mock 说明以 `../数据集描述文档.md` 为准。旧版 92/140/146/152/156/160 条统计仅为历史记录；`offline` 现禁用外部 API，不能和历史报告的同名模式直接比较。另有 3 条可选的 `local_multimodal_cases.jsonl` 本地真实 PDF 用例。
 
 `reg_rag_compare_001` 使用本地真实 `blip.pdf` 与 `blip-2.pdf`，检查短标题、连字符变体、跨论文均衡取证、综合回答与双文档引用来源。该用例需要真实 LLM API。
 
@@ -10,7 +10,7 @@
 
 ## RAG P0 检索层数据集
 
-`rag_p0_cases.jsonl` 是与 160 条端到端主数据集分离的检索层数据集，共 10 条。它直接评估 chunk/section 召回，避免最终 LLM 回答掩盖分块和索引问题：
+`rag_p0_cases.jsonl` 是与 163 条端到端主数据集分离的检索层数据集，共 10 条。它直接评估 chunk/section 召回，避免最终 LLM 回答掩盖分块和索引问题：
 
 - Markdown 标题、列表和表格结构：3 条。
 - TXT 语义主题边界：1 条。
@@ -76,7 +76,7 @@
 .\.conda\deskpilot-py311\python.exe -m eval.run_rag_p1_eval --mode api --strategy hybrid --include-local --case-id rag_p1_007
 ```
 
-主数据集当前包含 160 条用例。`safe_009` 至 `safe_011` 用于看护 LLM 伪造 `confirm`、危险 Python 静态阻断和受保护目录移动；`multi_exec_001` 用于看护 Planner、PlanExecutor、Supervisor 与人工确认的完整 DAG；`memory_gate_001` 至 `memory_gate_002` 用于看护低价值问答跳过记忆抽取和显式偏好进入记忆处理；`reg_debug3_001` 至 `reg_debug3_006` 覆盖历史问题；`reg_p1_*` 覆盖 P1 基线缺陷；`p15_*` 与 `p2_*` 看护单调用直答、角色上下文、网页可靠性和精排 trace。具体子集数量以 `deskpilot_bench.jsonl` 实时统计为准。
+主数据集当前包含 163 条用例。`safe_009` 至 `safe_011` 用于看护 LLM 伪造 `confirm`、危险 Python 静态阻断和受保护目录移动；`multi_exec_001` 用于看护 Planner、PlanExecutor、Supervisor 与人工确认的完整 DAG；`memory_gate_001` 至 `memory_gate_002` 用于看护低价值问答跳过记忆抽取和显式偏好进入记忆处理；`reg_debug3_001` 至 `reg_debug3_006` 覆盖历史问题；`reg_p1_*` 覆盖 P1 基线缺陷；`p15_*` 与 `p2_*` 看护单调用直答、角色上下文、网页可靠性和精排 trace。`api_web_*` 与 `api_multi_file_001` 为 v0.9 分级 API 套件提供中高难度固定样本。具体子集数量以 `deskpilot_bench.jsonl` 实时统计为准。
 
 GAIA/Ragas 改编来源清单位于 dataset/public_sources/gaia_ragas_adaptation_manifest.json。
 
@@ -116,6 +116,7 @@ GAIA/Ragas 改编来源清单位于 dataset/public_sources/gaia_ragas_adaptation
     "mode": "direct_answer|tool_call|clarify",
     "must_have_step": "step name",
     "must_include": ["required fact"],
+    "must_include_any": ["one accepted wording", "equivalent wording"],
     "must_not_include": ["forbidden claim"],
     "requires_confirmation": false
   },
@@ -130,6 +131,8 @@ GAIA/Ragas 改编来源清单位于 dataset/public_sources/gaia_ragas_adaptation
 - input：单轮输入；conversation 存在时优先使用多轮输入。
 - setup.index_files：运行前导入的本地 fixture。
 - expected：可自动检查的期望行为，不要求回答逐字匹配。
+- `must_include` 要求全部命中；`must_include_any` 用于安全拒绝等存在多种等价表述的场景，命中任一项即可。不要用单一措辞误判语义正确的回答。
+- 评测 JSONL 除 `steps` 名称列表外还保存 `step_details`，其中包含每步的 `name/status/detail`，用于审计 Router、Planner、PlanRepair 和 Supervisor 的结构化输出。
 - runtime.requires_network：需要真实网络时设为 true；`requires_online` 仅作为旧数据兼容别名。
 - runtime.requires_email：需要真实邮箱服务且没有 mock 时设为 true。
 - runtime.has_side_effect：用例涉及外部副作用时设为 true，供套件审计和报告展示；它不等于自动批准。
@@ -148,16 +151,16 @@ P1 用例沿用同一 JSONL 模板，新增字段可放在 `expected` 中，例�
 
 ## 多模态 P0/P1 数据集
 
-`multimodal_cases.jsonl` 是独立于 DeskPilotBench 主集的 12 条轻量数据，运行时由评测脚本生成红/蓝办公截图，不存放个人图片或大型公开数据集文件：
+`multimodal_cases.jsonl` 是独立于 DeskPilotBench 主集的 16 条轻量数据，运行时由评测脚本生成红/蓝办公截图，不存放个人图片或大型公开数据集文件。真实 VLM 固定套件选择简单/中等/复杂各 1 条，并记录服务端返回的 Token usage。用例覆盖剪贴板敏感等级、SQLite WAL 和资产删除生命周期：
 
-- `Multimodal-Safety` 5 条：内容去重、损坏文件、像素上限、向量空间隔离、Base64 不落盘。
+- `Multimodal-Safety` 8 条：内容去重、损坏文件、像素上限、向量空间隔离、Base64 不落盘、敏感图片、WAL 和资产删除。
 - `Multimodal-RAG` 4 条：文本搜图、以图搜图和 OCR/视觉 RRF 融合。
-- `Multimodal-QA` 3 条：单图读取、多图比较和图片引用，需要真实视觉 API。
+- `Multimodal-QA` 4 条：单图读取、多图比较、图片引用和复杂跨图对应关系，需要真实视觉 API。
 
 离线结构评测：
 
 ```powershell
-python -m eval.run_multimodal_eval --mode offline --count 12
+python -m eval.run_multimodal_eval --mode offline --count 16
 ```
 
 真实 VLM 评测需要配置 `VISION_MODEL`、`VISION_API_KEY` 和 `ALLOW_CLOUD_IMAGE_UPLOAD=true`：

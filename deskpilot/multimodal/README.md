@@ -3,10 +3,13 @@
 该模块实现多模态 P0/P1，并保持原图、派生文本和向量分离：
 
 - `AssetStore` 将校验后的图片和缩略图放入受控资产目录，SQLite 只保存路径和元数据。
-- `VisionLLMProvider` 使用 OpenAI-compatible `image_url` 消息完成单图/多图问答。
+- `VisionLLMProvider` 使用 OpenAI-compatible `image_url` 消息完成单图/多图问答，并支持 SSE 增量输出。
 - `PaddleOCRProvider` 与 `SigLIP2EmbeddingProvider` 都是延迟加载的可选本地 Provider。
 - `MultimodalVectorStore` 按 `embedding_space + dimension` 隔离向量，禁止不同模型误算。
 - `MultimodalRetriever` 用 RRF 融合 OCR 关键词、OCR 文本向量和视觉向量。
+- PDF 页图在一次 OCR worker 和一次视觉 worker 调用中批量处理；worker 内批大小由 `IMAGE_EMBEDDING_BATCH_SIZE` 限制。
+- OCR 文本优先复用 Embedding API 生成版本化语义向量；无 API 时降级为 `text/local-hash-v1`。
+- SQLite 使用 WAL 和 busy timeout；资产删除同步清理文件、chunk 与向量。
 
 ## 模型选择
 
@@ -36,13 +39,15 @@ python -m pip install -r requirements-multimodal.txt
 VISION_MODEL=qwen-vl-max-latest
 VISION_API_KEY=your_key
 ALLOW_CLOUD_IMAGE_UPLOAD=true
+SENSITIVE_IMAGE_POLICY=confirm
 ```
 
 启用本地检索：
 
 ```dotenv
 IMAGE_EMBEDDING_PROVIDER=siglip2
+IMAGE_EMBEDDING_BATCH_SIZE=8
 OCR_PROVIDER=paddleocr
 ```
 
-首次加载 SigLIP2 可能需要下载模型。DeskPilot 不会把 Base64、API Key 或原始图片写入会话 JSONL。
+`SENSITIVE_IMAGE_POLICY` 支持 `block|confirm|allow`。剪贴板/截图默认标记为敏感，默认策略会在聊天内请求单次人工确认。首次加载 SigLIP2 可能需要下载模型。DeskPilot 不会把 Base64、API Key 或原始图片写入会话 JSONL。

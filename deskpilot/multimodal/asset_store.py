@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from ..core.config import DATA_DIR
+from ..core.sqlite_utils import connect_sqlite
 from .image_processor import ImageProcessor, ProcessedImage
 from .models import MediaAsset
 
@@ -26,8 +27,7 @@ class AssetStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.database)
-        connection.row_factory = sqlite3.Row
+        connection = connect_sqlite(self.database)
         try:
             yield connection
             connection.commit()
@@ -62,6 +62,14 @@ class AssetStore:
         digest = hashlib.sha256(processed.content).hexdigest()
         existing = self.get_by_sha256(digest)
         if existing:
+            # 同一图片后来以截图/剪贴板进入时，只允许提高敏感等级，不能被旧记录降级。
+            if self._sensitivity_rank(sensitivity) > self._sensitivity_rank(existing.sensitivity):
+                with self._connect() as connection:
+                    connection.execute(
+                        "UPDATE assets SET sensitivity = ? WHERE asset_id = ?",
+                        (sensitivity, existing.asset_id),
+                    )
+                existing.sensitivity = sensitivity
             return existing
         asset_id = f"asset_{digest[:20]}"
         asset_dir = self.root / digest[:2]
@@ -106,6 +114,25 @@ class AssetStore:
                 "SELECT * FROM assets ORDER BY created_at DESC LIMIT ?", (max(1, min(limit, 5000)),)
             ).fetchall()
         return [self._from_row(row) for row in rows]
+
+    def delete(self, asset_id: str) -> bool:
+        asset = self.get(asset_id)
+        if asset is None:
+            return False
+        with self._connect() as connection:
+            connection.execute("DELETE FROM assets WHERE asset_id = ?", (asset_id,))
+        Path(asset.original_path).unlink(missing_ok=True)
+        Path(asset.thumbnail_path).unlink(missing_ok=True)
+        original_parent = Path(asset.original_path).parent
+        try:
+            original_parent.rmdir()
+        except OSError:
+            pass
+        return True
+
+    @staticmethod
+    def _sensitivity_rank(value: str) -> int:
+        return {"normal": 0, "private": 1, "sensitive": 2}.get(str(value).casefold(), 1)
 
     @staticmethod
     def _from_row(row: sqlite3.Row) -> MediaAsset:

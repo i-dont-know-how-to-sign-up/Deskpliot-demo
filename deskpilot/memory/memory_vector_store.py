@@ -10,6 +10,7 @@ from typing import Iterator
 
 from ..core.api_clients import cosine_similarity
 from ..core.config import MEMORY_VECTOR_DIR, ensure_dirs
+from ..core.sqlite_utils import connect_sqlite
 
 
 @dataclass
@@ -102,8 +103,7 @@ class SQLiteMemoryVectorStore(MemoryVectorStore):
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.db_file)
-        conn.row_factory = sqlite3.Row
+        conn = connect_sqlite(self.db_file)
         try:
             yield conn
             conn.commit()

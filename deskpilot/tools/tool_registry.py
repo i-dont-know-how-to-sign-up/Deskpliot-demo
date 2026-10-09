@@ -199,6 +199,26 @@ def build_default_tool_registry(
 
     if multimodal_service is not None:
         registry.register(ToolSpec(
+            name="vision.answer_attachments", category="vision",
+            description="使用云端视觉模型回答当前会话图片；敏感图片需要人工确认。",
+            parameters=[
+                ToolParameter("question", "string", True, "图片问题"),
+                ToolParameter("asset_ids", "array", True, "受控图片资产 ID"),
+            ],
+            handler=lambda question, asset_ids: {
+                "permission": multimodal_service.sensitive_permission(
+                    multimodal_service.sensitive_assets(list(asset_ids))
+                ),
+                "answered": False,
+            },
+            approval_handler=lambda question, asset_ids: {
+                "answer": multimodal_service.answer(
+                    str(question), list(asset_ids), confirm_sensitive=True
+                ),
+                "answered": True,
+            },
+        ))
+        registry.register(ToolSpec(
             name="vision.inspect_image", category="vision",
             description="校验并检查本地图片，可选执行 OCR；只读源文件，结果不包含 Base64。",
             parameters=[
@@ -235,6 +255,12 @@ def build_default_tool_registry(
                 ToolParameter("top_k", "integer", False, "检索候选数量", 4),
             ],
             handler=lambda query, top_k=4: multimodal_service.answer_from_index(str(query), int(top_k)),
+            approval_handler=lambda query, top_k=4: {
+                "answered": True,
+                **multimodal_service.answer_from_index(
+                    str(query), int(top_k), confirm_sensitive=True
+                ),
+            },
         ))
 
     # 邮件工具统一走 MCP 业务层；发送和保存草稿由业务层返回审批信息。

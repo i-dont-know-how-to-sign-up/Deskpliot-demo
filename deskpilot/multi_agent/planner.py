@@ -93,7 +93,7 @@ class PlannerAgent:
  "description":"...","depends_on":[],"allowed_tools":[],"requires_human":false,"arguments":{{}}}}]}}
 
 规则：knowledge 负责搜索和读取资料，communication 负责生成内容，commit 负责发送邮件、保存草稿或写文件；
-所有 commit 节点必须 requires_human=true。简单问答可以 steps=[] 且 route=single_agent。
+所有 commit 节点必须 requires_human=true。Router 已经判定当前请求需要规划，因此 steps 不能为空，且至少一个节点必须选择可执行工具。
 如果用户用自然语言描述文档，必须从“工作区文件清单”选择真实文件路径，并写入 knowledge.arguments.paths，不能把描述原样当作路径。
 若用户要求汇总已建立索引的多篇资料并写报告：knowledge.allowed_tools=["knowledge.search"]，knowledge.arguments.query 填纯检索主题，knowledge.arguments.doc_ids 从“索引文档目录”选择相关 ID；commit.allowed_tools=["files.write_file"]，commit.arguments.path 填明确指定的报告文件路径；只说“当前目录”但未指定文件名时留空，由执行器生成技术报告.md。不得把知识库文档当作工作区路径。
 若只要求汇总多篇已索引文档，同样选相关 doc_ids，但不要加入 commit 节点。不要把索引之外的文档编造为已索引。
@@ -101,6 +101,8 @@ class PlannerAgent:
 若用户要求先联网搜索、再把搜索结果写进文件（即使先说创建文件、后说搜索也一样）：knowledge.allowed_tools=["web.search"]，knowledge.arguments.query 填纯搜索主题；commit.allowed_tools=["files.write_file"]，commit.arguments.path 填目标文件名或明确路径，depends_on=["knowledge"]。不要将“写入到整个文件中”等写入动作说明当成文件内容；写入正文来自前置搜索结果。若明确要求写到桌面，输出路径应在用户的桌面目录下，不能写到当前工作目录。
 如果任务涉及邮件，必须在 commit.arguments 中填写 to、subject、request；没有明确标题时生成合理标题，没有明确正文时将用户要求作为 request。
 邮件提交只能选一个工具：只保存草稿使用 email.save_draft；明确要求发送使用 email.send。生成草稿不等于发送。
+把已有本地文件作为邮件附件不代表创建新文件：读取节点使用 files.read_document，提交节点使用 email.send 或 email.save_draft，
+不得添加 files.write_file；附件文件名应从工作区文件清单选择并写入 attachment_paths。
 如果用户要求先整理文档并作为附件发送，knowledge.allowed_tools 必须包含 web.research，commit.arguments 必须设置 attach_report=true；
 附件路径是前置节点运行时产生的动态结果，不要虚构 attachment_paths。
 request/query/topic 只能填写要搜索或调研的主题，不得包含“在网上搜索、整理成文档、作为附件、发送给某人”等操作指令。
@@ -148,6 +150,8 @@ Planner 独立运行时上下文（其中已包含当前任务）：{conversatio
 
     def validate(self, plan: TaskPlan) -> tuple[bool, str]:
         """执行前校验节点、依赖、预算和高风险动作。"""
+        if not plan.steps:
+            return False, "计划没有可执行节点"
         if len(plan.steps) > plan.max_agents + 1:
             return False, "计划节点数超过预算"
         ids = {step.step_id for step in plan.steps}

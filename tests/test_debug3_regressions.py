@@ -85,8 +85,17 @@ class Debug3RegressionTests(unittest.TestCase):
              "allowed_tools": ["files.write_file"], "arguments": {"path": "weather.txt"}},
         ]}
         self.assertEqual(DocumentQAAgent._planned_web_file_request(plan), {
-            "query": "上海天气", "path": "weather.txt",
+            "query": "上海天气", "path": "weather.txt", "source_tool": "web.search",
         })
+        research_plan = {"steps": [
+            {"id": "research", "allowed_tools": ["web.research"], "arguments": {}},
+            {"id": "write", "depends_on": ["research"],
+             "allowed_tools": ["files.write_file"], "arguments": {"path": "report.md"}},
+        ]}
+        self.assertEqual(
+            DocumentQAAgent._planned_web_file_request(research_plan, fallback_query="Agent 框架"),
+            {"query": "Agent 框架", "path": "report.md", "source_tool": "web.research"},
+        )
         index_plan = {"steps": [{
             "id": "knowledge_9", "allowed_tools": ["knowledge.search"],
             "arguments": {"query": "Falcon", "doc_ids": ["a", "b"]},

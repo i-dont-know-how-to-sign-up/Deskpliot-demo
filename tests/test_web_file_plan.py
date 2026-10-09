@@ -176,7 +176,7 @@ def test_semantic_router_and_planner_accept_web_file_dependencies() -> None:
         agent = DocumentQAAgent.__new__(DocumentQAAgent)
         steps = [{"id": s.step_id, "allowed_tools": s.allowed_tools, "arguments": s.arguments} for s in plan.steps]
         assert agent._planned_web_file_request({"steps": steps}) == {
-            "query": "上海明天的天气", "path": "weather.txt"
+            "query": "上海明天的天气", "path": "weather.txt", "source_tool": "web.search"
         }
 
 

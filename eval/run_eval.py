@@ -35,6 +35,7 @@ from deskpilot.tools.tool_registry import build_default_tool_registry
 from deskpilot import __version__
 
 from .scoring import score_case
+from .api_health import circuit_breaker_results, is_infrastructure_error, run_api_preflight
 
 DATASET = Path(__file__).parent / "dataset" / "deskpilot_bench.jsonl"
 FIXTURES = Path(__file__).parent / "dataset" / "fixtures"
@@ -89,7 +90,7 @@ def _prepare_run_metadata(args: argparse.Namespace) -> dict[str, Any]:
     config = load_config()
     started = getattr(args, "started_at", _now())
     git = _git_metadata()
-    return {
+    metadata = {
         "project": "DeskPilot",
         "project_version": args.project_version,
         "run_name": args.run_name,
@@ -110,6 +111,10 @@ def _prepare_run_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "embedding_configured": bool(config.embedding_api_key),
         "allow_local_fallback": config.allow_local_fallback,
     }
+    preflight = getattr(args, "api_preflight", None)
+    if isinstance(preflight, dict):
+        metadata["api_preflight"] = preflight
+    return metadata
 
 
 def load_cases(path: Path) -> list[dict[str, Any]]:
@@ -476,6 +481,19 @@ def render_report(results: list[dict[str, Any]], args: argparse.Namespace) -> st
         ok = [item for item in run if item["status"] == "passed"]
         avg = sum(float(item.get("score", 0)) for item in run) / len(run) if run else 0
         lines.append(f"| {subset_names.get(subset, subset)} | {len(selected)} | {len(ok)} | {avg:.4f} |")
+    difficulties = sorted({str(item.get("difficulty", "unspecified")) for item in results})
+    lines.extend([
+        "", "## 分难度质量统计", "",
+        "| 难度 | 用例数 | 执行数 | 通过数 | 准确率 |",
+        "|---|---:|---:|---:|---:|",
+    ])
+    for difficulty in difficulties:
+        selected = [item for item in results if str(item.get("difficulty", "unspecified")) == difficulty]
+        stats = aggregate_results(selected)
+        lines.append(
+            f"| {difficulty} | {len(selected)} | {stats['executed']} | "
+            f"{stats['passed']} | {stats['accuracy']:.4f} |"
+        )
     lines.extend([
         "",
         "## 分模块效率统计",
@@ -609,6 +627,11 @@ def main() -> int:
     parser.add_argument("--report", type=Path, default=None)
     parser.add_argument("--metadata", type=Path, default=None)
     parser.add_argument(
+        "--skip-api-preflight",
+        action="store_true",
+        help="skip the LLM and embedding connectivity preflight (not recommended)",
+    )
+    parser.add_argument(
         "--no-progress",
         dest="progress",
         action="store_false",
@@ -624,9 +647,14 @@ def main() -> int:
     args.metadata = args.metadata or args.output.with_suffix(".metadata.json")
     cases = load_cases(args.dataset)
     selected_case_ids = list(args.case_id or [])
+    suite_difficulties: dict[str, str] = {}
     if args.suite:
         suite = _load_suite(args.suite)
         selected_case_ids.extend(str(item) for item in suite["case_ids"])
+        suite_difficulties = {
+            str(item.get("id")): str(item.get("difficulty", "unspecified"))
+            for item in suite.get("cases", []) if isinstance(item, dict) and item.get("id")
+        }
         args.run_name = str(suite.get("name") or args.run_name)
     if selected_case_ids:
         by_id = {str(case.get("id")): case for case in cases}
@@ -635,6 +663,10 @@ def main() -> int:
             parser.error(f"Unknown case IDs: {', '.join(missing)}")
         # 保留 suite 中声明的顺序，便于跨版本对比。
         cases = [by_id[case_id] for case_id in dict.fromkeys(selected_case_ids)]
+        for case in cases:
+            case["difficulty"] = suite_difficulties.get(
+                str(case.get("id")), str(case.get("difficulty", "unspecified")),
+            )
     if args.subset:
         allowed = set(args.subset)
         cases = [case for case in cases if case.get("subset") in allowed]
@@ -644,13 +676,39 @@ def main() -> int:
     total = len(cases)
     if args.progress:
         print(f"DeskPilotBench: {total} cases, mode={args.mode}", flush=True)
+    if args.mode == "api" and not args.skip_api_preflight:
+        print("[api-preflight] checking LLM and embedding endpoints...", flush=True)
+        args.api_preflight = run_api_preflight()
+        if not args.api_preflight.get("ok"):
+            results.extend(circuit_breaker_results(
+                cases,
+                cause=(
+                    f"preflight {args.api_preflight.get('stage')} failed: "
+                    f"{args.api_preflight.get('error', 'unknown API error')}"
+                ),
+            ))
+            write_outputs(results, args)
+            print(
+                "[api-preflight] failed: "
+                f"{args.api_preflight.get('error')}\n"
+                f"[api-preflight] {args.api_preflight.get('guidance')}",
+                flush=True,
+            )
+            return 2
+        print("[api-preflight] passed", flush=True)
+    consecutive_infrastructure_errors = 0
     for index, case in enumerate(cases, start=1):
         case_id = str(case.get("id", f"case-{index}"))
         started = time.perf_counter()
         if args.progress:
             print_progress(index - 1, total, case_id, "running", 0.0)
         result = run_case(case, args.mode)
+        result["difficulty"] = str(case.get("difficulty", "unspecified"))
         results.append(result)
+        if args.mode == "api" and is_infrastructure_error(result):
+            consecutive_infrastructure_errors += 1
+        else:
+            consecutive_infrastructure_errors = 0
         elapsed = (time.perf_counter() - started)
         # 每条用例完成后马上落盘，Ctrl+C 或单条卡住时仍能保留已完成结果。
         write_outputs(results, args)
@@ -663,6 +721,17 @@ def main() -> int:
                 elapsed,
                 final=True,
             )
+        if args.mode == "api" and consecutive_infrastructure_errors >= 3:
+            cause = str(result.get("error", "repeated API infrastructure failure"))
+            remaining = cases[index:]
+            results.extend(circuit_breaker_results(remaining, cause=cause))
+            write_outputs(results, args)
+            print(
+                f"[api-circuit-breaker] opened after {consecutive_infrastructure_errors} "
+                f"consecutive infrastructure errors; skipped {len(remaining)} remaining cases.",
+                flush=True,
+            )
+            break
     if not cases:
         write_outputs(results, args)
     print(render_report(results, args))

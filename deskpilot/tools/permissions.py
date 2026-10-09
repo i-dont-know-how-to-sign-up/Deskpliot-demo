@@ -177,10 +177,11 @@ def assess_python_code(code: str) -> PermissionDecision:
 
     blocked_modules = {
         "subprocess", "socket", "requests", "httpx", "urllib", "http", "ftplib", "telnetlib",
-        "smtplib", "imaplib", "ctypes", "winreg",
+        "smtplib", "imaplib", "ctypes", "winreg", "importlib",
     }
     blocked_calls = {
-        "eval", "exec", "compile", "__import__",
+        "eval", "exec", "compile", "__import__", "getattr", "setattr", "delattr",
+        "globals", "locals", "vars",
         "os.remove", "os.unlink", "os.rmdir", "os.removedirs", "os.system", "os.popen",
         "shutil.rmtree", "shutil.move",
         "pathlib.path.unlink", "pathlib.path.rmdir", "pathlib.path.rename", "pathlib.path.replace",
@@ -205,7 +206,13 @@ def assess_python_code(code: str) -> PermissionDecision:
             name = _python_call_name(node.func, aliases)
             normalized = name.casefold()
             dangerous_suffixes = (".unlink", ".rmdir", ".rename", ".replace", ".write_text", ".write_bytes")
-            if normalized in blocked_calls or normalized.startswith("subprocess.") or normalized.endswith(dangerous_suffixes):
+            process_calls = ("os.exec", "os.spawn", "os.fork", "os.startfile")
+            if (
+                normalized in blocked_calls
+                or normalized.startswith("subprocess.")
+                or normalized.startswith(process_calls)
+                or normalized.endswith(dangerous_suffixes)
+            ):
                 reasons.append(f"Call to '{name}' is blocked by the Python execution policy.")
             if normalized == "open" and _open_call_can_write(node):
                 reasons.append("Opening a file in write/append/create mode is blocked; use a file tool instead.")
@@ -223,6 +230,8 @@ def assess_command(
 ) -> PermissionDecision:
     command_text = _command_to_text(command)
     blocked_reason = _blocked_command_reason(command_text)
+    if not blocked_reason:
+        blocked_reason = _blocked_readonly_command_option_reason(command_text)
     if blocked_reason:
         return PermissionDecision(
             allowed_without_confirmation=False,
@@ -310,6 +319,21 @@ def _readonly_pipeline_commands(command_text: str) -> list[str]:
             return []
         commands.append(base)
     return commands
+
+
+def _blocked_readonly_command_option_reason(command_text: str) -> str:
+    """阻断伪装成只读命令的副作用参数，避免命令名白名单被参数绕过。"""
+    if _command_base(command_text) != "find":
+        return ""
+    # POSIX find 的这些 action 可以删除文件、执行任意命令或修改权限。使用
+    # token 边界匹配，避免把普通文件名中的 ``-delete`` 子串误判为参数。
+    dangerous = re.search(
+        r"(?i)(?:^|\s)(-(?:delete|exec|execdir|ok|okdir|chmod|chown|chgrp))(?:\s|$)",
+        command_text,
+    )
+    if dangerous:
+        return f"find action '{dangerous.group(1)}' is blocked because it can change local state."
+    return ""
 
 
 def _external_command_path_reason(command_text: str, cwd: str | Path | None) -> str:
