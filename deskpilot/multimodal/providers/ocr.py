@@ -153,7 +153,8 @@ class PaddleOCRProvider:
     def _run_batch_worker(
         input_path: Path, output_path: Path, environment: dict[str, str], timeout: int,
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+        from .process import run_model_process
+        return run_model_process(
             [sys.executable, "-m", "deskpilot.multimodal.providers.ocr_worker", str(input_path), str(output_path)],
             cwd=str(Path(__file__).resolve().parents[3]), env=environment,
             capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -224,7 +225,8 @@ class PaddleOCRProvider:
     def _run_worker(
         image_path: Path, output_path: Path, environment: dict[str, str], timeout: int,
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+        from .process import run_model_process
+        return run_model_process(
             [
                 sys.executable, "-m", "deskpilot.multimodal.providers.ocr_worker",
                 str(image_path), str(output_path),

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import tempfile
 from pathlib import Path
+
+from ..core.sqlite_utils import sqlite_transaction
+from ..tasks.control import TaskControlError, get_execution_control
 
 from .asset_store import AssetStore
 from .models import MediaAsset, MultimodalChunk, VectorRecord
@@ -155,6 +159,8 @@ class MultimodalIngestionService:
                 model_revision=self.vision.model_revision, dimension=len(vision_vector), vector=vision_vector,
                 metadata={"asset_id": asset.asset_id},
             ))
+        except TaskControlError:
+            raise
         except (RuntimeError, OSError, MemoryError) as exc:
             # OCR 与视觉向量是独立检索通道。可选视觉模型资源不足时保留已完成的
             # OCR 索引，避免把可用资产错误报告成完全失败。
@@ -208,66 +214,139 @@ class MultimodalIngestionService:
             raise RuntimeError("PDF 页图索引需要 PyMuPDF") from exc
         path = path.expanduser().resolve()
         max_pages = max(1, min(int(os.getenv("MULTIMODAL_PDF_MAX_PAGES", "80")), 500))
-        doc_id = f"pdf_{hashlib.sha256(path.read_bytes()).hexdigest()[:16]}"
+        hasher = hashlib.sha256()
+        with path.open("rb") as stream:
+            for part in iter(lambda: stream.read(1024 * 1024), b""):
+                hasher.update(part)
+        file_sha = hasher.hexdigest()
+        doc_id = f"pdf_{file_sha[:16]}"
+        signature = json.dumps({
+            "sha256": file_sha, "version": "pdf-batch-v1", "max_pages": max_pages,
+            "ocr": [getattr(self.ocr, name, "") for name in ("provider", "model_id", "model_revision")],
+            "vision": self.vision.embedding_space, "text": self.text_embedder.embedding_space,
+        }, sort_keys=True)
+        job_key = hashlib.sha256(signature.encode()).hexdigest()
+        batch_size = max(1, min(int(os.getenv("MULTIMODAL_PDF_BATCH_SIZE", "4")), 32))
+        database = self.assets.root / "ingestion_checkpoints.sqlite3"
+        with sqlite_transaction(database) as connection:
+            connection.execute("CREATE TABLE IF NOT EXISTS pdf_pages "
+                               "(job_key TEXT NOT NULL, page INTEGER NOT NULL, result_json TEXT NOT NULL, "
+                               "PRIMARY KEY(job_key,page))")
+            cached = {int(row[0]): json.loads(row[1]) for row in connection.execute(
+                "SELECT page,result_json FROM pdf_pages WHERE job_key=?", (job_key,))}
+        results: list[dict] = []
+        control = get_execution_control()
+
+        def checkpoint() -> None:
+            if control is not None:
+                control.checkpoint()
+
+        def flush() -> None:
+            if not rendered:
+                return
+            checkpoint()
+            generated = self._ingest_pdf_batch(rendered, doc_id)
+            for item, result in zip(rendered, generated):
+                page = item[2]
+                result["page_number"] = page
+                with sqlite_transaction(database) as connection:
+                    connection.execute("INSERT OR REPLACE INTO pdf_pages VALUES (?, ?, ?)",
+                                       (job_key, page, json.dumps(result, ensure_ascii=False)))
+                results.append(result)
+                if control is not None:
+                    with control._lock:
+                        control._event("pdf_checkpoint", page=page, document_sha=file_sha,
+                                       embedding_status=result.get("embedding_status", ""))
+            for temp_path, _asset, _page, _label in rendered:
+                temp_path.unlink(missing_ok=True)
+            rendered.clear()
+            checkpoint()
+
         rendered: list[tuple[Path, MediaAsset, int, str]] = []
         try:
             # 渲染也必须处于清理范围内，否则中途解析失败会遗留临时页图。
             with fitz.open(path) as document:
+                if control is not None:
+                    with control._lock:
+                        control._event("pdf_started", total_pages=min(max_pages, len(document)), document_sha=file_sha)
                 for page_index, page in enumerate(document):
                     if page_index >= max_pages:
                         break
+                    checkpoint()
+                    page_number = page_index + 1
+                    saved = cached.get(page_number)
+                    if saved is not None and self.assets.get(saved["asset"]["asset_id"]) is not None:
+                        chunk_id = saved["chunk_id"]
+                        channels_valid = self.vectors.has_vector(chunk_id, self.text_embedder.embedding_space)
+                        if saved.get("embedding_status") == "success":
+                            channels_valid = channels_valid and self.vectors.has_vector(chunk_id, self.vision.embedding_space)
+                        elif os.getenv("MULTIMODAL_RETRY_MISSING_VISION", "false").lower() == "true":
+                            channels_valid = False
+                        if channels_valid:
+                            results.append({**saved, "checkpoint_reused": True})
+                            if control is not None:
+                                with control._lock:
+                                    control._event("pdf_checkpoint", page=page_number, document_sha=file_sha, reused=True)
+                            continue
                     pixmap = page.get_pixmap(matrix=fitz.Matrix(1.35, 1.35), alpha=False)
                     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temporary:
                         temporary.write(pixmap.tobytes("png"))
                         temp_path = Path(temporary.name)
-                    page_number = page_index + 1
                     label = f"{path.name}#page-{page_number}"
                     asset = self.assets.ingest_file(
                         temp_path, source_kind="pdf_page", parent_doc_id=doc_id,
                         page_number=page_number, metadata={"source_name": label},
                     )
                     rendered.append((temp_path, asset, page_number, label))
+                    if len(rendered) >= batch_size:
+                        flush()
+                flush()
 
-            # 一次 worker 处理整批页面，避免每页重复加载 Paddle/Torch。
-            provider_paths = [Path(asset.original_path) for _, asset, _, _ in rendered]
-            recognize_many = getattr(self.ocr, "recognize_many", None)
-            region_groups = recognize_many(provider_paths) if callable(recognize_many) else [
-                self.ocr.recognize(item) for item in provider_paths
-            ]
-            if len(region_groups) != len(provider_paths):
-                raise RuntimeError(
-                    f"OCR 批处理返回数量不一致：期望 {len(provider_paths)}，实际 {len(region_groups)}"
-                )
-            if hasattr(self.ocr, "release"):
-                self.ocr.release()
-            vision_vectors: list[list[float] | None] = [None] * len(provider_paths)
-            vision_error = ""
-            try:
-                if not self._vision_available:
-                    raise RuntimeError(self._vision_error or "视觉编码器在本次运行中不可用")
-                generated = self.vision.embed_images(provider_paths) if provider_paths else []
-                vision_vectors = list(generated)
-                if len(vision_vectors) != len(provider_paths):
-                    raise RuntimeError(
-                        f"视觉向量批处理返回数量不一致：期望 {len(provider_paths)}，实际 {len(vision_vectors)}"
-                    )
-            except (RuntimeError, OSError, MemoryError) as exc:
-                vision_error = str(exc)
-                self._vision_available = False
-                self._vision_error = vision_error
-            results: list[dict] = []
-            for item, regions, vector in zip(rendered, region_groups, vision_vectors):
-                temp_path, asset, page_number, label = item
-                results.append(self.ingest_image(
-                    temp_path, source_kind="pdf_page", parent_doc_id=doc_id,
-                    page_number=page_number, source_label=label, _asset=asset,
-                    _regions=regions, _vision_vector=vector, _vision_error=vision_error,
-                    _providers_precomputed=True,
-                ))
-            return results
+            return sorted(results, key=lambda item: int(item.get("page_number") or item["asset"].get("page_number") or 0))
         finally:
             for temp_path, _asset, _page, _label in rendered:
                 temp_path.unlink(missing_ok=True)
+
+    def _ingest_pdf_batch(self, rendered: list[tuple[Path, MediaAsset, int, str]], doc_id: str) -> list[dict]:
+        # 限制每批页数，降低峰值内存，并在批次提交后提供可恢复边界。
+        provider_paths = [Path(asset.original_path) for _, asset, _, _ in rendered]
+        recognize_many = getattr(self.ocr, "recognize_many", None)
+        region_groups = recognize_many(provider_paths) if callable(recognize_many) else [
+            self.ocr.recognize(item) for item in provider_paths
+        ]
+        if len(region_groups) != len(provider_paths):
+            raise RuntimeError(
+                f"OCR 批处理返回数量不一致：期望 {len(provider_paths)}，实际 {len(region_groups)}"
+            )
+        if hasattr(self.ocr, "release"):
+            self.ocr.release()
+        vision_vectors: list[list[float] | None] = [None] * len(provider_paths)
+        vision_error = ""
+        try:
+            if not self._vision_available:
+                raise RuntimeError(self._vision_error or "视觉编码器在本次运行中不可用")
+            generated = self.vision.embed_images(provider_paths) if provider_paths else []
+            vision_vectors = list(generated)
+            if len(vision_vectors) != len(provider_paths):
+                raise RuntimeError(
+                    f"视觉向量批处理返回数量不一致：期望 {len(provider_paths)}，实际 {len(vision_vectors)}"
+                )
+        except TaskControlError:
+            raise
+        except (RuntimeError, OSError, MemoryError) as exc:
+            vision_error = str(exc)
+            self._vision_available = False
+            self._vision_error = vision_error
+        results: list[dict] = []
+        for item, regions, vector in zip(rendered, region_groups, vision_vectors):
+            temp_path, asset, page_number, label = item
+            results.append(self.ingest_image(
+                temp_path, source_kind="pdf_page", parent_doc_id=doc_id,
+                page_number=page_number, source_label=label, _asset=asset,
+                _regions=regions, _vision_vector=vector, _vision_error=vision_error,
+                _providers_precomputed=True,
+            ))
+        return results
 
     def ingest_file(self, path: Path) -> list[dict]:
         if path.suffix.casefold() == ".pdf":

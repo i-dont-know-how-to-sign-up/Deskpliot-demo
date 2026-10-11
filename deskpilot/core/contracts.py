@@ -19,6 +19,7 @@ class ToolNames:
 
     KNOWLEDGE_SEARCH = "knowledge.search"
     KNOWLEDGE_ANSWER_MULTIMODAL = "knowledge.answer_multimodal"
+    KNOWLEDGE_SEARCH_DIRECTORY_IMAGES = "knowledge.search_directory_images"
     WEB_SEARCH = "web.search"
     WEB_RESEARCH = "web.research"
     FILES_READ_DOCUMENT = "files.read_document"
@@ -38,6 +39,7 @@ SOURCE_TOOLS = frozenset({
     ToolNames.WEB_SEARCH,
     ToolNames.WEB_RESEARCH,
     ToolNames.KNOWLEDGE_SEARCH,
+    ToolNames.KNOWLEDGE_SEARCH_DIRECTORY_IMAGES,
     ToolNames.FILES_READ_DOCUMENT,
 })
 

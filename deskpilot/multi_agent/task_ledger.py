@@ -1,141 +1,137 @@
 from __future__ import annotations
 
-import json
-import hashlib
-import os
-import secrets
-from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
 from typing import Any
 
+from ..tasks import TaskStore
 from .schemas import AgentResult, TaskPlan
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+_UNSET = object()
 
 
 class TaskLedger:
-    """持久化复杂任务的计划和节点状态，不保存工具敏感参数。"""
+    """兼容旧执行回调，实际输入和输出经独立引用持久保存。"""
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
-        self._lock = Lock()
-        self._mark_interrupted_tasks()
+        self.store = TaskStore(self.path)
+        # 新实例只回收到期 lease，不打断仍然存活的 worker。
+        self.store.expire_leases()
+        self.store.recover_orphaned_tasks()
 
-    def start(self, plan: TaskPlan) -> str:
-        task_id = f"task_{secrets.token_urlsafe(12)}"
-        record = {
-            "task_id": task_id,
-            "goal": " -> ".join(step.step_id for step in plan.steps),
-            "goal_digest": hashlib.sha256(plan.goal.encode("utf-8")).hexdigest()[:16],
-            "status": "running",
-            "created_at": _now(),
-            "updated_at": _now(),
-            "nodes": {
-                step.step_id: {
-                    "agent": step.agent,
-                    "status": "pending",
-                    "depends_on": list(step.depends_on),
-                    "allowed_tools": list(step.allowed_tools),
-                    "requires_human": step.requires_human,
-                }
-                for step in plan.steps
-            },
-            "safe_to_resume": True,
-        }
-        self._upsert(record)
-        return task_id
+    def start(
+        self, plan: TaskPlan | dict[str, Any], *, initial_values: Any = None,
+        session_id: str = "", plan_version: str | None = None, executor_version: str = "1",
+        status: str = "running", **kwargs: Any,
+    ) -> str:
+        descriptor = self._plan_metadata(plan)
+        metadata = descriptor.get("metadata", {})
+        if initial_values is None:
+            initial_values = metadata.get("initial_values", {})
+        session_id = session_id or str(metadata.get("session_id", ""))
+        plan_version = str(plan_version if plan_version is not None else descriptor.get("plan_version", "1"))
+        return self.store.create_task(
+            plan, initial_values=initial_values, session_id=session_id, plan_version=plan_version,
+            executor_version=executor_version, status=status, **kwargs,
+        )
 
-    def update_node(self, task_id: str, result: AgentResult) -> None:
-        records = self._read()
-        record = next((item for item in records if item.get("task_id") == task_id), None)
-        if record is None:
+    def update_node(self, task_id: str, result: AgentResult, **kwargs: Any) -> None:
+        if self.store.get_task(task_id) is None:
             return
-        node = record.setdefault("nodes", {}).setdefault(result.step_id, {})
-        node.update({
-            "status": result.status,
-            "error": result.error[:1000],
-            "tool_calls": result.tool_calls,
-            "tokens": result.tokens,
-            "artifact_paths": self._artifact_paths(result.output),
-        })
-        if node.get("requires_human") or result.status == "pending":
-            # 外部副作用节点在重启后必须重新获得用户确认，不能自动重放。
-            record["safe_to_resume"] = False
-        record["updated_at"] = _now()
-        self._write(records)
+        checks = getattr(result, "checks", {})
+        if checks:
+            kwargs.setdefault("checks", checks)
+            kwargs.setdefault("validation", {"ok": result.status in {"success", "succeeded"} and self._checks_pass(checks), "checks": checks})
+        kwargs.setdefault("attempt_id", getattr(result, "attempt_id", "") or None)
+        kwargs.setdefault("error_category", getattr(result, "error_category", ""))
+        self.store.update_node(
+            task_id, result.step_id, result.status, output=result.output, error=result.error,
+            tool_calls=result.tool_calls, tokens=result.tokens, **kwargs,
+        )
 
-    def finish(self, task_id: str, status: str, error: str = "") -> None:
-        records = self._read()
-        record = next((item for item in records if item.get("task_id") == task_id), None)
-        if record is None:
+    def finish(self, task_id: str, status: str, error: str = "", *, output: Any = _UNSET, **kwargs: Any) -> None:
+        if self.store.get_task(task_id) is None:
             return
-        record["status"] = status
-        record["error"] = str(error)[:1000]
-        record["updated_at"] = _now()
-        self._write(records)
+        if output is not _UNSET:
+            kwargs["output"] = output
+        self.store.finish_task(task_id, status, error, **kwargs)
 
-    def list_tasks(self) -> list[dict[str, Any]]:
-        return self._read()
+    def list_tasks(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self.store.list_tasks(**kwargs)
+
+    def get_task(self, task_id: str) -> dict[str, Any] | None:
+        return self.store.get_task(task_id)
+
+    def start_attempt(self, task_id: str, node_id: str, attempt: int | None = None, **guard: Any) -> str:
+        return self.store.start_attempt(task_id, node_id, **guard)["attempt_id"]
+
+    def finish_attempt(self, attempt_id: str, status: str, **kwargs: Any) -> dict[str, Any]:
+        return self.store.finish_attempt(attempt_id, status, **kwargs)
+
+    def completed_results(self, task_id: str) -> list[AgentResult]:
+        record = self.store.get_task(task_id)
+        if record is None:
+            return []
+        valid = set(self.store.validate_recovery(task_id)["reusable_nodes"])
+        return [AgentResult(
+            agent=node.get("agent", "executor"), status=node["status"],
+            output=self.store.load_output(task_id, node_id) or {}, error=node.get("error", ""),
+            tool_calls=node["tool_calls"], tokens=node["tokens"], step_id=node_id,
+            **({"checks": node.get("checks", {})} if "checks" in AgentResult.__dataclass_fields__ else {}),
+        ) for node_id, node in record["nodes"].items() if node_id in valid]
+
+    def resume(self, task_id: str, **guard: Any) -> dict[str, Any]:
+        record = self.store.get_task(task_id)
+        if record is None:
+            raise KeyError(task_id)
+        if record["legacy"]:
+            raise ValueError("Legacy history cannot be resumed")
+        for node_id, node in record["nodes"].items():
+            if node["status"] in {"unknown", "recovery_required"} or (node["status"] in {"running", "interrupted"} and node.get("side_effect")):
+                raise ValueError("Side effects require reconciliation before resume")
+            if node["status"] == "running" and record["owner"] is None:
+                self.store.update_node(task_id, node_id, "interrupted", record_attempt=True, **guard)
+        self.store.clear_requests(task_id)
+        return self.store.update_task(task_id, "running", error="", **guard)
 
     def recovery_candidates(self) -> list[dict[str, Any]]:
-        """返回可由 UI 展示的中断任务；是否重试仍需重新规划并重新授权。"""
-        return [
-            item for item in self._read()
-            if item.get("status") in {"interrupted", "failed"}
-        ]
+        return self.store.recovery_candidates()
 
-    def _mark_interrupted_tasks(self) -> None:
-        records = self._read()
-        changed = False
-        for record in records:
-            if record.get("status") != "running":
-                continue
-            record["status"] = "interrupted"
-            record["updated_at"] = _now()
-            nodes = record.get("nodes", {})
-            unsafe = any(
-                isinstance(node, dict)
-                and node.get("requires_human")
-                and node.get("status") in {"success", "pending"}
-                for node in nodes.values()
-            ) if isinstance(nodes, dict) else True
-            record["safe_to_resume"] = not unsafe
-            changed = True
-        if changed:
-            self._write(records)
+    def save_plan(self, task_id: str, plan: Any, **kwargs: Any) -> str:
+        return self.store.save_plan(task_id, plan, **kwargs)
+
+    def load_plan(self, task_id: str) -> dict[str, Any] | None:
+        return self.store.load_plan(task_id)
+
+    def save_input(self, task_id: str, values: Any, **kwargs: Any) -> str:
+        return self.store.save_input(task_id, values, **kwargs)
+
+    def load_input(self, task_id: str) -> Any:
+        return self.store.load_input(task_id)
+
+    load_initial_values = load_input
 
     @staticmethod
-    def _artifact_paths(output: dict[str, Any]) -> list[str]:
-        values = []
-        for key in ("artifact_path", "path", "resolved_paths"):
-            raw = output.get(key)
-            if isinstance(raw, list):
-                values.extend(str(item) for item in raw if str(item).strip())
-            elif raw:
-                values.append(str(raw))
-        return list(dict.fromkeys(values))[:20]
+    def _checks_pass(value: Any) -> bool:
+        if value is False:
+            return False
+        if isinstance(value, dict):
+            return all(TaskLedger._checks_pass(item) for item in value.values())
+        if isinstance(value, list):
+            return all(TaskLedger._checks_pass(item) for item in value)
+        return True
 
-    def _upsert(self, record: dict[str, Any]) -> None:
-        records = self._read()
-        records.append(record)
-        self._write(records[-200:])
+    @staticmethod
+    def _plan_metadata(plan: Any) -> dict[str, Any]:
+        if isinstance(plan, dict):
+            return plan
+        return {"metadata": getattr(plan, "metadata", {}), "plan_version": getattr(plan, "plan_version", "1")}
 
-    def _read(self) -> list[dict[str, Any]]:
-        with self._lock:
-            if not self.path.is_file():
-                return []
-            try:
-                value = json.loads(self.path.read_text(encoding="utf-8"))
-                return value if isinstance(value, list) else []
-            except (OSError, ValueError):
-                return []
+    def save_output(self, task_id: str, output: Any, *, node_id: str | None = None, **kwargs: Any) -> str:
+        return self.store.save_output(task_id, output, node_id=node_id, **kwargs)
 
-    def _write(self, records: list[dict[str, Any]]) -> None:
-        with self._lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-            temporary.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
-            os.replace(temporary, self.path)
+    def load_output(self, task_id: str, node_id: str | None = None) -> Any:
+        return self.store.load_output(task_id, node_id)
+
+    _artifact_paths = staticmethod(TaskStore.artifact_paths)

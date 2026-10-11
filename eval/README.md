@@ -122,3 +122,31 @@ D:\broagent\.conda\deskpilot-py311\python.exe -m eval.run_reranker_ablation `
 ```
 
 报告输出 Hit Rate、Recall、MRR、平均/P95 检索延迟、Token 和模型磁盘占用。磁盘有限时，可先用 `--providers rrf,lexical` 运行零额外模型版本。
+
+## 工程可靠性专项
+
+## Jev 决策与 Judge 对照
+
+可选 Jev 通过 OpenRouter `alpha.decisions.create` 对应的 `/api/alpha/decisions` 端点调用 `typesafe/jev-1.13`。入口仅为路由前置门控、普通文档 RAG 候选证据门控；Judge 是独立评测脚本，不参与线上最终回答或网页检索流程。`JEV_MODE=off/shadow/gated`，本地文档正文默认禁止外发；配置和数据构成见 [Jev 数据说明](dataset/README_jev.md)。
+
+```powershell
+python -m eval.compare_jev
+python -m eval.run_jev_judge --judge both --count 8
+```
+
+前者在同一 36 条真实 API 套件上跑 off/gated 各一遍，后者在 8 条标注证据上计算相关性/忠实度 P/R/F1；二者都需要相应 API Key，会产生付费请求。本地没有 Key 时只运行单测，不制造“真实 API 实验数据”。
+
+P2 后默认专项数据集为 68 条（原 P0/P1 60 条 + P2 8 条）。执行 `python -m eval.run_reliability_eval --count 68`；这是临时文件与模拟邮箱的故障注入，不含真实邮件投递。下方 60 条说明作为旧版基线范围保留。
+
+```powershell
+.\.conda\deskpilot-py311\python.exe -m eval.run_reliability_eval --count 60
+.\.conda\deskpilot-py311\python.exe -m eval.run_reliability_eval --scenario checkpoint_process_restart --count 5
+```
+
+独立数据集 `dataset/reliability_cases.jsonl` 为 12 类故障各 5 次确定性实验，不调用真实模型或邮箱，不混入 DeskPilotBench 的答案 Accuracy/F1。报告位于 `reports/reliability/latest.md/latest.json`，包含真实进程退出、审批重建、附件指纹、取消和有界重试的观测范围。格式和扩展方法见 [可靠性数据说明](dataset/README_reliability.md)。
+
+`python -m eval.prepare_reliability_demo` 可生成无隐私的资料、附件和长 PDF，用于桌面任务面板手工验证；保留已有同名文件，不覆盖。
+
+## Jev 对照
+
+`python -m eval.compare_jev` 对固定 36 条 API 用例做 off/gated 成对运行；报告同时给出 Jev 实际跳过原 Router 的次数与 RAG 证据过滤数，零干预时不可解读为有效模型对照。`python -m eval.run_jev_judge --judge both --count 8` 对标注证据做五档数值相关性、忠实度评分，结果为 0–1，报告 MAE/RMSE，非正式 RAGAS 指标。详见 [Jev 数据说明](dataset/README_jev.md)。

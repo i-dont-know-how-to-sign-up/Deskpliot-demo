@@ -105,6 +105,8 @@ class PlannerAgent:
 不得添加 files.write_file；附件文件名应从工作区文件清单选择并写入 attachment_paths。
 如果用户要求先整理文档并作为附件发送，knowledge.allowed_tools 必须包含 web.research，commit.arguments 必须设置 attach_report=true；
 附件路径是前置节点运行时产生的动态结果，不要虚构 attachment_paths。
+在用户指定的本地图片目录中按画面内容找图片，只需单个 knowledge.search_directory_images 节点；
+knowledge.arguments.directory 填用户指定的真实目录路径，query 只填要找的画面内容（优先简洁英文视觉描述），无需预先建立全局索引，不要选 knowledge.search 或 web.search。
 request/query/topic 只能填写要搜索或调研的主题，不得包含“在网上搜索、整理成文档、作为附件、发送给某人”等操作指令。
 读取源文件统一使用 files.read_document；读取节点可使用任意唯一 step_id，执行器不会依赖固定节点名。
 已有本地附件写入 commit.arguments.attachment_paths；只有附件由前置 web.research 动态生成时才使用 attach_report=true。
@@ -161,7 +163,7 @@ Planner 独立运行时上下文（其中已包含当前任务）：{conversatio
         planner_tools = {
             "knowledge.search", "web.search", "web.research", "web.read_page",
             "files.read_document", "files.write_file", "email.send", "email.save_draft",
-            "email.create_reply_draft",
+            "email.create_reply_draft", "knowledge.search_directory_images",
         }
         for step in plan.steps:
             if not step.step_id.strip():

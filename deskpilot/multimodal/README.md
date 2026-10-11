@@ -55,6 +55,8 @@ OCR_PROVIDER=paddleocr
 
 `SENSITIVE_IMAGE_POLICY` 支持 `block|confirm|allow`。剪贴板/截图默认标记为敏感，默认策略会在聊天内请求单次人工确认。首次加载 SigLIP2 可能需要下载模型。DeskPilot 不会把 Base64、API Key 或原始图片写入会话 JSONL。
 
+`knowledge.search_directory_images` 可以直接在用户指定的本地目录按画面描述检索图片，无需预先建立全局索引；返回文件路径及排序分数，不向云端上传图片，也不声称相似度等于内容确认。该工具需要 `IMAGE_EMBEDDING_PROVIDER=siglip2`；默认最多扫描 128 张有效图片，可用 `IMAGE_DIRECTORY_SEARCH_MAX_FILES` 调整。若 Windows 可用提交内存低于 `IMAGE_EMBEDDING_MIN_AVAILABLE_COMMIT_GB`，会明确报资源不足，需释放内存/增大页面文件后重试。
+
 视觉记忆预算可选配置：
 
 ```dotenv

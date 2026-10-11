@@ -12,11 +12,12 @@ from .rag.vector_index import DocumentIndex
 
 try:
     from PySide6.QtCore import (
-        QAbstractListModel, QBuffer, QIODevice, QModelIndex, QObject, Property, Qt, Signal, Slot, QUrl,
+        QAbstractListModel, QBuffer, QIODevice, QModelIndex, QObject, Property, Qt, Signal, Slot, QUrl, QTimer,
     )
     from PySide6.QtWidgets import QApplication, QFileDialog
     from PySide6.QtGui import QFont
     from PySide6.QtQml import QQmlApplicationEngine
+    from PySide6.QtQuickControls2 import QQuickStyle
 except ImportError as exc:  # pragma: no cover - 给未安装 GUI 依赖时提供清晰提示
     raise RuntimeError(
         f"当前解释器未安装 PySide6：{sys.executable}\n"
@@ -97,6 +98,7 @@ class DeskPilotBridge(QObject):
     statusChanged = Signal()
     busyChanged = Signal()
     contextChanged = Signal()
+    tasksChanged = Signal()
     pendingAttachmentsChanged = Signal()
     confirmRequested = Signal(str, str, str)
     errorRaised = Signal(str)
@@ -104,6 +106,9 @@ class DeskPilotBridge(QObject):
     _streamEvent = Signal(object)
     _indexReady = Signal(str)
     _errorReady = Signal(str)
+    _taskResultReady = Signal(str, object)
+    _taskErrorReady = Signal(str, str)
+    _mailReconcileReady = Signal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -124,11 +129,23 @@ class DeskPilotBridge(QObject):
         self._live_stream_received = False
         self._pending_action: dict[str, Any] | None = None
         self._pending_attachments: list[dict[str, Any]] = []
+        self._tasks: list[dict[str, Any]] = []
+        self._visible_task_id = ""
         # 所有后台任务都通过 signal 回到 Qt 主线程，再更新 QML 属性。
         self._resultReady.connect(self._start_stream)
         self._streamEvent.connect(self._handle_stream_event)
         self._indexReady.connect(self._index_finished)
         self._errorReady.connect(self._background_failed)
+        self._taskResultReady.connect(self._handle_task_result)
+        self._taskErrorReady.connect(self._handle_task_error)
+        self._mailReconcileReady.connect(self._handle_mail_reconcile)
+        self.agent.task_service.on_result = lambda task_id, result: self._taskResultReady.emit(task_id, result)
+        self.agent.task_service.on_error = lambda task_id, error: self._taskErrorReady.emit(task_id, error)
+        self.agent.task_event_callback = lambda event: self._streamEvent.emit(event)
+        self._task_timer = QTimer(self)
+        self._task_timer.setInterval(750)
+        self._task_timer.timeout.connect(self.refreshTasks)
+        self._task_timer.start()
         self._refresh_all()
         self._load_session_messages()
 
@@ -144,6 +161,7 @@ class DeskPilotBridge(QObject):
     status = Property("QString", lambda self: self._get("status"), notify=statusChanged)
     busy = Property(bool, lambda self: self._busy, notify=busyChanged)
     context = Property("QString", lambda self: self._get("context"), notify=contextChanged)
+    tasks = Property("QVariantList", lambda self: self._tasks, notify=tasksChanged)
     pendingAttachments = Property(
         "QVariantList", lambda self: self._pending_attachments, notify=pendingAttachmentsChanged
     )
@@ -175,6 +193,7 @@ class DeskPilotBridge(QObject):
         self._refresh_sessions()
         self._refresh_stats()
         self._refresh_memories()
+        self.refreshTasks()
 
     def _refresh_sessions(self) -> None:
         self._sessions = [
@@ -245,6 +264,10 @@ class DeskPilotBridge(QObject):
         ]
         self.stepsChanged.emit()
         self.evidencesChanged.emit()
+        self._pending_action = None
+        pending = self.agent.pending_actions.list_pending(session_id=self.current_session_id)
+        if pending:
+            self._maybe_request_confirmation(type("Result", (), {"pending_action": self.agent.pending_actions.public(pending[-1])})())
 
     def _set_messages(self, messages: list[dict[str, Any]]) -> None:
         self._messages = list(messages)
@@ -275,11 +298,14 @@ class DeskPilotBridge(QObject):
         self._set_result_panels(result)
         self._set_status("回答完成")
         self._maybe_request_confirmation(result)
+        self.refreshTasks()
         self._end_operation()
 
     def _handle_stream_event(self, event: Any) -> None:
         """所有事件经 Qt signal 回到主线程，只更新一个消息 delegate。"""
         if not isinstance(event, dict):
+            return
+        if event.get("session_id") and event["session_id"] != self.current_session_id:
             return
         event_type = str(event.get("type", ""))
         stage = str(event.get("stage", "Model"))
@@ -327,6 +353,9 @@ class DeskPilotBridge(QObject):
             f"风险等级：{pending.get('risk_level', 'high')}\n"
             f"原因：{reason_text}"
         )
+        preview = str(pending.get("preview", "") or "")
+        if preview:
+            confirmation += "\n\n" + preview
         self._set_messages(self._messages + [{"role": "confirmation", "content": confirmation}])
 
     @Slot(str)
@@ -352,15 +381,170 @@ class DeskPilotBridge(QObject):
 
     def _run_answer(self, question: str, session_id: str, asset_ids: list[str] | None = None) -> None:
         try:
-            callback = lambda event: self._streamEvent.emit(event)
-            result = (
-                self.agent.answer_multimodal(question, asset_ids, session_id=session_id, event_callback=callback)
-                if asset_ids else
-                self.agent.answer(question, session_id=session_id, event_callback=callback)
-            )
-            self._resultReady.emit(result)
+            self._visible_task_id = self.agent.task_service.submit("core.answer", {
+                "question": question, "session_id": session_id, "asset_ids": asset_ids or [],
+            }, session_id=session_id)
+            self.agent.task_service.start()
         except Exception as exc:  # pragma: no cover - 防止后台异常让 GUI 无响应
             self._errorReady.emit(str(exc))
+
+    def _handle_task_result(self, task_id: str, result: Any) -> None:
+        self.refreshTasks()
+        if isinstance(result, list):
+            self._index_finished(f"多模态入库完成：{len(result)} 页/图片，复用 {sum(bool(item.get('checkpoint_reused')) for item in result)} 个检查点")
+            return
+        if getattr(result, "session_id", "") and result.session_id != self.current_session_id:
+            self._refresh_all()
+            self._end_operation()
+            self._set_status("后台任务已更新")
+            return
+        # 恢复任务可能没有本轮占位消息。以已持久化的会话为准，避免覆盖旧回答。
+        self._load_session_messages()
+        self._set_result_panels(result)
+        self._set_status("等待确认" if getattr(result, "pending_action", None) else "回答完成")
+        self._end_operation()
+
+    def _handle_task_error(self, task_id: str, error: str) -> None:
+        self.refreshTasks()
+        self._end_operation()
+        task = self.agent.task_ledger.store.get_task(task_id)
+        state = task["status"] if task else "failed"
+        self._set_status({"paused": "任务已暂停", "cancelled": "任务已取消"}.get(state, "任务失败，请查看 Tasks"))
+        if state not in {"paused", "cancelled"}:
+            self.errorRaised.emit(error)
+
+    @Slot()
+    def refreshTasks(self) -> None:
+        from .tasks.effects import effects_for_task
+
+        store = self.agent.task_ledger.store
+        store.expire_leases()
+        items = []
+        labels = {"queued": "排队", "running": "执行中", "retry_wait": "等待重试", "waiting_human": "等待审批",
+                  "paused": "已暂停", "interrupted": "已中断", "recovery_required": "需人工核对",
+                  "success": "已完成", "succeeded": "已完成", "failed": "失败", "cancelled": "已取消", "partial": "部分完成"}
+        for task in reversed(store.list_tasks()[-100:]):
+            job = self.agent.task_service.descriptor(task["task_id"])
+            nodes = task["nodes"]
+            usage = job["usage"] if job else {}
+            complete = sum(node["status"] in {"success", "succeeded"} for node in nodes.values())
+            pending = self.agent.pending_actions.list_pending(task_id=task["task_id"])
+            effects = effects_for_task(store, task["task_id"])
+            unfinished_compensation = any(item["state"] in {"compensating", "compensation_unknown"} for item in effects)
+            uncertain_file = any(item["state"] in {"dispatched", "unknown"}
+                                 and (item["tool_name"].startswith("files.write") or item["tool_name"] == "files.apply_move")
+                                 for item in effects)
+            file_effect = next((item for item in effects if item["state"] == "committed"
+                                and (item["tool_name"].startswith("files.write") or item["tool_name"] == "files.apply_move")
+                                and json.loads(item["result_json"] or "{}").get("compensatable")), None)
+            mail_effect = next((item for item in effects if item["tool_name"] == "email.send"
+                                and (item["state"] in {"unknown", "dispatched"} or item["state"] == "committed"
+                                     and json.loads(item["result_json"] or "{}").get("sent_copy_saved") is False)), None)
+            title = str(job["payload"].get("question") or job["payload"].get("path") or job["handler_key"]) if job else task["goal"]
+            detail = f"{complete}/{len(nodes)} 节点 · {round(job['elapsed'], 1) if job else 0}s\n"
+            pdf = job.get("pdf_progress") if job else None
+            if pdf:
+                detail = f"PDF {pdf['completed']}/{pdf['total']} 页 · 复用 {pdf['reused']} 页 · {round(job['elapsed'], 1)}s\n"
+            detail += f"Tool {usage.get('tool_calls', 0)} · API {usage.get('api_attempts', 0)} · Token {usage.get('total_tokens', 0)}"
+            detail += f" · Retry {usage.get('retries', 0)}"
+            if usage.get("unknown_usage_calls"):
+                detail += f" · usage 未上报 {usage['unknown_usage_calls']} 次"
+            if task["pause_requested"] and task["status"] == "running":
+                detail += "\n正在请求暂停"
+            if task["cancel_requested"] and task["status"] == "running":
+                detail += "\n正在请求取消"
+            if task["error"]:
+                detail += "\n" + task["error"]
+            if file_effect:
+                detail += "\n文件写入可申请补偿（将重新校验文件版本）"
+            if mail_effect and mail_effect["state"] in {"unknown", "dispatched"}:
+                detail += "\n邮件提交结果未知：禁止自动重发，请人工核对邮箱。"
+            elif mail_effect:
+                detail += "\nSMTP 已接受，已发送箱副本待核对。"
+            if unfinished_compensation:
+                detail += "\n文件补偿中断：请核对副作用日志和文件版本，勿直接重试。"
+            if uncertain_file:
+                detail += "\n文件提交结果未确认：请先核对文件及副作用日志。"
+            state = task["status"]
+            items.append({"id": task["task_id"], "title": title[:100], "state": state,
+                          "status": labels.get(state, state), "detail": detail,
+                          "progress": (pdf["completed"] / max(1, pdf["total"])) if pdf else
+                                      (1 if state in {"success", "succeeded"} else complete / max(1, len(nodes))),
+                          "canPause": state in {"queued", "running", "retry_wait"},
+                          "canCancel": state in {"queued", "running", "waiting_human", "paused", "retry_wait"},
+                          "canResume": bool(job) and state in {"paused", "failed", "interrupted", "partial", "recovery_required"}
+                                       and not any(node["status"] == "unknown" for node in nodes.values()),
+                          "canApprove": bool(pending) and state == "waiting_human"})
+            items[-1]["compensationOperationId"] = file_effect["operation_id"] if file_effect else ""
+            items[-1]["mailOperationId"] = mail_effect["operation_id"] if mail_effect else ""
+        if items != self._tasks:
+            self._tasks = items
+            self.tasksChanged.emit()
+
+    @Slot(str, str)
+    def controlTask(self, task_id: str, action: str) -> None:
+        try:
+            if action == "resume":
+                if not self._begin_operation("正在恢复任务"):
+                    return
+                self.agent.task_service.resume(task_id)
+                self._visible_task_id = task_id
+                self.agent.task_service.start()
+            else:
+                self.agent.task_service.request(task_id, action)
+                if action == "cancel":
+                    for pending in self.agent.pending_actions.list_pending(task_id=task_id):
+                        self.agent.pending_actions.cancel(pending.action_id, pending.session_id)
+            self.refreshTasks()
+        except Exception as exc:
+            if action == "resume":
+                self._end_operation()
+            self.errorRaised.emit(str(exc))
+
+    @Slot(str)
+    def previewTask(self, task_id: str) -> None:
+        if self._busy:
+            return
+        task = self.agent.task_ledger.store.get_task(task_id)
+        if not task:
+            return
+        if task["session_id"]:
+            self.selectSession(task["session_id"])
+        pending = self.agent.pending_actions.list_pending(task_id=task_id)
+        if pending:
+            item = pending[-1]
+            refreshed = self.agent.pending_actions.renew(item.action_id, item.session_id)
+            self._maybe_request_confirmation(type("Result", (), {"pending_action": refreshed})())
+        self.refreshTasks()
+
+    @Slot(str, str)
+    def requestCompensation(self, task_id: str, operation_id: str) -> None:
+        try:
+            pending = self.agent.request_file_compensation(task_id, operation_id, self.current_session_id)
+            self._maybe_request_confirmation(type("Result", (), {"pending_action": pending})())
+            self._set_status("等待文件补偿确认")
+        except Exception as exc:
+            self.errorRaised.emit(str(exc))
+
+    @Slot(str, str)
+    def reconcileMail(self, task_id: str, operation_id: str) -> None:
+        if not self._begin_operation("正在核对邮件"):
+            return
+        session_id = self.current_session_id
+        def run() -> None:
+            try:
+                self._mailReconcileReady.emit(self.agent.reconcile_mail_effect(task_id, operation_id, session_id))
+            except Exception as exc:
+                self._errorReady.emit(str(exc))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _handle_mail_reconcile(self, result: object) -> None:
+        data = result if isinstance(result, dict) else {}
+        self._set_messages(self._messages + [{"role": "assistant", "content":
+            "邮件核对：" + str(data.get("reason") or data.get("action") or data.get("status"))}])
+        self._set_status("邮件核对完成")
+        self.refreshTasks()
+        self._end_operation()
 
     @Slot(str, int)
     def research(self, topic: str, limit: int = 5) -> None:
@@ -477,8 +661,9 @@ class DeskPilotBridge(QObject):
     def _index_file(self, path: Path) -> None:
         try:
             if path.suffix.casefold() in {".png", ".jpg", ".jpeg", ".webp"}:
-                results = self.agent.multimodal.index_file(path)
-                self._indexReady.emit(f"{path.name}: {len(results)} 个多模态片段")
+                self.agent.task_service.submit("multimodal.index", {"path": str(path)},
+                                               session_id=self.current_session_id, timeout_seconds=3600)
+                self.agent.task_service.start()
             else:
                 document, count = self.index.add_file(path)
                 # PDF 同时建立文本索引；页图索引由显式多模态工具处理，避免普通索引意外增加成本。
@@ -620,6 +805,8 @@ class DeskPilotBridge(QObject):
 
 
 def main() -> int:
+    # 原生 Windows Style 不支持自定义控件背景，统一使用可定制的 Fusion。
+    QQuickStyle.setStyle("Fusion")
     app = QApplication(sys.argv)
     # Windows 中文办公场景优先使用系统常见字体，避免默认字体缺字显示方框。
     app.setFont(QFont("Microsoft YaHei UI", 10))
@@ -627,6 +814,7 @@ def main() -> int:
     bridge = DeskPilotBridge()
     engine.rootContext().setContextProperty("deskPilot", bridge)
     qml_path = Path(__file__).with_name("qml") / "Main.qml"
+    app.aboutToQuit.connect(bridge.agent.task_service.close)
     engine.load(QUrl.fromLocalFile(str(qml_path)))
     if not engine.rootObjects():
         return 1

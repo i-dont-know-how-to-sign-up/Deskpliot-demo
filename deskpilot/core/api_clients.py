@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import math
 import os
-import random
 import re
+import socket
 import threading
 import time
 import urllib.error
@@ -17,6 +17,8 @@ from typing import Any, Callable, Iterator
 
 from .config import ModelConfig
 from .encoding_utils import fix_mojibake, strip_qwen_thinking
+from ..tasks.control import TaskBudgetExceeded, TaskControlError, get_execution_control
+from ..tasks.retry import RetryPolicy, retry_after_seconds
 
 
 _CALL_STAGE: ContextVar[str] = ContextVar("deskpilot_call_stage", default="Unattributed")
@@ -24,6 +26,7 @@ _STREAM_VISIBLE: ContextVar[bool] = ContextVar("deskpilot_stream_visible", defau
 _EVENT_CALLBACK: ContextVar[Callable[[dict[str, Any]], None] | None] = ContextVar(
     "deskpilot_event_callback", default=None
 )
+_CALL_ACCOUNTING: ContextVar[dict[str, Any] | None] = ContextVar("deskpilot_call_accounting", default=None)
 
 
 @dataclass(frozen=True)
@@ -91,6 +94,9 @@ class OpenAICompatibleClient:
             _EVENT_CALLBACK.reset(token)
 
     def embed(self, texts: list[str]) -> list[list[float]]:
+        control = get_execution_control()
+        if control is not None:
+            control.checkpoint()
         started = time.perf_counter()
         stage = _CALL_STAGE.get()
         if stage == "Unattributed":
@@ -104,17 +110,24 @@ class OpenAICompatibleClient:
 
         url = self.config.embedding_base_url.rstrip("/") + "/embeddings"
         payload = {"model": self.config.embedding_model, "input": texts}
+        accounting_token = _CALL_ACCOUNTING.set({"recorded": False})
         try:
             response = self._post_json(url, payload, self.config.embedding_api_key)
             self._record_call(response, stage, "embedding", self.config.embedding_model, started)
             items = sorted(response["data"], key=lambda item: item["index"])
             return [item["embedding"] for item in items]
+        except TaskControlError as exc:
+            self.last_error = str(exc)
+            raise
         except Exception as exc:
             self.last_error = str(exc)
             self._record_call({}, stage, "embedding", self.config.embedding_model, started, error=str(exc))
+            _checkpoint()
             if self.config.allow_local_fallback:
                 return [local_hash_embedding(text) for text in texts]
             raise
+        finally:
+            _CALL_ACCOUNTING.reset(accounting_token)
 
     def chat(
         self,
@@ -122,6 +135,9 @@ class OpenAICompatibleClient:
         temperature: float = 0.2,
         max_tokens: int | None = None,
     ) -> str:
+        control = get_execution_control()
+        if control is not None:
+            control.checkpoint()
         started = time.perf_counter()
         stage = _CALL_STAGE.get()
         self.last_error = ""
@@ -144,6 +160,7 @@ class OpenAICompatibleClient:
         callback = _EVENT_CALLBACK.get()
         visible_stream = bool(callback and _STREAM_VISIBLE.get())
         self._emit({"type": "model_start", "stage": stage, "kind": "chat", "visible": visible_stream})
+        accounting_token = _CALL_ACCOUNTING.set({"recorded": False})
         try:
             if visible_stream:
                 content, response = self._post_stream_json(url, payload, self.config.llm_api_key)
@@ -155,16 +172,24 @@ class OpenAICompatibleClient:
             self._record_call(response, stage, "chat", self.config.llm_model, started)
             self._emit({"type": "model_end", "stage": stage, "kind": "chat", "ok": True})
             return result
+        except TaskControlError as exc:
+            self.last_error = str(exc)
+            self._emit({"type": "model_end", "stage": stage, "kind": "chat", "ok": False, "error": str(exc)})
+            raise
         except Exception as exc:
             self.last_error = str(exc)
             self._record_call({}, stage, "chat", self.config.llm_model, started, error=str(exc))
             self._emit({"type": "model_end", "stage": stage, "kind": "chat", "ok": False, "error": str(exc)})
+            _checkpoint()
             if self.config.allow_local_fallback:
                 return ""
             raise
+        finally:
+            _CALL_ACCOUNTING.reset(accounting_token)
 
     def _post_stream_json(self, url: str, payload: dict, api_key: str) -> tuple[str, dict]:
         """消费 OpenAI-compatible SSE；最终 usage 仍只信任服务端返回值。"""
+        payload = self._budget_payload(payload)
         stream_payload = {**payload, "stream": True, "stream_options": {"include_usage": True}}
         data = json.dumps(stream_payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
@@ -182,40 +207,63 @@ class OpenAICompatibleClient:
         final_usage: dict[str, Any] = {}
         visible_text = ""
         stage = _CALL_STAGE.get()
-        with urllib.request.urlopen(request, timeout=60) as response:
-            for raw_line in response:
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if not line.startswith("data:"):
-                    continue
-                value = line[5:].strip()
-                if not value or value == "[DONE]":
-                    continue
-                try:
-                    item = json.loads(value)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(item.get("usage"), dict):
-                    final_usage = item["usage"]
-                choices = item.get("choices") or []
-                if not choices:
-                    continue
-                delta = choices[0].get("delta") or {}
-                content = delta.get("content") or ""
-                if content:
-                    text = fix_mojibake(str(content))
-                    pieces.append(text)
-                    if stage == "Router":
-                        # Router 输出结构化 JSON；聊天区只显示 direct_response，不能泄漏内部路由字段。
-                        extracted = _partial_json_string_field("".join(pieces), "direct_response")
-                        delta = extracted[len(visible_text):] if extracted.startswith(visible_text) else ""
-                        visible_text = extracted
-                    else:
-                        delta = text
-                    if delta:
-                        self._emit({"type": "token", "stage": stage, "text": delta})
+        started = time.perf_counter()
+        api_attempt = self._begin_attempt("chat", payload)
+        complete = False
+        try:
+            with _open_response(request) as response:
+                for raw_line in response:
+                    _checkpoint()
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    value = line[5:].strip()
+                    if value == "[DONE]":
+                        complete = True
+                        break
+                    if not value:
+                        continue
+                    try:
+                        item = json.loads(value)
+                    except json.JSONDecodeError:
+                        continue
+                    if item.get("error"):
+                        raise RuntimeError(f"Streaming API error: {item['error']}")
+                    if isinstance(item.get("usage"), dict):
+                        final_usage = item["usage"]
+                    choices = item.get("choices") or []
+                    if not choices:
+                        continue
+                    if choices[0].get("finish_reason") is not None:
+                        complete = True
+                    delta = choices[0].get("delta") or {}
+                    content = delta.get("content") or ""
+                    if content:
+                        text = fix_mojibake(str(content))
+                        pieces.append(text)
+                        if stage == "Router":
+                            # Router 输出仅展示 direct_response，避免泄漏内部路由字段。
+                            extracted = _partial_json_string_field("".join(pieces), "direct_response")
+                            delta = extracted[len(visible_text):] if extracted.startswith(visible_text) else ""
+                            visible_text = extracted
+                        else:
+                            delta = text
+                        if delta:
+                            self._emit({"type": "token", "stage": stage, "text": delta})
+            _checkpoint()
+            if not complete:
+                raise ConnectionError("Streaming API ended without a completion marker")
+        except Exception as exc:
+            error_response = getattr(exc, "usage_response", {"usage": final_usage})
+            self._record_transport(error_response, payload, started, error=str(exc), api_attempt=api_attempt)
+            self._emit({"type": "stream_interrupted", "stage": stage, "error": str(exc)})
+            _checkpoint()
+            raise
+        self._record_transport({"usage": final_usage}, payload, started, api_attempt=api_attempt)
         return "".join(pieces), {"usage": final_usage}
 
     def _post_json(self, url: str, payload: dict, api_key: str) -> dict:
+        payload = self._budget_payload(payload)
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
             url,
@@ -228,23 +276,81 @@ class OpenAICompatibleClient:
             },
             method="POST",
         )
-        attempts = _bounded_env_int("LLM_API_MAX_ATTEMPTS", 3, 1, 5)
-        base_delay = _bounded_env_float("LLM_API_RETRY_BASE_SECONDS", 0.5, 0.05, 5.0)
+        control = get_execution_control()
+        policy = control.retry_policy if control is not None else RetryPolicy(
+            max_attempts=_bounded_env_int("LLM_API_MAX_ATTEMPTS", 3, 1, 5),
+            base_delay=_bounded_env_float("LLM_API_RETRY_BASE_SECONDS", 0.5, 0.05, 5.0),
+        )
+        attempts = policy.max_attempts
         for attempt in range(1, attempts + 1):
+            started = time.perf_counter()
+            api_attempt = self._begin_attempt("embedding" if "input" in payload else "chat", payload)
+            result: dict[str, Any] = {}
             try:
-                with urllib.request.urlopen(request, timeout=60) as response:
-                    return json.loads(response.read().decode("utf-8-sig"))
-            except urllib.error.HTTPError as exc:
-                body = exc.read().decode("utf-8", errors="ignore")
-                if exc.code not in {429, 502, 503, 504} or attempt >= attempts:
-                    raise RuntimeError(f"API request failed: {exc.code} {body}") from exc
-                retry_after = _retry_after_seconds(exc.headers.get("Retry-After"))
-                _sleep_before_retry(attempt, base_delay, retry_after)
-            except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
-                if attempt >= attempts:
-                    raise RuntimeError(f"API request failed after {attempts} attempts: {exc}") from exc
-                _sleep_before_retry(attempt, base_delay)
+                with _open_response(request) as response:
+                    result = json.loads(response.read().decode("utf-8-sig"))
+                if not isinstance(result, dict):
+                    raise ValueError("API response must be a JSON object")
+                _checkpoint()
+            except Exception as exc:
+                error_response = getattr(exc, "usage_response", result)
+                if not isinstance(error_response, dict):
+                    error_response = {}
+                self._record_transport(error_response, payload, started, error=str(exc), api_attempt=api_attempt)
+                if isinstance(exc, TaskControlError):
+                    raise
+                _checkpoint()
+                retry_after = None
+                if isinstance(exc, urllib.error.HTTPError):
+                    retry_after = retry_after_seconds(exc.headers.get("Retry-After") if exc.headers else None)
+                if retry_after is not None and retry_after > policy.max_delay:
+                    raise RuntimeError(f"API request failed: {exc}") from exc
+                if not policy.allows(exc, attempt, control=control):
+                    if control is not None:
+                        # 保留分类异常，外层节点才能沿用同一个 RetryPolicy。
+                        raise
+                    raise RuntimeError(f"API request failed after {attempt} attempts: {exc}") from exc
+                policy.wait(attempt, control=control, retry_after=retry_after)
+                continue
+            self._record_transport(result, payload, started, api_attempt=api_attempt)
+            return result
         raise RuntimeError("API request failed without a response")
+
+    @staticmethod
+    def _budget_payload(payload: dict) -> dict:
+        control = get_execution_control()
+        remaining = control.remaining_tokens() if control is not None else None
+        if remaining is None:
+            return payload
+        # UTF-8 字节数是保守预留，不作为服务端真实 usage 入账。
+        estimate = _input_reservation(payload)
+        if remaining <= estimate:
+            raise TaskBudgetExceeded("Token budget cannot reserve request input")
+        if "input" in payload:
+            return payload
+        maximum = min(int(payload.get("max_tokens", 1024)), remaining - estimate)
+        return {**payload, "max_tokens": max(1, maximum)}
+
+    @staticmethod
+    def _begin_attempt(kind: str, payload: dict) -> int | None:
+        control = get_execution_control()
+        if control is not None:
+            reservation = _input_reservation(payload) + int(payload.get("max_tokens", 0))
+            sequence = control.record_attempt(kind, reserved_tokens=reservation)
+            accounting = _CALL_ACCOUNTING.get()
+            if accounting is not None:
+                accounting["api_attempt"] = sequence
+            return sequence
+        return None
+
+    def _record_transport(self, response: dict, payload: dict, started: float, *, error: str = "",
+                          api_attempt: int | None = None) -> None:
+        kind = "embedding" if "input" in payload else "chat"
+        stage = _CALL_STAGE.get()
+        if kind == "embedding" and stage == "Unattributed":
+            stage = "Embedding"
+        self._record_call(response, stage, kind, str(payload.get("model", "")), started,
+                          error=error, transport=True, api_attempt=api_attempt)
 
     def _record_call(
         self,
@@ -255,17 +361,24 @@ class OpenAICompatibleClient:
         started: float,
         *,
         error: str = "",
+        transport: bool = False,
+        api_attempt: int | None = None,
     ) -> None:
+        accounting = _CALL_ACCOUNTING.get()
+        if not transport and accounting is not None and accounting["recorded"]:
+            return
         usage = response.get("usage")
-        usage_reported = isinstance(usage, dict) and bool(usage)
+        usage_reported = isinstance(usage, dict) and any(key in usage for key in (
+            "prompt_tokens", "input_tokens", "completion_tokens", "output_tokens", "total_tokens"
+        ))
         usage = usage if isinstance(usage, dict) else {}
         prompt = usage.get("prompt_tokens", usage.get("input_tokens", 0))
         completion = usage.get("completion_tokens", usage.get("output_tokens", 0))
         try:
             prompt_tokens = int(prompt or 0)
             completion_tokens = int(completion or 0)
-            total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
-        except (TypeError, ValueError):
+            total_tokens = int(usage.get("total_tokens", prompt_tokens + completion_tokens) or 0)
+        except (TypeError, ValueError, OverflowError):
             prompt_tokens = completion_tokens = total_tokens = 0
             usage_reported = False
         event = UsageEvent(
@@ -280,6 +393,17 @@ class OpenAICompatibleClient:
             usage_reported=usage_reported,
             error=error[:500],
         ).to_dict()
+        control = get_execution_control()
+        if control is not None:
+            event.update(control.attribution())
+            event["api_attempt"] = api_attempt if api_attempt is not None else (
+                accounting.get("api_attempt") if accounting is not None else None
+            )
+            control.record_usage(usage, usage_reported=usage_reported, success=not error,
+                                 error=error, stage=stage, api_kind=kind, model=model,
+                                 api_attempt=event["api_attempt"])
+        if transport and accounting is not None:
+            accounting["recorded"] = True
         with self._usage_lock:
             if usage_reported:
                 self.token_usage["prompt_tokens"] += event["prompt_tokens"]
@@ -309,6 +433,12 @@ class OpenAICompatibleClient:
     def _emit(event: dict[str, Any]) -> None:
         callback = _EVENT_CALLBACK.get()
         if callback is not None:
+            control = get_execution_control()
+            if control is not None:
+                event = {**event, **control.attribution()}
+                accounting = _CALL_ACCOUNTING.get()
+                if accounting is not None:
+                    event["api_attempt"] = accounting.get("api_attempt")
             callback(dict(event))
 
 
@@ -341,10 +471,7 @@ def _is_dashscope_qwen(config: ModelConfig) -> bool:
 
 
 def _retry_after_seconds(value: str | None) -> float | None:
-    try:
-        return max(0.0, min(float(value), 10.0)) if value is not None else None
-    except (TypeError, ValueError):
-        return None
+    return retry_after_seconds(value)
 
 
 def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -364,8 +491,97 @@ def _bounded_env_float(name: str, default: float, minimum: float, maximum: float
 
 
 def _sleep_before_retry(attempt: int, base_delay: float, retry_after: float | None = None) -> None:
-    delay = retry_after if retry_after is not None else base_delay * (2 ** (attempt - 1))
-    time.sleep(min(10.0, delay + random.uniform(0.0, base_delay * 0.25)))
+    RetryPolicy(base_delay=base_delay).wait(attempt, control=get_execution_control(), retry_after=retry_after)
+
+
+def _checkpoint() -> None:
+    control = get_execution_control()
+    if control is not None:
+        control.checkpoint()
+
+
+def _input_reservation(payload: dict) -> int:
+    return len(json.dumps(payload.get("input", payload.get("messages", [])), ensure_ascii=False).encode("utf-8"))
+
+
+@contextmanager
+def _open_response(request: urllib.request.Request, *, default_timeout: float = 60) -> Iterator[Any]:
+    control = get_execution_control()
+    timeout = control.timeout(default_timeout) if control is not None else default_timeout
+    try:
+        opened = urllib.request.urlopen(request, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        _read_http_error_response(exc)
+        raise
+    except Exception:
+        if control is not None:
+            control.checkpoint()
+        raise
+    with opened as response:
+        with _response_control(response):
+            yield response
+
+
+def _read_http_error_response(error: urllib.error.HTTPError) -> None:
+    result: dict[str, Any] = {}
+    try:
+        with error as response, _response_control(response):
+            try:
+                body = json.loads(response.read(65536).decode("utf-8-sig"))
+                if isinstance(body, dict):
+                    result = body
+            except (ValueError, OSError, TypeError):
+                pass
+    except TaskControlError as exc:
+        # 退出 checkpoint 可以中断请求，但不能丢失刚收到的服务端 usage。
+        exc.usage_response = result
+        raise
+    finally:
+        error.usage_response = result
+
+
+@contextmanager
+def _response_control(response: Any) -> Iterator[Any]:
+    control = get_execution_control()
+    if control is None:
+        yield response
+        return
+    stopped = threading.Event()
+
+    def interrupt_read() -> None:
+        while not stopped.wait(0.025):
+            try:
+                control.checkpoint()
+            except TaskControlError:
+                # shutdown 可唤醒正在阻塞的 read；单独 close 不保证立即返回。
+                transport = response.fp if isinstance(response, urllib.error.HTTPError) else response
+                raw = getattr(getattr(transport, "fp", None), "raw", None)
+                connection = getattr(raw, "_sock", None)
+                if connection is not None:
+                    try:
+                        connection.shutdown(socket.SHUT_RDWR)
+                    except (OSError, ValueError):
+                        pass
+                close = getattr(response, "close", None)
+                if close is not None:
+                    try:
+                        close()
+                    except (OSError, ValueError):
+                        pass
+                return
+
+    watcher = threading.Thread(target=interrupt_read, name="deskpilot-http-control", daemon=True)
+    watcher.start()
+    try:
+        control.checkpoint()
+        yield response
+        control.checkpoint()
+    except Exception:
+        control.checkpoint()
+        raise
+    finally:
+        stopped.set()
+        watcher.join(timeout=1)
 
 
 def _partial_json_string_field(value: str, field: str) -> str:

@@ -167,6 +167,10 @@ class PlanRepairService:
             arguments = dict(previous_arguments.get(tool, {}))
             if tool in {ToolNames.WEB_SEARCH, ToolNames.WEB_RESEARCH, ToolNames.KNOWLEDGE_SEARCH}:
                 arguments.setdefault("query", str(decision.arguments.get("query") or question))
+            elif tool == ToolNames.KNOWLEDGE_SEARCH_DIRECTORY_IMAGES:
+                arguments.setdefault("directory", str(decision.arguments.get("directory") or
+                                                       decision.arguments.get("path") or ""))
+                arguments.setdefault("query", str(decision.arguments.get("query") or ""))
             elif tool == ToolNames.FILES_READ_DOCUMENT and selected_files:
                 arguments.setdefault("paths", selected_files)
             step_id = f"source_{index}"

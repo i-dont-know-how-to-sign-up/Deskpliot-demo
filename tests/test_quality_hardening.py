@@ -98,7 +98,8 @@ def test_pending_action_is_session_bound_one_time_and_hides_arguments() -> None:
         pass
     else:
         raise AssertionError("cross-session approval must be rejected")
-    # 会话不匹配也会销毁令牌，避免攻击者反复探测或重放。
+    # 错误会话不能销毁其他会话的合法审批，只有成功消费才使令牌失效。
+    assert store.consume(public["action_id"], "session-a").tool_name == "email.send"
     try:
         store.consume(public["action_id"], "session-a")
     except ValueError:

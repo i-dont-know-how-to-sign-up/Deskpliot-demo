@@ -150,7 +150,8 @@ class SigLIP2EmbeddingProvider:
             timeout = max(
                 30, min(int(os.getenv("IMAGE_EMBEDDING_TIMEOUT_SECONDS", "180")), 600)
             )
-            result = subprocess.run(
+            from .process import run_model_process
+            result = run_model_process(
                 [
                     sys.executable, "-m",
                     "deskpilot.multimodal.providers.vision_embedding_worker",

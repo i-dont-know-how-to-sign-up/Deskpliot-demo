@@ -16,7 +16,7 @@ def test_plan_runtime_retries_retryable_step() -> None:
     def flaky(values: dict[str, object]) -> dict[str, object]:
         attempts["count"] += 1
         if attempts["count"] == 1:
-            raise RuntimeError("temporary failure")
+            raise ConnectionError("temporary failure")
         return {"ok": True}
 
     runtime = PlanAndExecuteRuntime(default_max_retries=1)

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import sys
 import threading
+import time
 from contextlib import ExitStack
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
@@ -34,12 +36,19 @@ from ..rag.query_optimizer import QueryOptimizer
 from ..rag.query_analyzer import QueryAnalyzer
 from ..rag.retrieval import RetrievalFilters, RetrievalRequest
 from ..rag.web_research import ResearchResult, WebResearchAgent
-from ..tools.tool_registry import build_default_tool_registry
+from ..tools.tool_registry import ToolResult, build_default_tool_registry
 from ..multi_agent.planner import PlannerAgent
 from ..multi_agent.plan_executor import PlanExecutor
 from ..multi_agent.router import MultiAgentRouter
 from ..multi_agent.task_ledger import TaskLedger
 from ..multimodal import MultimodalService
+from ..tasks.control import (
+    ExecutionControl, TaskCancelled, TaskControlError, TaskPaused, get_execution_control, execution_scope,
+)
+from ..tasks.service import TaskService
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class DocumentQAAgent:
@@ -83,13 +92,21 @@ class DocumentQAAgent:
         self.workspace_root = Path.cwd().resolve()
         # Ledger 跟随索引所在的数据目录，测试/评测使用临时索引时不会污染项目工作区。
         self.task_ledger = TaskLedger(Path(self.index.index_file).parent / "task_ledger.json")
+        from ..mcp.email_mcp import EmailMCPService
+        self.email_service = EmailMCPService()
         self.tool_registry = build_default_tool_registry(
             index, self.web_research_agent, workspace_root=self.workspace_root,
             multimodal_service=self.multimodal, visual_memory=self.visual_memory,
+            task_store=self.task_ledger.store, email_service=self.email_service,
         )
-        self.pending_actions = PendingActionStore()
+        self.pending_actions = PendingActionStore(db_path=self.task_ledger.store.path)
+        self.task_service = TaskService(self.task_ledger.store)
+        self.task_service.register("core.answer", self._run_task_answer)
+        self.task_service.register("core.workflow", self._run_task_workflow)
+        self.task_service.register("multimodal.index", lambda payload: self.multimodal.index_file(Path(payload["path"])))
+        self._task_reference: dict[str, str] = {}
         self.runtime = PlanAndExecuteRuntime(default_max_retries=1)
-        self.intent_router = IntentRouter(self.client)
+        self.intent_router = IntentRouter(self.client, decision_client=self.index.hybrid_retriever.decision_client)
         self.plan_repair = PlanRepairService(lambda *args, **kwargs: self.plan_task(*args, **kwargs))
         self.direct_answer_handler = DirectAnswerHandler(
             answer=lambda question, context: self._direct_answer(question, context),
@@ -112,6 +129,81 @@ class DocumentQAAgent:
                 )
             )
         )
+
+    def _run_task_answer(self, payload: dict[str, Any]) -> AnswerResult:
+        sink = getattr(self, "task_event_callback", None)
+        callback = (lambda event: sink({**event, "session_id": payload["session_id"]})) if sink else None
+        if payload.get("asset_ids"):
+            return self.answer_multimodal(payload["question"], payload["asset_ids"],
+                                         session_id=payload["session_id"], event_callback=callback)
+        return self.answer(payload["question"], session_id=payload["session_id"], event_callback=callback)
+
+    def _run_task_workflow(self, payload: dict[str, Any]) -> AnswerResult:
+        # 从领域描述重建 closure，不重新进行意图识别或 Planner，也不重复写入用户消息。
+        with self._operation_lock:
+            session_id = payload["session_id"]
+            question = payload["question"]
+            context = self._load_memory_context(question, session_id)
+            common = {"question": question, "steps": [AgentStep("resume_task", "success", "从已校验的节点检查点继续。")],
+                      "session_id": session_id, "user_message_id": payload["user_message_id"], "memory_context": context}
+            self._task_reference = {}
+            domain = payload["domain"]
+            if domain == "documents":
+                return self._answer_local_documents(targets=payload["request"]["targets"], **common)
+            methods = {"email": self._answer_research_email_request,
+                       "web_file": self._answer_web_file_request, "index_report": self._answer_index_report}
+            if domain not in methods:
+                raise ValueError("任务的领域执行器不存在，未重放任何工具")
+            sink = getattr(self, "task_event_callback", None)
+            callback = (lambda event: sink({**event, "session_id": session_id})) if sink else None
+            with self.client.event_stream(callback):
+                return methods[domain](request=payload["request"], plan_preview=payload.get("plan_preview"), **common)
+
+    def _workflow_descriptor(self, domain: str, request: dict, question: str, session_id: str,
+                             user_message_id: str, plan_preview: dict | None = None) -> dict:
+        payload = {"domain": domain, "request": request, "question": question,
+                   "session_id": session_id, "user_message_id": user_message_id,
+                   "plan_preview": plan_preview or {}}
+        control = get_execution_control()
+        if control is not None and control.task_id:
+            self.task_service.bind(control.task_id, "core.workflow", payload)
+        return payload
+
+    def _bind_workflow_result(self, execution: Any, payload: dict) -> None:
+        task_id = str(execution.values.get("task_id", ""))
+        if task_id:
+            self.task_service.bind(task_id, "core.workflow", payload)
+            waiting = next((item.step_id for item in execution.results if item.status in {"pending", "waiting_human"}), "")
+            self._task_reference = {"task_id": task_id, "node_id": waiting}
+
+    def _bind_pending_task(self, action: dict, session_id: str, question: str) -> dict:
+        action = dict(action)
+        control = get_execution_control()
+        task_id = str(action.get("task_id") or self._task_reference.get("task_id")
+                      or (control.task_id if control else ""))
+        store = self.task_ledger.store
+        if not task_id:
+            task_id = store.create_task({"goal": question, "steps": []}, session_id=session_id, status="waiting_human")
+        record = store.get_task(task_id)
+        guard = dict(getattr(control, "ledger_guard", {}) or {}) if record["owner"] else {}
+        node_id = str(action.get("node_id") or self._task_reference.get("node_id") or "")
+        if not node_id:
+            node_id = next((key for key, node in record["nodes"].items()
+                            if node["status"] in {"pending", "waiting_human"}
+                            and action["tool_name"] in node.get("allowed_tools", [])), "")
+        if not node_id:
+            node_id = "approved_action"
+            store.save_plan(task_id, {"goal": question, "steps": [{
+                "id": node_id, "agent": "commit", "allowed_tools": [action["tool_name"]],
+                "requires_human": True, "arguments": action.get("kwargs", {}),
+                "handler_key": "tool.approved", "side_effect": True,
+            }]}, **guard)
+            store.update_node(task_id, node_id, "waiting_human", output={"tool_name": action["tool_name"]},
+                              record_attempt=False, **guard)
+        record = store.get_task(task_id)
+        action.update(task_id=task_id, node_id=node_id, plan_version=str(record["plan_version"]))
+        store.update_task(task_id, "waiting_human", **guard)
+        return action
 
     def answer_multimodal(
         self, question: str, asset_ids: list[str], session_id: str | None = None,
@@ -340,6 +432,34 @@ class DocumentQAAgent:
             return self.task_ledger.recovery_candidates()
         return self.task_ledger.list_tasks()
 
+    def request_file_compensation(self, task_id: str, operation_id: str, session_id: str) -> dict[str, Any]:
+        from ..tasks.compensation import file_effect
+
+        effect = file_effect(self.task_ledger.store, operation_id)
+        task = self.task_ledger.store.get_task(task_id)
+        if not effect or not task or effect["task_id"] != task_id or task["session_id"] != session_id:
+            raise ValueError("没有属于当前会话的文件补偿记录")
+        prepared = self.tool_registry.call("files.compensate_effect", operation_id=operation_id)
+        if not prepared.ok or not isinstance(prepared.output, dict) or not prepared.output.get("permission"):
+            raise ValueError(prepared.error or "该文件操作不能补偿")
+        return self.pending_actions.create(session_id, {
+            "tool_name": "files.compensate_effect",
+            "kwargs": {"operation_id": operation_id},
+            "description": f"补偿文件写入：{prepared.output['path']}",
+            "risk_level": "high",
+            "reasons": prepared.output["permission"]["reasons"],
+        })
+
+    def reconcile_mail_effect(self, task_id: str, operation_id: str, session_id: str) -> dict[str, Any]:
+        from ..tasks.compensation import file_effect
+        from ..tasks.mail_reconcile import reconcile_email_effect
+
+        task = self.task_ledger.store.get_task(task_id)
+        effect = file_effect(self.task_ledger.store, operation_id)
+        if not task or not effect or task["session_id"] != session_id or effect["task_id"] != task_id:
+            raise ValueError("没有属于当前会话的邮件核对记录")
+        return reconcile_email_effect(self.task_ledger.store, self.email_service.provider, operation_id)
+
     def call_tool(self, name: str, **kwargs) -> object:
         return self.tool_registry.call(name, **kwargs).to_dict()
 
@@ -360,6 +480,7 @@ class DocumentQAAgent:
                 return self._answer_unlocked(question, top_k=top_k, session_id=session_id)
 
     def _answer_unlocked(self, question: str, top_k: int = 5, session_id: str | None = None) -> AnswerResult:
+        self._task_reference = {}
         if hasattr(self, "usage_tracker"):
             self._turn_usage_start = self.usage_tracker.snapshot(self._combined_usage())
         session = self.session_store.get_or_create(session_id)
@@ -390,6 +511,10 @@ class DocumentQAAgent:
         decision = self.intent_router.route(
             question, self.tool_registry, router_context.text, index_hint=index_hint
         )
+        jev_trace = self.intent_router.last_jev_decision
+        if jev_trace.get("mode") != "off":
+            steps.append(AgentStep("jev_router", "success" if "fallback" not in jev_trace else "failed",
+                                   json.dumps(jev_trace, ensure_ascii=False)))
         if decision.mode == "plan_task":
             planner_context = self.context_assembler.for_role(memory_context, "planner", complexity=3)
             steps.append(AgentStep("planner_context", "success", "；".join(planner_context.debug_lines)))
@@ -493,6 +618,23 @@ class DocumentQAAgent:
                     user_message_id=user_message.message_id,
                     question=question,
                     memory_context=memory_context,
+                )
+            directory_image_request = self._planned_directory_image_search(question, plan_preview, decision)
+            if directory_image_request is not None:
+                if not directory_image_request["directory"] or not directory_image_request["query"]:
+                    return self._finalize_answer(
+                        answer="图片目录检索还缺少目录路径或画面描述，请补充后重试。",
+                        evidences=[], steps=steps, used_llm=False,
+                        session_id=session.session_id, user_message_id=user_message.message_id,
+                        question=question, memory_context=memory_context,
+                    )
+                steps.append(AgentStep(
+                    "execute_plan_node", "success", "执行只读图片目录检索节点：knowledge.search_directory_images",
+                ))
+                return self._answer_generic_tool_intent(
+                    question, ToolNames.KNOWLEDGE_SEARCH_DIRECTORY_IMAGES,
+                    directory_image_request, steps, session.session_id,
+                    user_message.message_id, memory_context,
                 )
             simple_index_query = self._planned_simple_index_query(
                 question, plan_preview, decision, index_hint
@@ -1287,6 +1429,7 @@ class DocumentQAAgent:
             ]
         steps.append(AgentStep("plan_task", "success", "统一执行器开始执行 Planner 生成的 DAG。"))
         steps.append(AgentStep("plan_executor", "success", "已将 Planner 节点绑定到领域 handler。"))
+        recovery = self._workflow_descriptor("email", request, question, session_id, user_message_id, effective_plan)
         executor = PlanExecutor(
             tool_call=self.tool_registry.call,
             research=self.web_research_agent.research,
@@ -1299,7 +1442,8 @@ class DocumentQAAgent:
             ),
             task_ledger=getattr(self, "task_ledger", None),
         )
-        execution = executor.execute_email_plan(effective_plan, request)
+        execution = executor.execute_email_plan(effective_plan, request, session_id=session_id)
+        self._bind_workflow_result(execution.supervisor, recovery)
         for result in execution.supervisor.results:
             legacy_name = None
             if result.agent == "knowledge":
@@ -1316,9 +1460,15 @@ class DocumentQAAgent:
             "supervisor", execution.supervisor.status,
             execution.supervisor.error or f"已处理 {len(execution.supervisor.results)} 个计划节点。",
         ))
-        if execution.supervisor.status == "failed":
+        if execution.supervisor.status in {"failed", "paused", "cancelled", "recovery_required"}:
+            message = {
+                "failed": "无法准备邮件",
+                "paused": "邮件任务已暂停",
+                "cancelled": "邮件任务已取消",
+                "recovery_required": "邮件任务需要人工核对，未继续执行",
+            }[execution.supervisor.status]
             return self._finalize_answer(
-                answer=f"无法准备邮件：{execution.supervisor.error}",
+                answer=f"{message}：{execution.supervisor.error}",
                 evidences=[],
                 steps=steps,
                 used_llm=False,
@@ -1333,10 +1483,11 @@ class DocumentQAAgent:
                 used_llm=False, session_id=session_id, user_message_id=user_message_id,
                 question=question, memory_context=memory_context,
             )
-        steps.append(AgentStep(
-            "request_email_confirmation", "waiting_human",
-            "Supervisor 已准备邮件提交，等待人工确认。",
-        ))
+        if execution.supervisor.status == "waiting_human":
+            steps.append(AgentStep(
+                "request_email_confirmation", "waiting_human",
+                "Supervisor 已准备邮件提交，等待人工确认。",
+            ))
         return self._finalize_generic_tool_result(
             question=question,
             tool_name=execution.tool_name,
@@ -1601,6 +1752,9 @@ class DocumentQAAgent:
                 "normalize_tool_capability", "success",
                 "纯文本多模态问答已从证据检索工具提升为综合回答工具。",
             ))
+        control = get_execution_control()
+        if tool_name == "knowledge.index_image" and control is not None and control.task_id:
+            self.task_service.bind(control.task_id, "multimodal.index", {"path": str(safe_arguments["path"])}, timeout_seconds=3600)
         result = self.tool_registry.call(tool_name, **safe_arguments)
         steps.append(AgentStep("execute_tool", "success" if result.ok else "failed", f"已调用工具：{tool_name}"))
         return self._finalize_generic_tool_result(
@@ -1668,6 +1822,8 @@ class DocumentQAAgent:
                 }
         if tool_name == "knowledge.index_image" and isinstance(payload, list):
             answer = self._present_multimodal_index_result(payload)
+        elif tool_name == ToolNames.KNOWLEDGE_SEARCH_DIRECTORY_IMAGES and isinstance(payload, dict):
+            answer = self._present_directory_image_search_result(payload)
         elif tool_name == "knowledge.search_multimodal" and isinstance(payload, list):
             answer = self._present_multimodal_search_result(payload)
         elif (
@@ -1716,6 +1872,7 @@ class DocumentQAAgent:
         result_detail = f"工具输出已返回：{tool_name}"
         if tool_name in {
             "knowledge.index_image", "knowledge.search_multimodal", "knowledge.answer_multimodal",
+            ToolNames.KNOWLEDGE_SEARCH_DIRECTORY_IMAGES,
         }:
             result_detail += "\n" + self._clip_tool_output(answer, limit=1600)
         steps.append(AgentStep("tool_result", "success", result_detail))
@@ -1771,6 +1928,24 @@ class DocumentQAAgent:
         if warnings:
             result += "\n\n注意：\n" + "\n".join(f"- {item}" for item in warnings)
         return result
+
+    @staticmethod
+    def _present_directory_image_search_result(payload: dict[str, object]) -> str:
+        directory = str(payload.get("directory", ""))
+        matches = payload.get("matches", [])
+        scanned = int(payload.get("scanned", 0) or 0)
+        skipped = int(payload.get("skipped", 0) or 0)
+        if not isinstance(matches, list) or not matches:
+            return f"在 {directory} 未找到可检索的图片（有效图片 {scanned} 张，跳过 {skipped} 张）。"
+        lines = [f"在 {directory} 检索了 {scanned} 张图片，最相似候选："]
+        for index, item in enumerate(matches, start=1):
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"{index}. {item.get('path', '')}（相似度 {float(item.get('score', 0)):.4f}）")
+        lines.append("相似度用于排序，不代表已确认图片内容；请打开候选图片核对。")
+        if skipped:
+            lines.append(f"另有 {skipped} 张无效或超出限制的图片未参与检索。")
+        return "\n".join(lines)
 
     @staticmethod
     def _present_multimodal_search_result(payload: list[object]) -> str:
@@ -1863,6 +2038,7 @@ class DocumentQAAgent:
                 ),
             ))
         if pending_action:
+            pending_action = self._bind_pending_task(pending_action, session_id, question)
             pending_action = self.pending_actions.create(session_id, pending_action)
         assistant_message = self.session_store.append_message(session_id, "assistant", answer)
         memory_result = MemoryTurnManager(
@@ -1905,6 +2081,8 @@ class DocumentQAAgent:
                     }
                     for item in evidences[:12]
                 ],
+                "pending_action": pending_action,
+                "task_id": str((pending_action or {}).get("task_id") or self._task_reference.get("task_id", "")),
             },
         )
         return AnswerResult(
@@ -1946,6 +2124,7 @@ class DocumentQAAgent:
         clients = [
             getattr(self, "client", None),
             getattr(getattr(self, "index", None), "client", None),
+            getattr(getattr(getattr(self, "index", None), "hybrid_retriever", None), "decision_client", None),
             getattr(getattr(self, "memory_store", None), "client", None),
             getattr(getattr(self, "web_research_agent", None), "client", None),
             getattr(getattr(self, "memory_extractor", None), "client", None),
@@ -1994,16 +2173,129 @@ class DocumentQAAgent:
     ) -> AnswerResult:
         session = self.session_store.get_or_create(session_id)
         action_id = str(pending_action.get("action_id", ""))
-        approved = self.pending_actions.consume(action_id, session.session_id)
-        question = f"用户确认执行工具：{approved.tool_name}"
+        preview = self.pending_actions.inspect(action_id, session.session_id, include_expired=True)
+        if preview is None:
+            raise ValueError("审批请求不存在或不属于当前会话")
+        if preview.task_id:
+            task = self.task_ledger.store.get_task(preview.task_id)
+            if task is None or task["status"] != "waiting_human" or str(task["plan_version"]) != str(preview.plan_version):
+                raise ValueError("任务状态或计划版本已变化，旧审批不能执行")
+        question = f"用户确认执行工具：{preview.tool_name}"
         user_message = self.session_store.append_message(session.session_id, "user", question)
         memory_context = self._load_memory_context(question, session.session_id)
         steps = [
-            AgentStep("approve_pending_action", "success", f"用户已确认：{approved.description}"),
+            AgentStep("approve_pending_action", "success", f"用户已确认：{preview.description}"),
         ]
+        approved = self.pending_actions.consume(action_id, session.session_id)
         tool_name = approved.tool_name
         kwargs = dict(approved.kwargs)
-        result = self.tool_registry.call_approved(tool_name, **kwargs)
+        store = self.task_ledger.store
+        attempt = ({"attempt_id": approved.attempt_id} if approved.attempt_id else
+                   store.start_attempt(approved.task_id, approved.node_id) if approved.task_id else None)
+        saved_job = self.task_service.descriptor(approved.task_id) if approved.task_id else None
+        remaining_seconds = min(120, max(0, saved_job["timeout_seconds"] - saved_job["elapsed"])) if saved_job else 120
+        control = ExecutionControl(task_id=approved.task_id, node_id=approved.node_id,
+                                   attempt_id=attempt["attempt_id"] if attempt else "",
+                                   deadline=time.monotonic() + remaining_seconds, max_tool_calls=40 if saved_job else 1,
+                                   max_tokens=80000, max_attempts=40)
+        if saved_job:
+            control.usage.update(saved_job["usage"])
+        tools_before = control.snapshot_usage()["tool_calls"]
+        guard = {"owner": approved.owner, "lease_token": approved.lease_token} if approved.owner else {}
+        control.ledger_guard = guard
+        control.task_store = store
+        done = threading.Event()
+
+        def refresh_approval_control() -> None:
+            task = store.get_task(approved.task_id)
+            if task["cancel_requested"]:
+                control.cancel()
+            if task["pause_requested"]:
+                control.pause()
+
+        def heartbeat_approval() -> None:
+            while not done.wait(1):
+                try:
+                    store.heartbeat(approved.task_id, approved.owner, approved.lease_token)
+                    refresh_approval_control()
+                except Exception:
+                    control.cancel()
+                    return
+
+        heartbeat = threading.Thread(target=heartbeat_approval, daemon=True) if approved.owner else None
+        if heartbeat:
+            heartbeat.start()
+        try:
+            try:
+                self.task_service.initialize_metrics(control)
+            except Exception:
+                _LOGGER.warning("Approval metrics initialization failed for task %s", approved.task_id, exc_info=True)
+            try:
+                with execution_scope(control):
+                    if approved.task_id:
+                        refresh_approval_control()
+                    control.checkpoint()
+                    result = self.tool_registry.call_approved(tool_name, **kwargs)
+            except Exception as exc:
+                if getattr(exc, "side_effect_state", "") == "committed" and isinstance(getattr(exc, "result", None), dict):
+                    # SMTP 已接受后发生暂停，不能把已知投递成功改写成未知并提示重发。
+                    result = ToolResult(True, tool_name, exc.result, status="success")
+                elif isinstance(exc, TaskControlError) and control.snapshot_usage()["tool_calls"] == tools_before:
+                    # Registry 尚未记录派发，保留准备结果，恢复后必须重新审批。
+                    error = f"审批工具未派发，未执行外部操作：{exc}"
+                    if attempt:
+                        status = "cancelled" if isinstance(exc, TaskCancelled) else "paused" if isinstance(exc, TaskPaused) else "failed"
+                        store.finish_attempt(attempt["attempt_id"], "waiting_human", error=error,
+                                             usage=control.snapshot_usage(), certainty="confirmed", **guard)
+                        store.finish_task(approved.task_id, status, error, **guard)
+                    raise type(exc)(error) from exc
+                else:
+                    error = f"审批工具已派发，结果尚未确认，请人工核对：{exc}" if isinstance(exc, TaskControlError) else str(exc)
+                    if attempt:
+                        store.finish_attempt(attempt["attempt_id"], "unknown", error=error,
+                                             usage=control.snapshot_usage(),
+                                             tool_calls=max(0, control.snapshot_usage()["tool_calls"] - tools_before),
+                                             certainty="unknown", **guard)
+                        store.finish_task(approved.task_id, "recovery_required", error, **guard)
+                    if isinstance(exc, TaskControlError):
+                        raise type(exc)(error) from exc
+                    raise
+            if attempt:
+                previous = store.load_output(approved.task_id, approved.node_id) or {}
+                node_status = "success" if result.ok and result.status == "success" else "unknown" if result.status == "unknown" else "failed"
+                approved_result = result.to_dict()
+                if node_status == "success" and isinstance(result.output, dict):
+                    permission = result.output.get("permission")
+                    if isinstance(permission, dict) and permission.get("requires_confirmation"):
+                        # 风险评估仍需确认，但已成功消费的审批不能恢复成再次等待。
+                        approved_result["output"] = {
+                            **result.output,
+                            "permission": {**permission, "requires_confirmation": False, "confirmed": True},
+                        }
+                output = {**previous, "tool_name": tool_name, "tool_result": approved_result,
+                          "call_arguments": kwargs, "_waiting_human": False}
+                if tool_name == ToolNames.FILES_WRITE_FILE and "write_output" in previous:
+                    output["write_output"] = approved_result["output"]
+                node = store.get_task(approved.task_id)["nodes"][approved.node_id]
+                checks = {**dict(node.get("checks") or {}), "result_success": node_status == "success",
+                          "approval_consumed": True, "approved_tool_success": node_status == "success"}
+                store.finish_attempt(attempt["attempt_id"], node_status, output=output, error=result.error,
+                                     usage=control.snapshot_usage(), tool_calls=1, checks=checks,
+                                     certainty="confirmed" if node_status == "success" else "unknown", **guard)
+                nodes = store.get_task(approved.task_id)["nodes"]
+                status = "succeeded" if all(node["status"] in {"success", "succeeded"} for node in nodes.values()) else "paused"
+                if node_status != "success":
+                    status = "recovery_required" if node_status == "unknown" else "failed"
+                store.finish_task(approved.task_id, status, result.error, **guard)
+        finally:
+            # 租约覆盖工具执行、文件指纹计算与终态提交，成功落库后才停止续租。
+            done.set()
+            if heartbeat:
+                heartbeat.join(timeout=2)
+            try:
+                self.task_service.persist_metrics(control)
+            except Exception:
+                _LOGGER.warning("Approval metrics persistence failed for task %s", approved.task_id, exc_info=True)
         if not result.ok:
             steps.append(AgentStep("execute_approved_action", "failed", result.error or "工具执行失败"))
             answer = f"已获得确认，但工具执行失败：{tool_name}\n\n原因：{result.error or '未知错误'}"
@@ -2021,7 +2313,7 @@ class DocumentQAAgent:
         output = result.output or {}
         email_success = tool_name == "email.save_draft" and output.get("status") == "draft_saved"
         send_success = tool_name == "email.send" and output.get("status") == "sent"
-        execution_success = bool(output.get("executed"))
+        execution_success = bool(output.get("executed")) and result.status == "success" and output.get("returncode") == 0
         move_success = tool_name == "files.apply_move" and bool(output.get("confirmed"))
         vision_success = bool(output.get("answered")) and bool(output.get("answer"))
         if output.get("written") or email_success or send_success or execution_success or move_success or vision_success:
@@ -2087,7 +2379,13 @@ class DocumentQAAgent:
     def cancel_pending_action(self, pending_action: dict, session_id: str | None = None) -> bool:
         """取消一次性审批请求，避免同一 action_id 之后被重放。"""
         session = self.session_store.get_or_create(session_id)
-        return self.pending_actions.cancel(str(pending_action.get("action_id", "")), session.session_id)
+        action_id = str(pending_action.get("action_id", ""))
+        item = self.pending_actions.inspect(action_id, session.session_id, include_expired=True)
+        cancelled = self.pending_actions.cancel(action_id, session.session_id)
+        if cancelled and item and item.task_id:
+            self.task_ledger.store.update_node(item.task_id, item.node_id, "cancelled", record_attempt=False)
+            self.task_ledger.store.finish_task(item.task_id, "cancelled", "用户拒绝审批，未提交操作")
+        return cancelled
 
     def _extract_test_execution_request(self, question: str) -> dict[str, object] | None:
         normalized = question.lower()
@@ -2353,6 +2651,40 @@ class DocumentQAAgent:
         return query or question
 
     @staticmethod
+    def _planned_directory_image_search(
+        question: str, plan_preview: dict[str, object], decision: IntentDecision,
+    ) -> dict[str, object] | None:
+        """将只有目录视觉检索工具的计划收敛为一次只读调用。"""
+        if decision.requires_file_output:
+            return None
+        steps = plan_preview.get("steps", [])
+        if not isinstance(steps, list):
+            return None
+        selected: dict[str, object] = {}
+        tools: set[str] = set()
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            current = {str(tool) for tool in step.get("allowed_tools", [])}
+            tools.update(current)
+            if ToolNames.KNOWLEDGE_SEARCH_DIRECTORY_IMAGES in current:
+                selected = step.get("arguments", {}) if isinstance(step.get("arguments"), dict) else {}
+        if tools != {ToolNames.KNOWLEDGE_SEARCH_DIRECTORY_IMAGES}:
+            return None
+        directory = str(selected.get("directory") or selected.get("path") or
+                        decision.arguments.get("directory") or decision.arguments.get("path") or "").strip()
+        if not directory:
+            match = re.search(r'["“]([A-Za-z]:[\\/][^"”]+|/[^"”]+)["”]', question)
+            directory = match.group(1) if match else ""
+        query = str(selected.get("query") or decision.arguments.get("query") or "").strip()
+        raw_recursive = selected.get("recursive", False)
+        recursive = raw_recursive if isinstance(raw_recursive, bool) else str(raw_recursive).casefold() in {
+            "1", "true", "yes", "on",
+        }
+        return {"directory": directory.strip('"“”'), "query": query,
+                "top_k": selected.get("top_k", 3), "recursive": recursive}
+
+    @staticmethod
     def _planned_simple_web_request(
         question: str,
         plan_preview: dict[str, object],
@@ -2476,7 +2808,9 @@ class DocumentQAAgent:
                 session_id=session_id, user_message_id=user_message_id,
                 question=question, memory_context=memory_context,
             )
-        if target.exists():
+        control = get_execution_control()
+        resuming = bool(control and control.task_id and self.task_ledger.store.load_plan(control.task_id).get("steps"))
+        if target.exists() and not resuming:
             return self._finalize_answer(
                 answer=f"目标文件已存在，未覆盖：{target}。请指定新文件名；此搜索建文件任务默认不覆盖已有文件。",
                 evidences=[], steps=steps, used_llm=False, session_id=session_id,
@@ -2561,21 +2895,31 @@ class DocumentQAAgent:
             llm_call=lambda prompt: self._chat_with_stage("Answer", [{"role": "user", "content": prompt}]),
             task_ledger=getattr(self, "task_ledger", None),
         )
+        recovery = self._workflow_descriptor("web_file", request, question, session_id, user_message_id, plan_preview)
         execution = executor.execute_bound_plan(
             workflow_plan,
             {source_id: search, commit_id: write_result},
             initial_values={"query": query, "target": str(target)},
             parallel=False,
+            session_id=session_id,
+            prepare_steps={commit_id},
         )
+        self._bind_workflow_result(execution, recovery)
         for item in execution.results:
             steps.append(AgentStep(
                 f"supervisor:{item.step_id}", item.status,
                 item.error or f"agent={item.agent}; tool_calls={item.tool_calls}; tokens={item.tokens}",
             ))
         steps.append(AgentStep("supervisor", execution.status, execution.error or "网页到文件计划执行完成。"))
-        if execution.status == "failed":
+        if execution.status in {"failed", "paused", "cancelled", "recovery_required"}:
+            message = {
+                "failed": "未写入文件",
+                "paused": "搜索建文件任务已暂停",
+                "cancelled": "搜索建文件任务已取消",
+                "recovery_required": "搜索建文件任务需要人工核对，未继续执行",
+            }[execution.status]
             return self._finalize_answer(
-                answer=f"未写入文件：{execution.error}", evidences=[], steps=steps,
+                answer=f"{message}：{execution.error}", evidences=[], steps=steps,
                 used_llm=False, session_id=session_id, user_message_id=user_message_id,
                 question=question, memory_context=memory_context,
             )
@@ -2760,10 +3104,13 @@ class DocumentQAAgent:
             llm_call=lambda prompt: self._chat_with_stage("Answer", [{"role": "user", "content": prompt}]),
             task_ledger=getattr(self, "task_ledger", None),
         )
+        recovery = self._workflow_descriptor("index_report", request, question, session_id, user_message_id, plan_preview)
         execution = executor.execute_bound_plan(
             workflow_plan, {source_id: retrieve, commit_id: generate_and_commit},
-            initial_values={"query": query}, parallel=False,
+            initial_values={"query": query}, parallel=False, session_id=session_id,
+            prepare_steps={commit_id},
         )
+        self._bind_workflow_result(execution, recovery)
         for item in execution.results:
             steps.append(AgentStep(
                 f"supervisor:{item.step_id}", item.status,
@@ -2776,9 +3123,15 @@ class DocumentQAAgent:
             "retrieve_index_collection", "success" if evidences else "failed",
             f"索引中选出 {len({item.doc_id for item in evidences})} 份文档、{len(evidences)} 条证据。",
         ))
-        if execution.status == "failed":
+        if execution.status in {"failed", "paused", "cancelled", "recovery_required"}:
+            message = {
+                "failed": "未生成技术报告",
+                "paused": "技术报告任务已暂停",
+                "cancelled": "技术报告任务已取消",
+                "recovery_required": "技术报告任务需要人工核对，未继续执行",
+            }[execution.status]
             return self._finalize_answer(
-                answer=f"未生成技术报告：{execution.error}", evidences=evidences, steps=steps, used_llm=False,
+                answer=f"{message}：{execution.error}", evidences=evidences, steps=steps, used_llm=False,
                 session_id=session_id, user_message_id=user_message_id,
                 question=question, memory_context=memory_context,
             )
@@ -3337,6 +3690,7 @@ class DocumentQAAgent:
                 )
                 return {
                     f"document_{requested_target}": {"title": title, "content": content, "evidence": evidence},
+                    "resolved_paths": [str(resolved.output)],
                     "_tool_calls": 2,
                 }
 
@@ -3385,10 +3739,12 @@ class DocumentQAAgent:
             llm_call=lambda prompt: self._chat_with_stage("Answer", [{"role": "user", "content": prompt}]),
             task_ledger=getattr(self, "task_ledger", None),
         )
+        recovery = self._workflow_descriptor("documents", {"targets": list(targets)}, question, session_id, user_message_id)
         execution = executor.execute_bound_plan(
             {"goal": question, "score": 7, "steps": plan_steps}, handlers,
-            initial_values={"targets": list(targets)}, parallel=True,
+            initial_values={"targets": list(targets)}, parallel=True, session_id=session_id,
         )
+        self._bind_workflow_result(execution, recovery)
         for item in execution.results:
             steps.append(AgentStep(
                 f"supervisor:{item.step_id}", item.status,

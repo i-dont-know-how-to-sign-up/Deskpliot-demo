@@ -1,23 +1,30 @@
 from __future__ import annotations
 
 import email
+from email import policy
 import html
 import imaplib
 import json
 import mimetypes
 import os
+import hashlib
 import re
 import smtplib
 import ssl
-import re
+import socket
+import threading
+from contextlib import contextmanager
 from email.utils import getaddresses
 import time
 from dataclasses import asdict, dataclass, field
 from email.header import decode_header, make_header
 from email.message import EmailMessage as MIMEEmailMessage
-from email.utils import parsedate_to_datetime
+from email.utils import make_msgid, parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Protocol
+
+from ..tasks.control import TaskControlError, get_execution_control
+from ..tasks.retry import UnknownSideEffect
 
 
 @dataclass
@@ -173,11 +180,13 @@ class ImapSmtpEmailProvider:
                 self.host,
                 self.imap_port,
                 ssl_context=ssl.create_default_context(),
-                timeout=self.timeout,
+                timeout=_email_timeout(self.timeout),
             )
+            _email_checkpoint(client, self.timeout)
             status, detail = client.login(self.username, self.password)
             if status != "OK":
                 raise RuntimeError(f"IMAP 登录失败：{detail!r}")
+            _email_checkpoint(client, self.timeout)
             status, detail = client.select(target_mailbox, readonly=readonly)
             if status != "OK" and readonly and "Unsafe Login" in str(detail):
                 # 部分 163 节点会拒绝只读 EXAMINE，但允许 SELECT。
@@ -185,7 +194,10 @@ class ImapSmtpEmailProvider:
                 status, detail = client.select(target_mailbox, readonly=False)
             if status != "OK":
                 raise RuntimeError(f"无法打开邮箱文件夹 {target_mailbox}：{detail!r}")
+        except TaskControlError:
+            raise
         except Exception as exc:
+            _email_timeout(self.timeout)
             detail = str(exc)
             if "Unsafe Login" in detail:
                 provider = self._provider_label()
@@ -212,6 +224,7 @@ class ImapSmtpEmailProvider:
         """将邮件副本写入 IMAP 文件夹，供网页版邮箱显示。"""
         client = self._connect(mailbox, readonly=False)
         try:
+            _email_checkpoint(client, self.timeout)
             status, detail = client.append(
                 mailbox,
                 flags,
@@ -289,6 +302,10 @@ class ImapSmtpEmailProvider:
         message["From"] = self.username
         message["To"] = ", ".join(to)
         message["Subject"] = subject
+        control = get_execution_control()
+        operation_id = str(getattr(control, "active_operation_id", "") or "")
+        domain = self.username.rsplit("@", 1)[-1] if "@" in self.username else "localhost"
+        message["Message-ID"] = f"<deskpilot-{operation_id}@{domain}>" if operation_id else make_msgid()
         message.set_content(body)
         for raw_path in attachment_paths or []:
             path = Path(raw_path)
@@ -302,6 +319,55 @@ class ImapSmtpEmailProvider:
             )
         return message
 
+    def _saved_mime_path(self) -> Path | None:
+        control = get_execution_control()
+        operation_id = str(getattr(control, "active_operation_id", "") or "")
+        store = getattr(control, "task_store", None)
+        if not operation_id or store is None:
+            return None
+        return store.path.parent / "email_effects" / f"{operation_id}.eml"
+
+    def _persist_mime(self, message: MIMEEmailMessage) -> None:
+        path = self._saved_mime_path()
+        if path is None:
+            return
+        data = message.as_bytes()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            if hashlib.sha256(path.read_bytes()).digest() != hashlib.sha256(data).digest():
+                raise RuntimeError("邮件操作内容与已保存的 MIME 快照不一致")
+            return
+        with path.open("xb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+
+    def find_sent_copy(self, message_id: str) -> bool:
+        client = self._connect(self.sent_mailbox, readonly=True)
+        try:
+            status, data = client.uid("search", None, "HEADER", "Message-ID", f'"{message_id}"')
+            if status != "OK":
+                raise RuntimeError("已发送箱查询失败，不能判断邮件状态")
+            return bool(data and data[0] and data[0].split())
+        finally:
+            client.logout()
+
+    def repair_sent_copy(self, operation_id: str, message_id: str, store_path: Path) -> bool:
+        if self.find_sent_copy(message_id):
+            return False
+        path = store_path.parent / "email_effects" / f"{operation_id}.eml"
+        if not path.is_file():
+            raise FileNotFoundError("邮件 MIME 快照不存在，不能补写已发送箱")
+        message = email.message_from_bytes(path.read_bytes(), policy=policy.default)
+        if message.get("Message-ID") != message_id:
+            raise RuntimeError("MIME 快照与副作用日志的 Message-ID 不一致")
+        self._append_to_mailbox(message, self.sent_mailbox, "(\\Seen)")
+        return True
+
     def _send(
         self,
         to: list[str],
@@ -310,20 +376,60 @@ class ImapSmtpEmailProvider:
         send: bool,
         attachment_paths: list[str] | None = None,
     ) -> dict[str, Any]:
+        _email_timeout(self.timeout)
         message = self._build_message(to, subject, body, attachment_paths)
-        if self.smtp_port == 465:
-            client = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, context=ssl.create_default_context())
-        else:
-            client = smtplib.SMTP(self.smtp_host, self.smtp_port)
-            client.starttls(context=ssl.create_default_context())
-        with client:
-            client.login(self.username, self.password)
-            if send:
-                client.send_message(message)
+        if send:
+            self._persist_mime(message)
+        try:
+            if self.smtp_port == 465:
+                client = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port,
+                                          context=ssl.create_default_context(), timeout=_email_timeout(self.timeout))
+            else:
+                client = smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=_email_timeout(self.timeout))
+        except Exception:
+            _email_timeout(self.timeout)
+            raise
+        refused: dict[str, Any] = {}
+        dispatched = False
+        try:
+            with _email_connection_control(client):
+                if self.smtp_port != 465:
+                    _email_checkpoint(client, self.timeout)
+                    client.starttls(context=ssl.create_default_context())
+                _email_checkpoint(client, self.timeout)
+                client.login(self.username, self.password)
+                if send:
+                    _email_checkpoint(client, self.timeout)
+                    dispatched = True
+                    refused = client.send_message(message) or {}
+        except (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused, smtplib.SMTPDataError):
+            # 明确拒绝与丢失接受响应不同；拒绝不表示投递成功。
+            raise
+        except Exception as exc:
+            if dispatched:
+                error = UnknownSideEffect(
+                    f"SMTP delivery outcome unknown; do not resend automatically. Message-ID={message['Message-ID']}"
+                )
+                error.message_id = str(message["Message-ID"])
+                error.result = {"status": "unknown", "message_id": error.message_id}
+                raise error from exc
+            _email_timeout(self.timeout)
+            raise
+        finally:
+            # QUIT 的失败不能覆盖 DATA 已确认的接受状态。
+            try:
+                client.close()
+            except OSError:
+                pass
         if send:
             # SMTP 投递不会自动保证 IMAP 已发送箱出现副本，因此单独 APPEND。
             try:
                 sent_copy_saved = self._append_to_mailbox(message, self.sent_mailbox, "(\\Seen)")
+            except TaskControlError as exc:
+                exc.side_effect_state = "committed"
+                exc.result = {"status": "sent", "message_id": str(message["Message-ID"]),
+                              "sent_copy_saved": False, "refused_recipients": refused}
+                raise
             except Exception as exc:
                 sent_copy_saved = False
                 sent_copy_error = str(exc)
@@ -335,6 +441,8 @@ class ImapSmtpEmailProvider:
                 "body": body,
                 "attachment_paths": list(attachment_paths or []),
                 "status": "sent",
+                "message_id": str(message["Message-ID"]),
+                "refused_recipients": refused,
                 "sent_copy_saved": sent_copy_saved,
                 "sent_copy_error": sent_copy_error,
             }
@@ -364,6 +472,48 @@ class ImapSmtpEmailProvider:
         self, to: list[str], subject: str, body: str, attachment_paths: list[str] | None = None
     ) -> dict[str, Any]:
         return self._send(to, subject, body, send=True, attachment_paths=attachment_paths)
+
+
+def _email_timeout(default: float) -> float:
+    control = get_execution_control()
+    return control.timeout(default) if control is not None else default
+
+
+def _email_checkpoint(client: Any, default: float) -> None:
+    timeout = _email_timeout(default)
+    connection = getattr(client, "sock", None)
+    if connection is not None:
+        connection.settimeout(timeout)
+
+
+@contextmanager
+def _email_connection_control(client: Any):
+    control = get_execution_control()
+    if control is None:
+        yield
+        return
+    stopped = threading.Event()
+
+    def interrupt() -> None:
+        while not stopped.wait(0.025):
+            try:
+                control.checkpoint()
+            except TaskControlError:
+                connection = getattr(client, "sock", None)
+                if connection is not None:
+                    try:
+                        connection.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                return
+
+    watcher = threading.Thread(target=interrupt, name="deskpilot-smtp-control", daemon=True)
+    watcher.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        watcher.join(timeout=1)
 
 
 class EmailMCPService:

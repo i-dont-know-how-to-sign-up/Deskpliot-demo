@@ -11,6 +11,8 @@ from .reranker import DisabledReranker, RerankDocument, build_reranker
 from .tracing import RetrievalTrace
 from ..context.budget import estimate_tokens
 from ..core.api_clients import cosine_similarity, local_hash_embedding
+from ..decision.jev import JevClient, noul
+from ..tasks.control import TaskControlError
 from ..core.models import Chunk, Document, Evidence
 
 
@@ -129,6 +131,7 @@ class HybridRetriever:
         self.dense = DenseRetriever()
         self.sparse = SparseRetriever(catalog)
         self.rrf_k = rrf_k or max(1, int(os.getenv("RAG_RRF_K", "60")))
+        self.decision_client = JevClient()
 
     def retrieve(self, request: RetrievalRequest, documents: dict[str, Document],
                  chunks: dict[str, Chunk], embed: Callable[[list[str]], list[list[float]]],
@@ -158,9 +161,55 @@ class HybridRetriever:
 
         ranked, effective_provider = self._rerank(request, ranked, documents, trace)
         ranked = self._apply_threshold(request, ranked, effective_provider, trace)
+        ranked = self._jev_filter(request, ranked, trace)
         expanded = self._expand(request, ranked, trace)
         selected = self._select_mmr(request, expanded, trace)
         return self._finish(selected, ranked, request, trace, effective_provider)
+
+    def _jev_filter(self, request: RetrievalRequest, ranked: list[RetrievalCandidate],
+                    trace: RetrievalTrace) -> list[RetrievalCandidate]:
+        client = self.decision_client
+        if client.config.mode == "off" or not ranked:
+            return ranked
+        if not client.config.allow_document_text:
+            trace.add("jev_evidence", perf_counter(), len(ranked), len(ranked),
+                      mode=client.config.mode, skipped="document_text_not_allowed")
+            return ranked
+        started = perf_counter()
+        pool = ranked[:client.config.max_passages]
+        state = {"query": request.original_query[:1200], "passages": [
+            {"id": index, "text": item.chunk.text[:client.config.max_passage_chars]}
+            for index, item in enumerate(pool)
+        ]}
+        questions: dict[str, dict[str, str]] = {}
+        for index in range(len(pool)):
+            questions[f"relevant_{index}"] = {
+                "type": "noul", "instructions": f"Is passage {index} directly relevant to the query?"}
+            questions[f"support_{index}"] = {
+                "type": "noul", "instructions": f"Does passage {index} contain factual evidence useful for answering the query?"}
+        try:
+            with client.stage("Jev RAG Evidence"):
+                answers = client.judge(state, questions)
+            rejected = {item.chunk.chunk_id for index, item in enumerate(pool)
+                        if min(noul(answers, f"relevant_{index}"),
+                               noul(answers, f"support_{index}")) < client.config.passage_threshold}
+            protected = set()
+            for doc_id in request.filters.doc_ids:
+                first = next((item.chunk.chunk_id for item in ranked if item.chunk.doc_id == doc_id), None)
+                if first:
+                    protected.add(first)
+            selected = [item for item in ranked if item.chunk.chunk_id not in rejected or item.chunk.chunk_id in protected]
+            output = selected if client.config.mode == "gated" else ranked
+            trace.add("jev_evidence", started, len(ranked), len(output), mode=client.config.mode,
+                      assessed=len(pool), rejected=len(rejected), protected=len(rejected & protected),
+                      threshold=client.config.passage_threshold)
+            return output
+        except TaskControlError:
+            raise
+        except Exception as exc:
+            trace.add("jev_evidence", started, len(ranked), len(ranked), mode=client.config.mode,
+                      fallback=True, error=type(exc).__name__)
+            return ranked
 
     def _recall(self, request: RetrievalRequest, chunks: dict[str, Chunk], allowed: set[str],
                 embed: Callable[[list[str]], list[list[float]]]) -> list[tuple[str, str, list[tuple[str, float]]]]:

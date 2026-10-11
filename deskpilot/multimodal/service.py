@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import re
 import os
+import math
 from pathlib import Path
 from typing import Any
 
 from ..core.config import DATA_DIR, ROOT_DIR, _load_dotenv
 from .asset_store import AssetStore
+from .image_processor import SUPPORTED_FORMATS
 from .ingestion import MultimodalIngestionService
 from .models import MediaAsset, VisualEvidence
 from .providers.ocr import build_ocr_provider
@@ -90,6 +92,79 @@ class MultimodalService:
         if not query.strip() and image_path is None:
             raise ValueError("多模态检索需要文本或图片查询")
         return self.retriever.search(query, image_path, top_k)
+
+    def search_directory_images(
+        self, directory: Path, query: str, top_k: int = 3, recursive: bool = False,
+    ) -> dict[str, Any]:
+        """只读地检索一个本地目录，不修改全局多模态索引。"""
+        from PIL import Image, UnidentifiedImageError
+        from ..tasks.control import get_execution_control
+
+        root = directory.expanduser().resolve(strict=True)
+        if not root.is_dir():
+            raise NotADirectoryError(f"不是图片目录：{root}")
+        if not query.strip():
+            raise ValueError("请提供要查找的图片内容描述")
+        if self.vision_embedding.provider == "basic":
+            raise RuntimeError("按文本查找图片需要 IMAGE_EMBEDDING_PROVIDER=siglip2")
+
+        max_files = max(1, min(int(os.getenv("IMAGE_DIRECTORY_SEARCH_MAX_FILES", "128")), 512))
+        max_bytes = max(1, int(os.getenv("IMAGE_MAX_BYTES", str(10 * 1024 * 1024))))
+        max_pixels = max(1, int(os.getenv("IMAGE_MAX_PIXELS", "40000000")))
+        extensions = {".png", ".jpg", ".jpeg", ".webp"}
+        paths: list[Path] = []
+        skipped = 0
+        iterator = root.rglob("*") if recursive else root.iterdir()
+        for candidate in iterator:
+            if candidate.suffix.casefold() not in extensions or not candidate.is_file() or candidate.is_symlink():
+                continue
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(root):
+                continue
+            if len(paths) >= max_files:
+                raise ValueError(f"目录超过 {max_files} 张图片上限，请缩小目录或提高 IMAGE_DIRECTORY_SEARCH_MAX_FILES")
+            try:
+                if resolved.stat().st_size > max_bytes:
+                    skipped += 1
+                    continue
+                with Image.open(resolved) as image:
+                    if image.format not in SUPPORTED_FORMATS or image.width * image.height > max_pixels:
+                        skipped += 1
+                        continue
+                    image.verify()
+            except (OSError, UnidentifiedImageError, ValueError):
+                skipped += 1
+                continue
+            paths.append(resolved)
+        if not paths:
+            return {"directory": str(root), "query": query, "scanned": 0,
+                    "skipped": skipped, "matches": []}
+
+        control = get_execution_control()
+        if control is not None:
+            control.checkpoint()
+        text_vector = self.vision_embedding.embed_texts([query])[0]
+        if control is not None:
+            control.checkpoint()
+        # Provider batches images internally; a single call avoids reloading SigLIP2 per batch.
+        vectors = self.vision_embedding.embed_images(paths)
+        if len(vectors) != len(paths):
+            raise RuntimeError("视觉编码器返回的图片向量数量不正确")
+        scored: list[tuple[float, Path]] = []
+        for path, vector in zip(paths, vectors):
+            if len(vector) != len(text_vector):
+                raise RuntimeError("图片和文本的向量维度不一致")
+            score = sum(float(a) * float(b) for a, b in zip(text_vector, vector))
+            if not math.isfinite(score):
+                raise RuntimeError("视觉编码器返回了无效相似度")
+            scored.append((score, path))
+        scored.sort(key=lambda item: (-item[0], str(item[1]).casefold()))
+        limit = max(1, min(int(top_k), 5))
+        return {
+            "directory": str(root), "query": query, "scanned": len(paths), "skipped": skipped,
+            "matches": [{"path": str(path), "score": round(score, 4)}
+                        for score, path in scored[:limit]],
+        }
 
     def answer_from_index(
         self, query: str, top_k: int = 4, *, confirm_sensitive: bool = False,

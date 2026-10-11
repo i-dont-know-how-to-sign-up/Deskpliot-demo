@@ -18,6 +18,7 @@ data/
 eval/runs/
 eval/reports/
 eval/baselines/
+eval/pytest_*/
 sess_*.md
 
 # Root-level design/debug documents are local working material. Keep README only.

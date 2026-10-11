@@ -9,6 +9,8 @@ from typing import Any
 
 from ..core.api_clients import OpenAICompatibleClient
 from ..core.json_utils import parse_json_value
+from ..decision.jev import JevClient, noul
+from ..tasks.control import TaskControlError
 from ..tools.tool_registry import ToolRegistry
 from .schemas import IntentDecision
 from .validator import SlotValidator
@@ -18,6 +20,8 @@ from .validator import SlotValidator
 class IntentRouter:
     client: OpenAICompatibleClient
     validator: SlotValidator = field(default_factory=SlotValidator)
+    decision_client: JevClient | None = None
+    last_jev_decision: dict[str, Any] = field(default_factory=dict, init=False)
 
     def route(
         self,
@@ -29,6 +33,9 @@ class IntentRouter:
         # 路由提示只使用摘要；工具被选中后，再从注册表加载完整 schema 做槽位校验。
         tool_summaries = tools.list_tool_summaries() if isinstance(tools, ToolRegistry) else self._summarize_tools(tools)
         full_tool_specs = self._normalize_tools(tools)
+        shortcut = self._jev_direct_gate(question, index_hint or [])
+        if shortcut is not None:
+            return shortcut
         # 第一步先判断问题该直接回答，还是需要调用工具或继续追问。
         prompt = self._build_prompt(question, tool_summaries, memory_context, index_hint or [])
         with self._client_stage("Router", stream=True):
@@ -216,6 +223,57 @@ class IntentRouter:
         decision.raw_response = response
         return decision
 
+    def _jev_direct_gate(self, question: str, index_hint: list[dict[str, Any]]) -> IntentDecision | None:
+        client = self.decision_client
+        self.last_jev_decision = {"mode": client.config.mode if client else "off"}
+        if client is None or client.config.mode == "off":
+            return None
+        # 这是外发数据保护，不是意图分类；敏感/路径请求交还原 Router。
+        if re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|[A-Za-z]:[\\/]|(?:^|\s)/(?:home|Users|mnt)/|邮件|草稿|收件人|发信|send\s+email|draft|密码|授权码|api[_-]?key|secret|token", question, re.I):
+            self.last_jev_decision = {"mode": client.config.mode, "skipped": "sensitive_input"}
+            return None
+        questions = {
+            "route": {"type": "choice", "instructions": "Choose the complete task class for this user request.",
+                      "criteria": {"direct_answer": "Only a general knowledge answer, no external evidence or action",
+                                   "single_tool": "Exactly one tool is required",
+                                   "multi_step": "Multiple dependent actions or an output artifact is required",
+                                   "unclear": "The required goal or target is ambiguous"}},
+            "needs_local_evidence": {"type": "noul", "instructions": "Does the user ask to consult local files or an index?"},
+            "needs_fresh_web": {"type": "noul", "instructions": "Does the answer require fresh online information or explicit web search?"},
+            "has_side_effect": {"type": "noul", "instructions": "Does the request require writing, sending or changing external state?"},
+        }
+        try:
+            with client.stage("Jev Router"):
+                answers = client.judge({"user_request": question[:2400],
+                                        "index_candidate_count": min(len(index_hint), 20)}, questions)
+            route = answers["route"]
+            choice = str(route.get("choice", ""))
+            probability = route.get("probabilities", {}).get(choice, 0)
+            confidence = route.get("confidence", 0)
+            flags = {key: noul(answers, key) for key in (
+                "needs_local_evidence", "needs_fresh_web", "has_side_effect")}
+            if choice not in questions["route"]["criteria"] or not all(
+                isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1
+                for value in (probability, confidence)
+            ):
+                raise ValueError("Invalid Jev route choice or confidence")
+            self.last_jev_decision = {"mode": client.config.mode, "choice": choice,
+                                      "confidence": float(confidence), "probability": float(probability),
+                                      "flags": flags, "used_shortcut": False}
+            allowed = (client.config.mode == "gated" and choice == "direct_answer" and not index_hint
+                       and min(float(probability), float(confidence)) >= client.config.route_confidence
+                       and all(value <= client.config.route_veto_probability for value in flags.values()))
+            if not allowed:
+                return None
+            self.last_jev_decision["used_shortcut"] = True
+            return IntentDecision(mode="direct_answer", reason="Jev high-confidence read-only direct route",
+                                  confidence=float(confidence))
+        except TaskControlError:
+            raise
+        except Exception as exc:
+            self.last_jev_decision = {"mode": client.config.mode, "fallback": type(exc).__name__}
+            return None
+
     @staticmethod
     def _complete_plan_contract(decision: IntentDecision) -> None:
         """根据 Router 的结构化标志补全最低工具契约，不分析用户措辞。"""
@@ -309,6 +367,11 @@ class IntentRouter:
             "For a textual question that asks for an answer based on the multimodal index, choose "
             "knowledge.answer_multimodal. Choose knowledge.search_multimodal only when the user wants raw evidence "
             "or provides image_path for image-to-image retrieval. Choose knowledge.index_image only for ingestion.\n"
+            "For finding an image by its visual content inside a named local directory, choose the single read-only "
+            "knowledge.search_directory_images tool with directory set to the exact user path and query set to a "
+            "short visual description (prefer concise English for SigLIP2). Do not use the global multimodal index "
+            "or plan_task unless the user also asks for dependent actions. For this tool, set "
+            "needs_workspace_files=false and needs_index_catalog=false; the explicit directory is passed as a slot.\n"
             "For files.read_document add arguments.read_mode: verbatim when the user asks to view/read the actual content, "
             "summary only when the user asks for a summary, or question_answer for a specific question about the file.\n"
             "If required slots for that single tool are missing, set mode to clarify and list them in missing_slots.\n"

@@ -470,11 +470,13 @@ ApplicationWindow {
                 Label { text: "Agent 观察"; color: theme.text; font.pixelSize: 16; font.weight: Font.DemiBold }
                 TabBar {
                     id: tabs
+                    objectName: "observerTabs"
                     Layout.fillWidth: true
                     TabButton { text: "Steps" }
                     TabButton { text: "Evidence" }
                     TabButton { text: "Memory" }
                     TabButton { text: "Context" }
+                    TabButton { text: "Tasks" }
                 }
                 StackLayout {
                     Layout.fillWidth: true
@@ -492,7 +494,7 @@ ApplicationWindow {
                             anchors.centerIn: parent
                             visible: stepsList.count === 0
                             text: deskPilot.status === "正在处理" ? "正在生成执行步骤..." : "本轮暂无执行步骤"
-                            color: theme.textMuted
+                            color: theme.muted
                             font.pixelSize: 11
                         }
                         delegate: Rectangle {
@@ -531,6 +533,94 @@ ApplicationWindow {
                         Column { width: parent.width; spacing: 9; Repeater { model: deskPilot.memories; delegate: Rectangle { width: parent.width; height: memoryText.contentHeight + 22; radius: 6; color: theme.surfaceSoft; border.color: theme.border; TextEdit { id: memoryText; anchors.fill: parent; anchors.margins: 10; text: modelData.title + "  ·  " + modelData.confidence + "\n" + modelData.content; color: theme.text; font.pixelSize: 11; wrapMode: TextEdit.Wrap; textFormat: TextEdit.PlainText; readOnly: true; selectByMouse: true; selectByKeyboard: true; cursorVisible: false; selectionColor: theme.cyanSoft; selectedTextColor: theme.text } } } }
                     }
                     ScrollView { clip: true; TextEdit { width: parent.width; text: deskPilot.context || "本轮上下文将在这里显示。"; color: theme.text; font.pixelSize: 11; wrapMode: TextEdit.Wrap; textFormat: TextEdit.PlainText; readOnly: true; selectByMouse: true; selectByKeyboard: true; cursorVisible: false; selectionColor: theme.cyanSoft; selectedTextColor: theme.text } }
+                    ListView {
+                        id: tasksList
+                        objectName: "tasksList"
+                        clip: true
+                        spacing: 8
+                        model: deskPilot.tasks
+                        boundsBehavior: Flickable.StopAtBounds
+                        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                        Label {
+                            anchors.centerIn: parent
+                            visible: tasksList.count === 0
+                            text: "暂无任务"
+                            color: theme.muted
+                            font.pixelSize: 12
+                        }
+                        delegate: Rectangle {
+                            required property var modelData
+                            width: tasksList.width
+                            height: taskContents.implicitHeight + 20
+                            radius: 6
+                            color: theme.surfaceSoft
+                            border.color: modelData.state === "failed" || modelData.state === "recovery_required" ? theme.danger : theme.border
+                            ColumnLayout {
+                                id: taskContents
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.top: parent.top
+                                anchors.margins: 10
+                                spacing: 6
+                                Label {
+                                    Layout.fillWidth: true
+                                    text: modelData.title
+                                    color: theme.text
+                                    font.pixelSize: 12
+                                    font.weight: Font.DemiBold
+                                    wrapMode: Text.WrapAnywhere
+                                }
+                                Label { text: modelData.status; color: theme.muted; font.pixelSize: 11 }
+                                TextEdit {
+                                    Layout.fillWidth: true
+                                    text: modelData.id
+                                    color: theme.muted
+                                    font.pixelSize: 11
+                                    textFormat: TextEdit.PlainText
+                                    wrapMode: TextEdit.WrapAnywhere
+                                    readOnly: true
+                                    selectByMouse: true
+                                    cursorVisible: false
+                                    selectionColor: theme.cyanSoft
+                                }
+                                ProgressBar {
+                                    id: taskProgress
+                                    Layout.fillWidth: true
+                                    value: modelData.progress
+                                    Layout.preferredHeight: 6
+                                    background: Rectangle { implicitHeight: 6; color: theme.surfaceRaised; radius: 3 }
+                                    contentItem: Item {
+                                        implicitHeight: 6
+                                        Rectangle { width: taskProgress.visualPosition * parent.width; height: parent.height; radius: 3; color: theme.cyan }
+                                    }
+                                }
+                                TextEdit {
+                                    Layout.fillWidth: true
+                                    text: modelData.detail
+                                    readOnly: true
+                                    selectByMouse: true
+                                    selectByKeyboard: true
+                                    wrapMode: TextEdit.Wrap
+                                    textFormat: TextEdit.PlainText
+                                    color: theme.muted
+                                    font.pixelSize: 11
+                                    cursorVisible: false
+                                    selectionColor: theme.cyanSoft
+                                    selectedTextColor: theme.text
+                                }
+                                Flow {
+                                    Layout.fillWidth: true
+                                    spacing: 6
+                                    SmallButton { text: "暂停"; visible: modelData.canPause; onClicked: deskPilot.controlTask(modelData.id, "pause") }
+                                    SmallButton { text: "取消"; visible: modelData.canCancel; onClicked: deskPilot.controlTask(modelData.id, "cancel") }
+                                    SmallButton { text: "继续"; visible: modelData.canResume; enabled: !deskPilot.busy; onClicked: deskPilot.controlTask(modelData.id, "resume") }
+                                    SmallButton { text: "补偿文件"; visible: modelData.compensationOperationId !== ""; enabled: !deskPilot.busy; onClicked: deskPilot.requestCompensation(modelData.id, modelData.compensationOperationId) }
+                                    SmallButton { text: "核对邮件"; visible: modelData.mailOperationId !== ""; enabled: !deskPilot.busy; onClicked: deskPilot.reconcileMail(modelData.id, modelData.mailOperationId) }
+                                    SmallButton { text: modelData.canApprove ? "重新预览" : "查看会话"; enabled: !deskPilot.busy; onClicked: deskPilot.previewTask(modelData.id) }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

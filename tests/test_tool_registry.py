@@ -249,7 +249,8 @@ def test_write_tools_and_permission_paths(base: Path) -> None:
     assert markdown_path.read_text(encoding="utf-8").startswith("# Demo")
 
     no_overwrite = registry.call("files.write_markdown", path=markdown_path, content="new")
-    assert no_overwrite.ok
+    assert not no_overwrite.ok
+    assert no_overwrite.status == "failed"
     assert no_overwrite.output["written"] is False
     assert "overwrite=True" in no_overwrite.output["message"]
 

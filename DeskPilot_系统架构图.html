@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DeskPilot 系统架构图</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172329;
+      --muted: #526168;
+      --line: #cbd6d9;
+      --page: #f5f7f7;
+      --surface: #ffffff;
+      --teal: #136e69;
+      --teal-soft: #e7f4f1;
+      --blue: #285b9a;
+      --blue-soft: #eaf2fc;
+      --amber: #995e17;
+      --amber-soft: #fff3e4;
+      --violet: #684b8f;
+      --violet-soft: #f2edfa;
+      --red: #a14343;
+      --red-soft: #fceded;
+      --green: #3f6b39;
+      --green-soft: #edf6e9;
+    }
+
+    * { box-sizing: border-box; }
+    html { background: var(--page); }
+    body {
+      margin: 0;
+      color: var(--ink);
+      font-family: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    .sheet { width: min(100% - 40px, 1140px); margin: 0 auto; padding: 32px 0 48px; }
+    .heading { display: flex; align-items: end; justify-content: space-between; gap: 24px; margin-bottom: 22px; }
+    .heading h1 { margin: 0; font-size: 27px; font-weight: 700; line-height: 1.25; }
+    .heading p { margin: 7px 0 0; color: var(--muted); font-size: 14px; }
+    .version { flex: none; color: var(--teal); font-size: 12px; font-weight: 700; border-bottom: 2px solid currentColor; padding-bottom: 5px; }
+    .diagram { display: grid; grid-template-columns: minmax(0, 1fr) 208px; gap: 16px; align-items: stretch; }
+    .main { min-width: 0; }
+    .layer {
+      border: 1px solid var(--line);
+      background: var(--surface);
+      border-radius: 8px;
+      padding: 16px 18px 17px;
+    }
+    .layer-header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 12px; }
+    .number { font-size: 11px; font-weight: 800; letter-spacing: 0; white-space: nowrap; }
+    .layer h2 { margin: 0; font-size: 15px; line-height: 1.35; }
+    .layer-note { color: var(--muted); font-size: 12px; margin-left: auto; text-align: right; }
+    .row { display: grid; grid-template-columns: repeat(var(--cols, 3), minmax(0, 1fr)); gap: 9px; }
+    .cell { min-width: 0; min-height: 69px; border: 1px solid; border-radius: 6px; padding: 10px 12px; }
+    .cell strong { display: block; font-size: 13px; line-height: 1.35; }
+    .cell span { display: block; margin-top: 5px; color: var(--muted); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+    .cell small { display: block; margin-top: 8px; color: var(--muted); font-size: 11px; }
+    .teal { background: var(--teal-soft); border-color: #abd5cf; }
+    .blue { background: var(--blue-soft); border-color: #b5cee9; }
+    .amber { background: var(--amber-soft); border-color: #e8cda7; }
+    .violet { background: var(--violet-soft); border-color: #d2c1e7; }
+    .green { background: var(--green-soft); border-color: #c0d9b7; }
+    .red { background: var(--red-soft); border-color: #e8baba; }
+    .neutral { background: #f4f6f7; border-color: #d3dce0; }
+    .accent-teal .number, .accent-teal h2 { color: var(--teal); }
+    .accent-blue .number, .accent-blue h2 { color: var(--blue); }
+    .accent-amber .number, .accent-amber h2 { color: var(--amber); }
+    .accent-violet .number, .accent-violet h2 { color: var(--violet); }
+    .accent-green .number, .accent-green h2 { color: var(--green); }
+    .flow {
+      height: 28px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 11px;
+      text-align: center;
+    }
+    .flow .stem { width: 2px; height: 17px; background: #80979d; position: relative; flex: none; }
+    .flow .stem::after {
+      content: "";
+      position: absolute;
+      bottom: -1px;
+      left: -4px;
+      width: 8px;
+      height: 8px;
+      border-right: 2px solid #80979d;
+      border-bottom: 2px solid #80979d;
+      transform: rotate(45deg);
+    }
+    .route-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; }
+    .route { min-width: 0; min-height: 112px; padding: 11px 12px; border: 1px solid; border-radius: 6px; }
+    .route .route-label { font-size: 11px; font-weight: 700; }
+    .route strong { display: block; margin-top: 6px; font-size: 14px; }
+    .route span { display: block; margin-top: 5px; font-size: 12px; color: var(--muted); }
+    .route em { display: block; margin-top: 9px; font-size: 11px; font-style: normal; font-weight: 700; }
+    .route-direct { background: var(--green-soft); border-color: #c0d9b7; }
+    .route-direct .route-label, .route-direct em { color: var(--green); }
+    .route-tool { background: var(--blue-soft); border-color: #b5cee9; }
+    .route-tool .route-label, .route-tool em { color: var(--blue); }
+    .route-plan { background: var(--amber-soft); border-color: #e8cda7; }
+    .route-plan .route-label, .route-plan em { color: var(--amber); }
+    .subflow { display: flex; align-items: center; justify-content: center; gap: 7px; margin-top: 8px; font-size: 11px; font-weight: 700; color: var(--amber); }
+    .subflow i { height: 1px; width: 15px; background: currentColor; position: relative; }
+    .subflow i::after { content: ""; position: absolute; right: 0; top: -3px; width: 5px; height: 5px; border-top: 1px solid currentColor; border-right: 1px solid currentColor; transform: rotate(45deg); }
+    .ability .cell { min-height: 122px; }
+    .ability .cell strong { font-size: 14px; }
+    .decision-note { margin: 0 0 10px; padding: 7px 10px; border-left: 3px solid var(--teal); background: var(--teal-soft); color: var(--ink); font-size: 12px; line-height: 1.45; }
+    .chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
+    .chip { display: inline-block; padding: 2px 6px; border: 1px solid currentColor; border-radius: 3px; color: #40545a; font-size: 10px; font-weight: 700; line-height: 1.4; }
+    .base .cell { min-height: 91px; }
+    .side { display: flex; flex-direction: column; gap: 12px; }
+    .crosscut { border: 1px solid; border-radius: 8px; padding: 15px 14px; background: var(--surface); }
+    .crosscut h2 { margin: 0 0 8px; font-size: 14px; line-height: 1.35; }
+    .crosscut p { margin: 0 0 11px; font-size: 12px; color: var(--muted); }
+    .crosscut ul { margin: 0; padding: 0; list-style: none; }
+    .crosscut li { padding: 7px 0; border-top: 1px solid rgba(63, 75, 79, .15); font-size: 12px; line-height: 1.4; }
+    .crosscut li:first-child { border-top: 0; }
+    .crosscut.security { border-color: #e8baba; background: #fff7f6; }
+    .crosscut.security h2 { color: var(--red); }
+    .crosscut.evaluation { border-color: #d2c1e7; background: #faf8fe; }
+    .crosscut.evaluation h2 { color: var(--violet); }
+    .crosscut.optimization { border-color: #b9d8cb; background: #f3faf6; }
+    .crosscut.optimization h2 { color: #286e4c; }
+    .footnote { color: var(--muted); font-size: 12px; margin-top: 18px; line-height: 1.6; }
+    .footnote strong { color: var(--ink); }
+    @media (max-width: 860px) {
+      .diagram { display: block; }
+      .side { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 15px; }
+      .layer-note { display: none; }
+    }
+    @media (max-width: 650px) {
+      .sheet { width: min(100% - 24px, 1140px); padding-top: 20px; }
+      .heading { align-items: start; }
+      .heading h1 { font-size: 22px; }
+      .version { display: none; }
+      .layer { padding: 14px; }
+      .row, .route-grid, .side { grid-template-columns: 1fr; }
+      .cell, .route, .ability .cell, .base .cell { min-height: 0; }
+      .cell span, .route span, .crosscut p, .crosscut li, .decision-note { font-size: 16px; }
+    }
+    @media print {
+      @page { size: A3 landscape; margin: 12mm; }
+      html, body { background: #fff; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+      .sheet { width: 100%; max-width: none; padding: 0; }
+      .layer, .crosscut, .cell, .route { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <main class="sheet">
+    <header class="heading">
+      <div>
+        <h1>DeskPilot 系统架构</h1>
+        <p>个人办公 Agent · 请求流向与横切能力</p>
+      </div>
+      <div class="version">CURRENT IMPLEMENTATION · 2026-10</div>
+    </header>
+
+    <div class="diagram">
+      <div class="main">
+        <section class="layer accent-teal" aria-labelledby="ui-title">
+          <div class="layer-header"><span class="number">01 / ENTRY</span><h2 id="ui-title">桌面交互层</h2><span class="layer-note">PySide6 · Qt Quick / QML</span></div>
+          <div class="row">
+            <div class="cell teal"><strong>聊天与流式输出</strong><span>问题、回答、Steps、引用证据</span></div>
+            <div class="cell teal"><strong>会话与附件</strong><span>历史记录、图片预览、拖拽与粘贴</span></div>
+            <div class="cell teal"><strong>审批与任务面板</strong><span>一次性 action_id；暂停、取消、恢复和节点状态</span></div>
+          </div>
+        </section>
+        <div class="flow"><span class="stem" aria-hidden="true"></span></div>
+
+        <section class="layer accent-blue" aria-labelledby="core-title">
+          <div class="layer-header"><span class="number">02 / STATE</span><h2 id="core-title">Agent 核心与上下文工程</h2><span class="layer-note">DocumentQAAgent · ContextBuilder</span></div>
+          <div class="row" style="--cols:2">
+            <div class="cell blue"><strong>统一任务入口</strong><span>创建会话、接收问题与附件、记录运行步骤和模型用量</span></div>
+            <div class="cell blue"><strong>上下文构建</strong><span>当前问题 + 最近对话 + 摘要 + 检索记忆；按角色与 token 预算选择</span></div>
+          </div>
+        </section>
+        <div class="flow"><span class="stem" aria-hidden="true"></span><span>工具摘要与有界索引候选进入路由</span></div>
+
+        <section class="layer accent-blue" aria-labelledby="route-title">
+          <div class="layer-header"><span class="number">03 / DECIDE</span><h2 id="route-title">意图识别与执行路径</h2><span class="layer-note">IntentRouter · Jev · SlotValidator</span></div>
+          <p class="decision-note"><strong>可选 Jev 前置门控</strong> · off / shadow / gated；仅高置信、无副作用直答可跳过原 Router，异常时回退。</p>
+          <div class="route-grid">
+            <div class="route route-direct"><div class="route-label">FAST PATH / DIRECT</div><strong>直接回答</strong><span>无需外部资料或动作；同次路由调用可返回正文</span><em>→ 最终结果</em></div>
+            <div class="route route-tool"><div class="route-label">FAST PATH / TOOL</div><strong>单工具调用</strong><span>选择注册工具、校验槽位、执行一次独立动作</span><em>→ 工具注册表</em></div>
+            <div class="route route-plan"><div class="route-label">COMPLEX PATH / PLAN</div><strong>依赖任务编排</strong><span>查资料、生成内容、写文件或发送邮件等多步骤任务</span><div class="subflow">Planner <i></i> PlanRepair <i></i> Supervisor</div></div>
+          </div>
+        </section>
+        <div class="flow"><span class="stem" aria-hidden="true"></span><span>单工具与多步骤任务进入受控工具层</span></div>
+
+        <section class="layer accent-amber" aria-labelledby="exec-title">
+          <div class="layer-header"><span class="number">04 / EXECUTE</span><h2 id="exec-title">Agent Loop 与工具</h2><span class="layer-note">PlanExecutor · Supervisor · TaskService</span></div>
+          <div class="row">
+            <div class="cell amber"><strong>计划与多 Agent</strong><span>Knowledge 获取证据 → Communication 生成产物；按依赖推进、观察结果</span></div>
+            <div class="cell blue"><strong>任务 Harness</strong><span>SQLite 状态 / attempt / 检查点；预算、lease/CAS、分类重试与恢复</span></div>
+            <div class="cell neutral"><strong>工具注册表</strong><span>Web · 文件/桌面 · Shell/Python · 邮件 MCP · 知识库 · 视觉/记忆</span></div>
+          </div>
+        </section>
+        <div class="flow"><span class="stem" aria-hidden="true"></span></div>
+
+        <section class="layer accent-violet ability" aria-labelledby="ability-title">
+          <div class="layer-header"><span class="number">05 / CAPABILITY</span><h2 id="ability-title">领域能力层</h2><span class="layer-note">按需调用，不是每轮必经</span></div>
+          <div class="row">
+            <div class="cell violet"><strong>文档 RAG</strong><span>解析 → 结构/语义分块 → BM25 + Dense → RRF / 精排 → 可选 Jev 证据门控 → 扩展与 MMR → 引用回答</span><div class="chips"><span class="chip">Sentence Window</span><span class="chip">Parent</span><span class="chip">可选 Cross Encoder</span></div></div>
+            <div class="cell green"><strong>记忆系统</strong><span>会话消息 → 抽取 Gate → 事实/偏好/任务 → 向量召回；视觉事实带资产引用，pending 审批后生效</span><div class="chips"><span class="chip">滚动摘要</span><span class="chip">TTL / supersede</span><span class="chip">视觉预算</span></div></div>
+            <div class="cell teal"><strong>多模态</strong><span>图片校验与去重 → OCR / 视觉向量 → 多路检索 → VLM 图文问答；图片引用可进入视觉记忆</span><div class="chips"><span class="chip">PaddleOCR</span><span class="chip">SigLIP2 可选</span><span class="chip">Qwen-VL API</span></div></div>
+          </div>
+        </section>
+        <div class="flow"><span class="stem" aria-hidden="true"></span></div>
+
+        <section class="layer accent-green base" aria-labelledby="base-title">
+          <div class="layer-header"><span class="number">06 / FOUNDATION</span><h2 id="base-title">模型与存储基础</h2></div>
+          <div class="row" style="--cols:2">
+            <div class="cell neutral"><strong>模型服务</strong><span>OpenAI-compatible LLM / Embedding / VLM；可选 OpenRouter Jev；本地 OCR 与视觉编码器按需加载</span></div>
+            <div class="cell neutral"><strong>本地数据</strong><span>SQLite / FTS5、文档与记忆索引、SHA-256 图片资产、会话 JSONL、任务及副作用日志</span></div>
+          </div>
+        </section>
+        <div class="flow"><span class="stem" aria-hidden="true"></span><span>生成回答、来源与 Steps；必要时抽取记忆并回到桌面端</span></div>
+
+        <section class="layer accent-teal" aria-labelledby="output-title">
+          <div class="layer-header"><span class="number">07 / OUTPUT</span><h2 id="output-title">结果与反馈</h2></div>
+          <div class="row" style="--cols:2">
+            <div class="cell teal"><strong>可核对的结果</strong><span>答案、产物及邮件结果、来源引用、Steps、失败与人工接管状态</span></div>
+            <div class="cell green"><strong>持续会话状态</strong><span>会话历史、压缩摘要、有效长期记忆及视觉资产引用</span></div>
+          </div>
+        </section>
+      </div>
+
+      <aside class="side" aria-label="横切能力">
+        <section class="crosscut security">
+          <h2>权限与安全</h2>
+          <p>在具体工具执行路径上检查风险。</p>
+          <ul>
+            <li>路径和覆盖/移动风险分级</li>
+            <li>命令白名单、Python AST 拦截</li>
+            <li>敏感图片上云确认</li>
+            <li>一次性、会话绑定的 action_id</li>
+            <li>副作用日志；unknown 禁止自动重放</li>
+            <li>受控文件补偿与邮件副本核对</li>
+          </ul>
+        </section>
+        <section class="crosscut evaluation">
+          <h2>测评与观测</h2>
+          <p>覆盖入口、领域能力与最终结果。</p>
+          <ul>
+            <li>pytest 确定性回归</li>
+            <li>DeskPilotBench 离线 / API 用例</li>
+            <li>多模态专项用例</li>
+            <li>Jev off / gated 对照与证据评分</li>
+            <li>故障注入与检查点复用</li>
+            <li>分模块正确率、延迟、Token</li>
+            <li>版本化基线与 API 预检</li>
+          </ul>
+        </section>
+        <section class="crosscut optimization">
+          <h2>工程优化</h2>
+          <p>降低桌面端启动和重型模型成本。</p>
+          <ul>
+            <li>模型延迟加载、worker 隔离</li>
+            <li>图片与向量幂等缓存</li>
+            <li>OCR / 向量批处理</li>
+            <li>SQLite WAL 与 busy timeout</li>
+            <li>失败通道独立降级；单机恢复</li>
+          </ul>
+        </section>
+      </aside>
+    </div>
+
+    <p class="footnote"><strong>阅读方式：</strong>主列自上而下表示任务处理；右列是横切能力。直接回答跳过工具，复杂任务才进入 Planner；Jev 与视觉模型按配置启用。任务恢复仅为单机机制，文件补偿与邮件核对均不构成通用回滚或 exactly-once；Reflection 尚未形成完整自动闭环。</p>
+  </main>
+</body>
+</html>

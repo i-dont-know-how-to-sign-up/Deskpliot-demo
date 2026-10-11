@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ...core.config import _load_dotenv, ROOT_DIR
+from ...core.api_clients import _open_response
+from ...tasks.control import get_execution_control
 
 
 class VisionLLMProvider:
@@ -62,15 +64,48 @@ class VisionLLMProvider:
             },
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+        control = get_execution_control()
+        attempt = None
+        if control is not None:
+            # 图片 Token 与分辨率/模型有关；预留是保护估计，最终仍按服务端 usage 结算。
+            reservation = len(self._prompt(question, len(image_paths)).encode("utf-8")) + max_tokens + len(image_paths) * 1024
+            attempt = control.record_attempt("vision", reserved_tokens=reservation)
+        success = False
+        error = ""
+        try:
+            answer = self._read_answer(request, event_callback)
+            success = True
+            return answer
+        except Exception as exc:
+            error = str(exc)
+            error_response = getattr(exc, "usage_response", {})
+            if isinstance(error_response, dict) and isinstance(error_response.get("usage"), dict):
+                self.last_usage = self._normalize_usage(error_response["usage"])
+            if control is not None:
+                control.checkpoint()
+            raise
+        finally:
+            if control is not None:
+                control.record_usage(self.last_usage, usage_reported=bool(self.last_usage), success=success,
+                                     error=error, api_attempt=attempt, stage="Vision Answer")
+
+    def _read_answer(self, request: urllib.request.Request, event_callback: Callable | None) -> str:
+        with _open_response(request, default_timeout=self.timeout) as response:
             if event_callback:
                 pieces: list[str] = []
+                finished = False
                 for raw_line in response:
+                    control = get_execution_control()
+                    if control is not None:
+                        control.checkpoint()
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line.startswith("data:"):
                         continue
                     value = line[5:].strip()
-                    if not value or value == "[DONE]":
+                    if value == "[DONE]":
+                        finished = True
+                        continue
+                    if not value:
                         continue
                     try:
                         item = json.loads(value)
@@ -82,6 +117,7 @@ class VisionLLMProvider:
                     if not choices:
                         continue
                     delta = choices[0].get("delta") or {}
+                    finished = finished or bool(choices[0].get("finish_reason"))
                     token = delta.get("content") or ""
                     if isinstance(token, list):
                         token = "".join(
@@ -90,10 +126,13 @@ class VisionLLMProvider:
                     if token:
                         pieces.append(str(token))
                         event_callback({"type": "token", "stage": "Vision Answer", "text": str(token)})
+                if not finished:
+                    raise ConnectionError("视觉模型输出流中断，未收到完成标记；没有自动重试或拼接另一轮输出")
                 return "".join(pieces).strip()
             result = json.loads(response.read().decode("utf-8-sig"))
-        if isinstance(result.get("usage"), dict):
-            self.last_usage = self._normalize_usage(result["usage"])
+            # usage 先保存，再允许上下文退出的暂停/取消 checkpoint 生效。
+            if isinstance(result.get("usage"), dict):
+                self.last_usage = self._normalize_usage(result["usage"])
         value = result["choices"][0]["message"].get("content") or ""
         if isinstance(value, list):
             value = "".join(str(item.get("text", "")) for item in value if isinstance(item, dict))
@@ -101,9 +140,16 @@ class VisionLLMProvider:
 
     @staticmethod
     def _normalize_usage(value: dict[str, Any]) -> dict[str, int]:
-        prompt = int(value.get("prompt_tokens", value.get("input_tokens", 0)) or 0)
-        completion = int(value.get("completion_tokens", value.get("output_tokens", 0)) or 0)
-        total = int(value.get("total_tokens", prompt + completion) or prompt + completion)
+        if not any(key in value for key in (
+            "prompt_tokens", "input_tokens", "completion_tokens", "output_tokens", "total_tokens"
+        )):
+            return {}
+        try:
+            prompt = max(0, int(value.get("prompt_tokens", value.get("input_tokens", 0)) or 0))
+            completion = max(0, int(value.get("completion_tokens", value.get("output_tokens", 0)) or 0))
+            total = max(0, int(value.get("total_tokens", prompt + completion) or 0))
+        except (TypeError, ValueError, OverflowError):
+            return {}
         return {
             "prompt_tokens": prompt,
             "completion_tokens": completion,

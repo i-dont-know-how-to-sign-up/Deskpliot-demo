@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import html
+import hashlib
+import os
+import shutil
+import tempfile
 import zipfile
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from .permissions import assess_path_write, is_foreign_windows_path, require_permission
+from ..tasks.control import get_execution_control
 
 
 TEXT_FORMATS = {
@@ -73,6 +78,8 @@ def write_file(
         }
 
     target = Path(lexical_path).resolve(strict=False)
+    if target.exists() and not target.is_file():
+        raise IsADirectoryError(f"Target must be a file: {target}")
     if target.exists() and not overwrite:
         return {
             "ok": True,
@@ -84,12 +91,38 @@ def write_file(
         }
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    if suffix in TEXT_FORMATS:
-        target.write_text(str(content), encoding="utf-8", newline="\n")
-    elif suffix == ".docx":
-        _write_docx(target, str(content))
-    elif suffix == ".pdf":
-        _write_pdf(target, str(content))
+    control = get_execution_control()
+    operation_id = str(getattr(control, "active_operation_id", "") or "")
+    before_sha256 = _sha256(target) if target.is_file() else ""
+    backup_path = ""
+    stage = _stage_path(target)
+    try:
+        if suffix in TEXT_FORMATS:
+            stage.write_text(str(content), encoding="utf-8", newline="\n")
+        elif suffix == ".docx":
+            _write_docx(stage, str(content))
+        elif suffix == ".pdf":
+            _write_pdf(stage, str(content))
+        after_sha256 = _sha256(stage)
+        if not after_sha256:
+            raise RuntimeError("Staged file validation failed")
+        if target.exists() and overwrite:
+            if operation_id and control is not None and getattr(control, "task_store", None):
+                backup = control.task_store.path.parent / "effect_backups" / operation_id
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target, backup)
+                if _sha256(backup) != before_sha256:
+                    raise RuntimeError("Source changed while preparing backup")
+                backup_path = str(backup)
+            if _sha256(target) != before_sha256:
+                raise RuntimeError("Target changed before commit")
+            os.replace(stage, target)
+        else:
+            # 同卷 hard link 的创建具有排他性；不能用 os.replace 覆盖刚出现的文件。
+            os.link(stage, target)
+            stage.unlink()
+    finally:
+        stage.unlink(missing_ok=True)
 
     return {
         "ok": True,
@@ -97,9 +130,27 @@ def write_file(
         "path": str(target),
         "format": suffix,
         "size": target.stat().st_size,
+        "before_sha256": before_sha256,
+        "after_sha256": after_sha256,
+        "backup_path": backup_path,
+        "compensatable": bool(operation_id),
         "permission": decision.to_dict(),
         "message": "File written successfully.",
     }
+
+
+def _stage_path(target: Path) -> Path:
+    handle, name = tempfile.mkstemp(prefix=f".{target.stem}.", suffix=target.suffix, dir=target.parent)
+    os.close(handle)
+    return Path(name)
+
+
+def _sha256(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            hasher.update(block)
+    return hasher.hexdigest()
 
 
 def write_markdown(

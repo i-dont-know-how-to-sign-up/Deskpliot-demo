@@ -59,3 +59,17 @@ def test_bridge_busy_gate_rejects_overlapping_operations() -> None:
     assert bridge._begin_operation("不应启动") is False
     bridge._end_operation()
     assert bridge.busy is False
+
+
+def test_resumed_task_reloads_persisted_transcript_instead_of_overwriting(monkeypatch) -> None:
+    from types import SimpleNamespace
+    bridge = DeskPilotBridge.__new__(DeskPilotBridge)
+    QObject.__init__(bridge)
+    bridge.current_session_id = "session"
+    calls = []
+    for name in ("refreshTasks", "_load_session_messages", "_end_operation"):
+        monkeypatch.setattr(bridge, name, lambda name=name: calls.append(name))
+    monkeypatch.setattr(bridge, "_set_result_panels", lambda result: calls.append("panels"))
+    monkeypatch.setattr(bridge, "_set_status", lambda status: calls.append(status))
+    bridge._handle_task_result("task", SimpleNamespace(session_id="session", pending_action=None))
+    assert calls == ["refreshTasks", "_load_session_messages", "panels", "回答完成", "_end_operation"]

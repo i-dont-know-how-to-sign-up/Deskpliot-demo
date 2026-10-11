@@ -14,7 +14,9 @@ DeskPilot 是一个本地优先的多模态桌面办公 Agent，支持文档与�
 
 ## 系统架构
 
-![DeskPilot 系统架构图：桌面交互、上下文与意图路由、单工具和多智能体执行、领域能力、模型与存储](docs/assets/deskpilot-architecture.png)
+![DeskPilot 系统架构图：桌面交互、上下文与 Jev 意图门控、Agent Loop、任务 Harness、领域能力及安全评测](docs/assets/deskpilot-architecture.png)
+
+架构图的可编辑源文件为 [`DeskPilot_系统架构图.html`](DeskPilot_系统架构图.html)。图中 Jev 和视觉模型均为按配置启用的可选能力，复杂任务才进入 Planner。
 
 主链路是“桌面输入 → 上下文构建 → 意图路由 → 直接回答 / 单工具 / 多步骤计划 → 结果与记忆”。权限审批、评测和工程优化贯穿对应执行路径；图中三条分支并非每轮都会执行。
 
@@ -30,11 +32,20 @@ DeskPilot 是一个本地优先的多模态桌面办公 Agent，支持文档与�
 ### 意图识别与任务编排
 
 - LLM 将请求分为 `direct_answer`、`tool_call`、`clarify`、`plan_task`，依据注册工具 Schema 选择工具并校验参数。简单问答可复用 Router 回答，跳过 Planner。
+- 可选 Jev typed decision 只在意图路由前置门控和 RAG 初排后的证据筛选两处运行：`off` 不调用，`shadow` 只记录，`gated` 才在高置信且无外部需求/副作用的直接回答上跳过原 Router，或过滤低相关证据。敏感输入及 Jev 异常回退原路径；Jev 不负责工具授权。
 - 复杂任务由 Planner 生成依赖图，经过 PlanRepair 校验/修订后，由 PlanExecutor + Supervisor 执行受控节点；已覆盖邮件复合任务、网页写报告、索引报告和多文档摘要，其他路径仍保留兼容执行链。
-- Supervisor 管理依赖、有限重试、预算和等待人工确认状态；TaskLedger 记录任务及节点结果。Planner 仅在需要定位文件时接收有数量、目录和 Token 限制的候选列表。
+- Supervisor 管理依赖和分类有限重试，TaskStore 以 SQLite 保存计划、节点输入/输出、attempt、检查点和事件；新领域工作流可在中断后复用已校验结果。Planner 仅在需要定位文件时接收有数量、目录和 Token 限制的候选列表。
 - 提供 Knowledge、Communication、Reflection 等角色组件；Reflection 已有路由入口和审查接口，完整自动质量审查闭环仍待完善。
 
 实现：[`core/`](deskpilot/core/)、[`intent/`](deskpilot/intent/)、[`multi_agent/`](deskpilot/multi_agent/)。
+
+### 可恢复任务与执行控制
+
+- 桌面对话进入持久单 worker 队列；Tasks 显示状态、节点进度、耗时、调用和 Token，可暂停、取消、继续及重新预览。审批绑定原任务/节点、计划版本与附件指纹，重开应用可恢复待确认操作。
+- deadline、重试和预算在工具/API 边界执行，失败 attempt 同样计账；Windows Job Object / Linux process group 负责本地子进程树清理，PDF 页批次保存可恢复检查点。
+- 心跳/lease 和 CAS 防止失联 worker 覆盖新状态；派发/返回副作用日志阻止结果不确定的文件和邮件操作自动重放。已支持经人工确认、按文件版本/哈希校验的写入与移动补偿，以及按 Message-ID 核对邮件已发送副本；核对不到副本不能推断邮件未投递。当前仍是单机容错，不是多副本高可用或 SMTP exactly-once；取消不会撤销已产生的副作用。
+
+实现与边界：[`tasks/README.md`](deskpilot/tasks/README.md)。
 
 ### 本地文档 RAG
 
@@ -48,6 +59,7 @@ Sentence Window/Parent 扩展 -> 覆盖感知 MMR -> 证据回答与引用校验
 
 - 结构文档按标题、段落、表格或页分块，非结构文本支持相邻句向量的语义断点与完整句 overlap；索引保存版本、元数据、父块、句子窗口和向量缓存。
 - 默认采用精确向量扫描与 SQLite FTS5/BM25 混合检索；复杂查询可触发 Multi-Query，HyDE 默认关闭。精排默认 `lexical`，可选本地 Cross-Encoder 或 API，失败回退 RRF。
+- Jev 证据门控默认关闭文档正文外发；显式允许后才会对有限候选片段评分。`shadow` 不改变结果，`gated` 保护显式指定文档的首个候选，并在 Jev 失败时保留原证据。
 - 按问题类型扩展句子窗口或父块，再以相关性、文档/子查询覆盖和 MMR 选择证据。引用校验失败时尝试一次修订；记忆和历史模型回答不能替代文档证据。
 
 实现：[`rag/`](deskpilot/rag/)。
@@ -147,6 +159,8 @@ Accuracy 是按用例验收规则计算的任务通过比例，Task Completion �
 | 固定 VLM API 集，2026-10-09 02:28 | 任务 Accuracy **100.00%**；平均 **5.34 s** | 3 条分级图文问答，真实视觉 API；尚无后续同配置 VLM 对比运行 |
 | 本机 Qt Bridge 冷启动 | **7.03 s → 0.96 s** | 模型懒加载；测试含 28 个会话、当前会话 1,580 条历史消息 |
 | 本机同图重复入库 | **约 33 s → 49 ms** | SHA-256 + 向量空间缓存命中，不包含首次 OCR/视觉推理成本 |
+| 工程可靠性 P0/P1，2026-10-11 | 检查点复用 **1.00（10 次恢复）**；unknown 自动重放 **0（5 次实验）**；本地取消 P95 **31 ms（5 次）** | 12 类故障各重复 5 次，本机 Windows/fixture；非答案准确率、端到端 UI 延迟或 SMTP exactly-once |
+| Jev 评分探索，2026-10-12 | 相关性 / 忠实度 MAE：Jev **0.115 / 0.0163**；对照 LLM **0.1562 / 0.0625** | 8 条人工标签样本，仅用于检查评分与探索趋势，不能推断生产效果或路由收益 |
 
 主数据集含公开数据采样/改编和自建回归用例，属于 DeskPilotBench，不是 GAIA/BFCL 官方榜单成绩；数据说明见 [`eval/dataset/README.md`](eval/dataset/README.md)。其他项目的 CLIP/Qwen 微调指标未计入本项目结果。
 
@@ -159,6 +173,7 @@ Accuracy 是按用例验收规则计算的任务通过比例，Task Completion �
 | 语言 | Python 3.11 |
 | 桌面 UI | PySide6、Qt Quick、QML |
 | LLM / Embedding | OpenAI-compatible HTTP/SSE API，默认示例为 DashScope/Qwen |
+| 可选判别模型 | OpenRouter Jev decisions API，`off/shadow/gated`，异常回退原路由和证据 |
 | 多模态 | Pillow、OpenAI-compatible VLM、可选 SigLIP2/PaddleOCR |
 | 文档解析 | PyMuPDF、pypdf，以及基于 ZIP/XML 的 Office 文档解析 |
 | RAG 存储 | JSON 兼容快照、SQLite Catalog、SQLite FTS5/BM25 |
@@ -179,6 +194,8 @@ deskpilot/
   mcp/                  # 邮件 MCP 业务层和 stdio Server
   memory/               # 会话、结构化记忆、压缩和向量存储
   multi_agent/          # Planner、Router、Supervisor 和领域 Agent
+  decision/             # Jev typed decision 客户端
+  tasks/                # 持久任务、检查点、队列、执行控制和故障恢复
   multimodal/           # 图片资产、OCR、视觉模型、向量库和融合检索
   qml/                  # Qt Quick 界面
   rag/                  # 解析、分块、索引、检索和网页调研
@@ -300,6 +317,17 @@ RAG_MMR_LAMBDA=0.72
 - 完整分块、窗口、批处理和 RRF 参数见 `.env.example`。
 - `CONTEXT_TOKENIZER_PROVIDER=auto` 对 Qwen 等 OpenAI-compatible 模型使用轻量保守估算，避免 Demo 启动时导入 Transformers/Torch；准备好本地 tokenizer 后可显式设置为 `transformers`。
 
+### Jev 判别配置（可选）
+
+```env
+JEV_MODE=off
+OPENROUTER_API_KEY=
+JEV_MODEL=typesafe/jev-1.13
+JEV_ALLOW_DOCUMENT_TEXT=false
+```
+
+默认不调用 Jev。可先设 `shadow` 对照观察，再在同一数据集上测试 `gated`；只有高置信的无副作用直接回答可跳过原 Router，其他请求仍走现有链路。RAG 片段发送到 OpenRouter 前，必须自行评估文档敏感性并显式设置 `JEV_ALLOW_DOCUMENT_TEXT=true`。完整阈值、超时和候选上限见 `.env.example`；这两个门控不是权限审批，也不代替结果引用校验。
+
 ### 多模态配置
 
 ```env
@@ -393,6 +421,7 @@ EMAIL_ATTACHMENTS_TOTAL_MAX_MB=25
 4. 在 Evidence 中核对文件名、PDF 页码或网页链接。
 5. 对写文件、执行命令、保存草稿和发送邮件等操作进行人工确认。
 6. 添加图片进行直接图文问答，或通过自然语言将图片/PDF 页图加入多模态索引。
+7. 在 Tasks 查看持久任务，暂停/取消运行，或重开后恢复有检查点的领域工作流。
 
 只有外部 MCP Client 需要单独启动邮件 Server：
 
@@ -415,7 +444,7 @@ DeskPilotBench 离线模式不会调用真实模型、网页或邮箱：
 .\.conda\deskpilot-py311\python.exe -m eval.run_eval --count 163 --mode offline
 ```
 
-离线模式用于确定性逻辑与回归检查，不能替代模型能力测评。完整基线包含 36 个测试模块、163 条主离线用例、22 条多模态离线用例、36 条分级文本 API 和 3 条分级 VLM API：
+离线模式用于确定性逻辑与回归检查，不能替代模型能力测评。完整基线自动发现测试模块，并运行 163 条主离线用例、22 条多模态离线用例、36 条分级文本 API 和 3 条分级 VLM API：
 
 ```powershell
 .\.conda\deskpilot-py311\python.exe -m eval.run_baseline `
@@ -438,6 +467,24 @@ DeskPilotBench 离线模式不会调用真实模型、网页或邮箱：
 ```
 
 API 模式先检查 LLM/Embedding 连接，运行中持续连接或限流失败会熔断。评测进度与逐例结果持续写入 `eval/runs/`、`eval/reports/`，详见 [`eval/README.md`](eval/README.md)。
+
+工程可靠性专项独立评测，不调用真实 API/邮箱，也不混入功能 Accuracy：
+
+```powershell
+.\.conda\deskpilot-py311\python.exe -m eval.run_reliability_eval --count 60
+.\.conda\deskpilot-py311\python.exe -m eval.prepare_reliability_demo
+```
+
+专项包含 12 类故障各 5 次重复实验，覆盖进程退出恢复、审批重启、附件变更、取消、deadline 与 unknown 不重放，输出检查点复用、取消延迟和次数上限。格式、样本范围和扩展方法见 [`README_reliability.md`](eval/dataset/README_reliability.md)，不能用其通过率推导生产可用性或 SMTP exactly-once。
+
+Jev 路由/检索对照与证据评分实验独立于主基线；会使用 OpenRouter 配额，且评分实验还需要配置普通 LLM：
+
+```powershell
+.\.conda\deskpilot-py311\python.exe -m eval.compare_jev
+.\.conda\deskpilot-py311\python.exe -m eval.run_jev_judge --judge both
+```
+
+Jev 子集和评分样本说明见 [`README_jev.md`](eval/dataset/README_jev.md)；8 条评分结果不能当作泛化性能结论。
 
 RAG 检索层消融：
 
@@ -467,6 +514,8 @@ GitHub Actions 使用 Python 3.11 执行完整 pytest、163 条主集的数量/�
 - `eval/runs/`、`eval/reports/` 和会话导出可能包含用户问题、绝对路径或模型输出，不得提交。
 - 高风险工具虽然有权限控制，但仍应在隔离目录和非重要账号上验证。
 - LLM 生成的计划、命令、邮件正文和文件内容在确认前仍需人工检查。
+- 持久任务及审批 DB 含恢复所需正文和产物引用，同样属于敏感本地数据；凭证剔除不等于正文加密，当前没有自动配置 DPAPI/额外 ACL。
+- `JEV_MODE=shadow/gated` 会发送请求摘要至 OpenRouter；开启 `JEV_ALLOW_DOCUMENT_TEXT` 还会发送受限文档片段，不应对含隐私的资料启用。
 
 ## 当前局限
 
@@ -481,8 +530,8 @@ GitHub Actions 使用 Python 3.11 执行完整 pytest、163 条主集的数量/�
 ## 后续工作
 
 - RAG：校准各 reranker 阈值，使用真实中英文 Cross-Encoder 做消融，并在知识库规模增长后接入成熟 ANN Provider。
-- 多模态：继续完善会话孤立资产回收，并开发 Office 内嵌图、后台任务队列、ANN 和端侧 VLM。
-- Agent：按任务质量要求启用 Reflection，并完善失败恢复、预算和人工接管。
+- 多模态：继续完善会话孤立资产回收，扩展已有后台页批次恢复，并开发 Office 内嵌图、ANN 和端侧 VLM。
+- Agent：按任务质量要求启用 Reflection，继续完善兼容链路迁移、文件补偿覆盖范围、SMTP 核对与人工接管；评估 Jev 门控在更大标注集上的收益和误拒风险。
 - 邮件：多账号、OAuth、模板管理、附件策略和更完整的邮箱文件夹兼容。
 - UI：补齐审批重放流式输出、计划图和工具审批历史。
 - 评测：先在相同数据、模型和降级策略下复测基线，再扩充参考答案、真实复合任务与多模态标注，完善 F1/Recall、成本和稳定性对比。

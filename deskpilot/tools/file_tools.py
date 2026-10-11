@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import shutil
+import os
 from pathlib import Path
 from typing import Any
 
 from .permissions import assess_file_move, require_permission
+from .write_tools import _sha256, _stage_path
+from ..tasks.control import get_execution_control
+from ..tasks.retry import UnknownSideEffect
 
 from ..rag.document_parsers import parse_document
 
@@ -212,13 +216,36 @@ def apply_file_move(
             "destination": str(destination),
             **permission,
         }
+    if destination.exists():
+        raise FileExistsError(f"Move target already exists: {destination}")
+    source_sha256 = _sha256(source)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(source), str(destination))
+    stage = _stage_path(destination)
+    linked = False
+    try:
+        shutil.copy2(source, stage)
+        if _sha256(stage) != source_sha256 or _sha256(source) != source_sha256:
+            raise RuntimeError("Source changed while preparing move")
+        os.link(stage, destination)
+        linked = True
+        if _sha256(source) != source_sha256:
+            raise UnknownSideEffect("移动目标已建立，但源文件在提交期间改变；需人工核对")
+        source.unlink()
+    except Exception as exc:
+        if linked and not isinstance(exc, UnknownSideEffect):
+            raise UnknownSideEffect("文件移动已部分提交，需人工核对源和目标") from exc
+        raise
+    finally:
+        stage.unlink(missing_ok=True)
+    control = get_execution_control()
     return {
         "ok": True,
         "confirmed": True,
         "source": str(source),
         "destination": str(destination),
+        "before_sha256": source_sha256,
+        "after_sha256": _sha256(destination),
+        "compensatable": bool(getattr(control, "active_operation_id", "")),
         "message": "File moved successfully.",
         "permission": decision.to_dict(),
     }

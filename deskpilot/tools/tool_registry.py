@@ -21,6 +21,8 @@ from ..rag.web_research import WebResearchAgent, WebSearchClient
 from ..mcp.email_mcp import EmailMCPService
 from ..multimodal import MultimodalService
 from ..memory.visual_memory import VisualMemoryManager
+from ..tasks import TaskStore
+from ..tasks.compensation import compensate_file_effect
 
 
 ToolHandler = Callable[..., Any]
@@ -121,18 +123,42 @@ class ToolRegistry:
         spec = self._tools.get(name)
         if not spec:
             return ToolResult(ok=False, tool_name=name, error=f"Unknown tool: {name}", status="failed", error_code="UNKNOWN_TOOL")
+        operation_id = ""
+        control = None
+        from ..tasks.effects import begin_effect, finish_effect
         try:
+            from ..tasks.control import get_execution_control
+            control = get_execution_control()
+            if control is not None:
+                control.checkpoint()
+                control.record_tool(name)
             # 只把工具 schema 里声明过的参数传给处理函数，避免审批回放时被额外字段打断。
             allowed_keys = {parameter.name for parameter in spec.parameters}
             filtered_kwargs = {key: value for key, value in kwargs.items() if key in allowed_keys}
+            operation_id = begin_effect(control, name, filtered_kwargs) if control else ""
             output = spec.handler(**filtered_kwargs)
             status, error_code = self._output_state(output)
-            return ToolResult(ok=True, tool_name=name, output=output, status=status, error_code=error_code)
+            result = self._normalized_result(name, output, status, error_code)
+            finish_effect(control, operation_id, result)
+            return result
         except Exception as exc:
-            return ToolResult(
-                ok=False, tool_name=name, error=str(exc), status="failed",
+            from ..tasks.control import TaskControlError
+            if isinstance(exc, TaskControlError):
+                if getattr(exc, "side_effect_state", "") == "committed" and isinstance(getattr(exc, "result", None), dict):
+                    result = self._normalized_result(name, exc.result, "success", "")
+                    finish_effect(control, operation_id, result)
+                    return result
+                if operation_id:
+                    finish_effect(control, operation_id, ToolResult(False, name, status="unknown"))
+                raise
+            from ..tasks.retry import UnknownSideEffect
+            result = ToolResult(
+                ok=False, tool_name=name, output=getattr(exc, "result", None), error=str(exc),
+                status="unknown" if isinstance(exc, UnknownSideEffect) or getattr(exc, "state", "") == "unknown" else "failed",
                 error_code=self._exception_code(exc),
             )
+            finish_effect(control, operation_id, result)
+            return result
 
     def call_approved(self, name: str, **kwargs: Any) -> ToolResult:
         """执行已经由一次性审批状态确认的调用，禁止普通路由触达此入口。"""
@@ -141,17 +167,41 @@ class ToolRegistry:
             return ToolResult(ok=False, tool_name=name, error=f"Unknown tool: {name}", status="failed", error_code="UNKNOWN_TOOL")
         if spec.approval_handler is None:
             return ToolResult(ok=False, tool_name=name, error=f"Tool does not support approved execution: {name}", status="failed", error_code="APPROVAL_NOT_SUPPORTED")
+        operation_id = ""
+        control = None
+        from ..tasks.effects import begin_effect, finish_effect
         try:
+            from ..tasks.control import get_execution_control
+            control = get_execution_control()
+            if control is not None:
+                control.checkpoint()
+                control.record_tool(name)
             allowed_keys = {parameter.name for parameter in spec.parameters}
             filtered_kwargs = {key: value for key, value in kwargs.items() if key in allowed_keys}
+            operation_id = begin_effect(control, name, filtered_kwargs) if control else ""
             output = spec.approval_handler(**filtered_kwargs)
             status, error_code = self._output_state(output)
-            return ToolResult(ok=True, tool_name=name, output=output, status=status, error_code=error_code)
+            result = self._normalized_result(name, output, status, error_code)
+            finish_effect(control, operation_id, result)
+            return result
         except Exception as exc:
-            return ToolResult(
-                ok=False, tool_name=name, error=str(exc), status="failed",
+            from ..tasks.control import TaskControlError
+            if isinstance(exc, TaskControlError):
+                if getattr(exc, "side_effect_state", "") == "committed" and isinstance(getattr(exc, "result", None), dict):
+                    result = self._normalized_result(name, exc.result, "success", "")
+                    finish_effect(control, operation_id, result)
+                    return result
+                if operation_id:
+                    finish_effect(control, operation_id, ToolResult(False, name, status="unknown"))
+                raise
+            from ..tasks.retry import UnknownSideEffect
+            result = ToolResult(
+                ok=False, tool_name=name, output=getattr(exc, "result", None), error=str(exc),
+                status="unknown" if isinstance(exc, UnknownSideEffect) or getattr(exc, "state", "") == "unknown" else "failed",
                 error_code=self._exception_code(exc),
             )
+            finish_effect(control, operation_id, result)
+            return result
 
     @staticmethod
     def _output_state(output: Any) -> tuple[str, str]:
@@ -167,10 +217,39 @@ class ToolRegistry:
                 output.get(key) for key in ("written", "executed", "sent", "saved", "confirmed")
             ):
                 return "waiting_human", "CONFIRMATION_REQUIRED"
+        if output.get("outcome_unknown") or output.get("status") == "unknown":
+            return "unknown", "SIDE_EFFECT_UNKNOWN"
+        if output.get("cancelled"):
+            return "cancelled", "CANCELLED"
+        if output.get("timed_out"):
+            return "failed", "TIMEOUT"
+        if output.get("returncode") not in (None, 0):
+            return "failed", "NONZERO_EXIT"
+        if output.get("ok") is False or output.get("status") in {"failed", "error"}:
+            return "failed", str(output.get("error_code") or "TOOL_EXECUTION_ERROR")
+        if any(key in output and output[key] is False for key in ("written", "saved", "answered", "confirmed")):
+            return "failed", str(output.get("error_code") or "OPERATION_NOT_COMPLETED")
         return "success", ""
 
     @staticmethod
+    def _normalized_result(name: str, output: Any, status: str, code: str) -> ToolResult:
+        # waiting_human 是有效的准备结果，但绝不是已提交成功。
+        ok = status in {"success", "waiting_human"}
+        error = ""
+        if not ok and isinstance(output, dict):
+            error = str(output.get("error") or output.get("message") or output.get("stderr") or code)
+        return ToolResult(ok, name, output, error=error, status=status, error_code=code)
+
+    @staticmethod
     def _exception_code(exc: Exception) -> str:
+        from ..tasks.retry import ErrorCategory, classify_error
+        category = classify_error(exc)
+        if category == ErrorCategory.UNKNOWN_SIDE_EFFECT:
+            return "SIDE_EFFECT_UNKNOWN"
+        if category == ErrorCategory.AUTH:
+            return "AUTHENTICATION_FAILED"
+        if category == ErrorCategory.TRANSIENT:
+            return "TRANSIENT_ERROR"
         if isinstance(exc, FileNotFoundError):
             return "FILE_NOT_FOUND"
         if isinstance(exc, PermissionError):
@@ -192,12 +271,27 @@ def build_default_tool_registry(
     email_service: EmailMCPService | None = None,
     multimodal_service: MultimodalService | None = None,
     visual_memory: VisualMemoryManager | None = None,
+    task_store: TaskStore | None = None,
 ) -> ToolRegistry:
     # 这里集中注册所有工具，意图路由器和 UI 都只需要依赖这一份工具清单。
     registry = ToolRegistry()
     email = email_service or EmailMCPService()
+    compensation_store = task_store or (
+        TaskStore(Path(index.index_file).parent / "task_ledger.json")
+        if getattr(index, "index_file", None) is not None else None
+    )
     search_client = web_research_agent.search_client if web_research_agent else WebSearchClient()
     write_safe_roots = [workspace_root] if workspace_root is not None else None
+    if compensation_store is not None:
+        registry.register(ToolSpec(
+            name="files.compensate_effect", category="files",
+            description="补偿已记录的文件写入；需人工确认，目标被修改时拒绝执行。",
+            parameters=[ToolParameter("operation_id", "string", True, "副作用操作 ID")],
+            handler=lambda operation_id: compensate_file_effect(
+                compensation_store, str(operation_id), safe_roots=write_safe_roots),
+            approval_handler=lambda operation_id: compensate_file_effect(
+                compensation_store, str(operation_id), confirm=True, safe_roots=write_safe_roots),
+        ))
 
     if multimodal_service is not None:
         registry.register(ToolSpec(
@@ -340,6 +434,20 @@ def build_default_tool_registry(
             handler=lambda query="", image_path="", top_k=5: [item.to_dict() for item in multimodal_service.search(
                 str(query), Path(image_path) if image_path else None, int(top_k)
             )],
+        ))
+        registry.register(ToolSpec(
+            name="knowledge.search_directory_images", category="knowledge",
+            description="在指定的本地图片目录中按画面内容查找图片；只读，不要求预先建索引。",
+            parameters=[
+                ToolParameter("directory", "string", True, "图片所在目录的完整路径"),
+                ToolParameter("query", "string", True, "要找的画面内容，例如穿红衣服的狗"),
+                ToolParameter("top_k", "integer", False, "返回最相似候选数", 3),
+                ToolParameter("recursive", "boolean", False, "是否包含子目录", False),
+            ],
+            handler=lambda directory, query, top_k=3, recursive=False:
+                multimodal_service.search_directory_images(
+                    Path(directory), str(query), int(top_k), bool(recursive)
+                ),
         ))
         registry.register(ToolSpec(
             name="knowledge.answer_multimodal", category="knowledge",

@@ -5,6 +5,8 @@ from typing import Any, Callable
 
 from .contracts import StepStatus
 from .models import AgentStep
+from ..tasks.control import TaskControlError, get_execution_control
+from ..tasks.retry import RetryPolicy
 
 
 PlanHandler = Callable[[dict[str, Any]], Any]
@@ -43,10 +45,19 @@ class PlanAndExecuteRuntime:
         for step in plan:
             attempts = 0
             max_retries = step.max_retries if step.max_retries >= 0 else self.default_max_retries
+            control = get_execution_control()
+            policy = RetryPolicy(max_attempts=max_retries + 1)
             while True:
                 attempts += 1
                 try:
+                    if control is not None:
+                        control.checkpoint()
                     output = step.handler(execution.values)
+                    if isinstance(output, dict) and (
+                        output.get("ok") is False or output.get("timed_out")
+                        or output.get("returncode") not in (None, 0)
+                    ):
+                        raise RuntimeError(str(output.get("error") or output.get("stderr") or "step returned failure"))
                     if isinstance(output, dict):
                         execution.values.update(output)
                     elif output is not None:
@@ -57,11 +68,14 @@ class PlanAndExecuteRuntime:
                     execution.add_step(step.name, StepStatus.SUCCESS, detail)
                     break
                 except Exception as exc:
+                    if isinstance(exc, TaskControlError):
+                        raise
                     message = str(exc) or exc.__class__.__name__
-                    if step.retryable and attempts <= max_retries:
+                    if step.retryable and policy.allows(exc, attempts, control=control):
                         # 只对可恢复错误做小范围重试，不把单步失败直接扩大成整条计划失败。
                         execution.add_step(step.name, StepStatus.RETRY, f"{message}; retrying")
-                        continue
+                        if policy.wait(attempts, control=control):
+                            continue
                     execution.add_step(step.name, StepStatus.FAILED, message)
                     execution.failed = True
                     execution.failure = message
