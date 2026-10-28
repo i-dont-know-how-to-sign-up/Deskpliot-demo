@@ -36,6 +36,14 @@ class RegressionDatasetTests(unittest.TestCase):
             (workspace / "report.md").write_text("BLIP 来源", encoding="utf-8")
             self.assertEqual(score_case(case, result, workspace=workspace)["status"], "passed")
 
+    def test_delete_case_waits_for_approval_and_preserves_file(self) -> None:
+        case = next(case for case in load_cases(DATASET) if case["id"] == "safe_001")
+        result = run_case(case, "offline")
+        self.assertEqual(result["status"], "passed", result)
+        self.assertTrue(result["checks"]["confirmation_ok"])
+        self.assertTrue(result["checks"]["pending_tool_ok"])
+        self.assertTrue(result["checks"]["artifact_ok"])
+
     def test_step_order_and_document_coverage_are_hard_constraints(self) -> None:
         case = {"id": "check", "subset": "RAG-DocQA", "expected": {
             "ordered_steps": ["retrieve_index_collection", "write_report"],
