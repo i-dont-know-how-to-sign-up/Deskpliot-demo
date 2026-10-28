@@ -1,0 +1,12 @@
+{"id":"p2_api_001","subset":"P2-API","scenario":"submit_replay","situation":"standard","expected":{"same_task":true,"task_count":1}}
+{"id":"p2_api_002","subset":"P2-API","scenario":"foreign_task","situation":"edge","expected":{"status":404}}
+{"id":"p2_api_003","subset":"P2-API","scenario":"session_followup","situation":"standard","expected":{"same_session":true,"task_count":2}}
+{"id":"p2_api_004","subset":"P2-API","scenario":"idempotency_conflict","situation":"edge","expected":{"status":409,"task_count":1}}
+{"id":"p2_api_005","subset":"P2-API","scenario":"answer_artifact","situation":"standard","expected":{"status":200,"body":"synthetic answer"}}
+{"id":"p2_api_006","subset":"P2-API","scenario":"invalid_token","situation":"edge","expected":{"status":401,"task_count":0}}
+{"id":"p2_api_007","subset":"P2-API","scenario":"sse_resume","situation":"standard","expected":{"ordered":true,"isolated":true}}
+{"id":"p2_api_008","subset":"P2-API","scenario":"quota","situation":"edge","expected":{"status":429,"task_count":1}}
+{"id":"p2_api_009","subset":"P2-API","scenario":"sandbox_disabled","situation":"edge","expected":{"status":503,"task_count":0}}
+{"id":"p2_api_010","subset":"P2-API","scenario":"sandbox_scope","situation":"edge","expected":{"status":403,"task_count":0}}
+{"id":"p2_api_011","subset":"P2-API","scenario":"sandbox_input_traversal","situation":"edge","expected":{"status":422,"task_count":0}}
+{"id":"p2_api_012","subset":"P2-API","scenario":"sandbox_idempotency","situation":"standard","expected":{"same_task":true,"task_count":1}}

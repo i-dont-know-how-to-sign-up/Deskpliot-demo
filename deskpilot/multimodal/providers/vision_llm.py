@@ -4,11 +4,15 @@ import base64
 import json
 import mimetypes
 import os
+import re
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
 from ...core.config import _load_dotenv, ROOT_DIR
+from ...release.profile import release_mode
+from ...release.secrets import secret_value
 from ...core.api_clients import _open_response
 from ...tasks.control import get_execution_control
 
@@ -17,12 +21,13 @@ class VisionLLMProvider:
     """OpenAI-compatible 视觉消息适配器；Base64 只存在于瞬时请求体中。"""
 
     def __init__(self) -> None:
-        _load_dotenv(ROOT_DIR / ".env")
+        if not release_mode():
+            _load_dotenv(ROOT_DIR / ".env")
         self.provider = os.getenv("VISION_PROVIDER", "openai_compatible").strip().casefold()
         self.model = os.getenv("VISION_MODEL", "qwen-vl-max-latest").strip()
         self.base_url = (os.getenv("VISION_BASE_URL") or os.getenv("DASHSCOPE_BASE_URL") or
                          "https://dashscope.aliyuncs.com/compatible-mode/v1").rstrip("/")
-        self.api_key = os.getenv("VISION_API_KEY") or os.getenv("DASHSCOPE_API_KEY") or ""
+        self.api_key = secret_value("VISION_API_KEY") or secret_value("DASHSCOPE_API_KEY")
         self.allow_cloud = os.getenv("ALLOW_CLOUD_IMAGE_UPLOAD", "false").casefold() in {"1", "true", "yes", "on"}
         self.timeout = max(10, min(int(os.getenv("VISION_TIMEOUT_SECONDS", "90")), 300))
         self.last_usage: dict[str, int] = {}
@@ -37,7 +42,8 @@ class VisionLLMProvider:
     ) -> str:
         self.last_usage = {}
         if not self.allow_cloud:
-            raise PermissionError("云端图片上传未启用，请在 .env 设置 ALLOW_CLOUD_IMAGE_UPLOAD=true")
+            hint = "请在桌面设置中启用并重启" if release_mode() else "请在 .env 设置 ALLOW_CLOUD_IMAGE_UPLOAD=true"
+            raise PermissionError(f"云端图片上传未启用，{hint}")
         if not self.api_key:
             raise RuntimeError("未配置 VISION_API_KEY 或 DASHSCOPE_API_KEY")
         content: list[dict[str, Any]] = [{"type": "text", "text": self._prompt(question, len(image_paths))}]
@@ -76,6 +82,25 @@ class VisionLLMProvider:
             answer = self._read_answer(request, event_callback)
             success = True
             return answer
+        except urllib.error.HTTPError as exc:
+            error_response = getattr(exc, "usage_response", {})
+            if isinstance(error_response, dict) and isinstance(error_response.get("usage"), dict):
+                self.last_usage = self._normalize_usage(error_response["usage"])
+            if exc.code != 403:
+                error = str(exc)
+                if control is not None:
+                    control.checkpoint()
+                raise
+            code = str(error_response.get("code", "")) if isinstance(error_response, dict) else ""
+            if not code and isinstance(error_response, dict) and isinstance(error_response.get("error"), dict):
+                code = str(error_response["error"].get("code", ""))
+            code = re.sub(r"[^A-Za-z0-9_.-]", "", code)[:80]
+            hint = "请核对视觉模型名称、API Key 对该模型的授权，以及 VISION_BASE_URL 与 Key 所属地域是否一致。"
+            detail = f"；服务端错误码：{code}" if code else ""
+            error = f"视觉模型请求被拒绝（HTTP {exc.code}，模型 {self.model}{detail}）。{hint}"
+            if control is not None:
+                control.checkpoint()
+            raise RuntimeError(error) from exc
         except Exception as exc:
             error = str(exc)
             error_response = getattr(exc, "usage_response", {})

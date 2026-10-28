@@ -69,6 +69,13 @@ def test_task_panel_loads_and_renders_offscreen(tmp_path: Path, monkeypatch, wid
             assert capture.save(str(destination / f"tasks_ui_{width}.png"))
         colors = {capture.pixelColor(x, y).name() for x in range(0, width, 20) for y in range(0, height, 20)}
         assert len(colors) > 8, "Task panel must not be a blank canvas"
+        bridge.errorRaised.emit("无法解密当前用户的凭据文件")
+        for _ in range(10):
+            application.processEvents()
+        error_dialog = window.findChild(QObject, "errorDialog")
+        assert error_dialog is not None and error_dialog.property("visible") is True
+        error_text = window.findChild(QObject, "errorText")
+        assert error_text is not None and "无法解密" in error_text.property("text")
         assert not warnings, warnings
     finally:
         window.close()

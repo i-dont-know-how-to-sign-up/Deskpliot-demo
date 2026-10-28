@@ -18,6 +18,7 @@ data/
 eval/runs/
 eval/reports/
 eval/baselines/
+eval/release_runs/
 eval/pytest_*/
 sess_*.md
 
@@ -28,6 +29,8 @@ sess_*.md
 !/requirements.txt
 !/requirements-rerank.txt
 !/requirements-multimodal.txt
+!/requirements-ragas.txt
+!/requirements-api.txt
 
 # Imported documents, generated attachments and local corpora may contain private data.
 *.docx
@@ -46,3 +49,9 @@ sess_*.md
 *.log
 *.tmp
 *.bak
+
+# Local Windows release builds and generated installer artifacts.
+/build/
+/dist/
+/dist-installer/
+/test_temp_release_*/

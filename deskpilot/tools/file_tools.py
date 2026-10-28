@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import shutil
 import os
+import hashlib
+import sys
 from pathlib import Path
 from typing import Any
 
-from .permissions import assess_file_move, require_permission
+from .permissions import assess_file_move, assess_path_write, is_confirmed, require_permission
 from .write_tools import _sha256, _stage_path
 from ..tasks.control import get_execution_control
 from ..tasks.retry import UnknownSideEffect
@@ -27,6 +29,39 @@ FILE_CATEGORY_RULES: list[tuple[str, tuple[str, ...]]] = [
 
 
 SUPPORTED_DOC_EXTENSIONS = {".txt", ".md", ".markdown", ".docx", ".pptx", ".xlsx", ".csv", ".pdf"}
+
+
+def delete_file(path: str | Path, *, expected_sha256: str = "", confirm: bool = False,
+                safe_roots: list[Path] | None = None) -> dict[str, Any]:
+    """Delete only one regular file after approval, bound to its previewed content hash."""
+    raw = Path(path).expanduser()
+    if raw.is_symlink() or not raw.is_file():
+        raise ValueError("Only an existing regular file can be deleted")
+    target = raw.resolve(strict=True)
+    if os.getenv("DESKPILOT_RELEASE_MODE") == "1" and getattr(sys, "frozen", False):
+        install_root = Path(sys.executable).resolve().parent
+        if target == install_root or install_root in target.parents:
+            raise ValueError("The application installation directory is protected; remove stray files manually")
+    decision = assess_path_write(target, "delete_file", additional_safe_roots=safe_roots)
+    if decision.blocked:
+        raise PermissionError("; ".join(decision.reasons))
+    digest = hashlib.sha256()
+    with target.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    actual_sha256 = digest.hexdigest()
+    if expected_sha256 and expected_sha256 != actual_sha256:
+        raise ValueError("File changed after approval preview; request a new approval")
+    if not is_confirmed(confirm):
+        return {
+            "path": str(target), "sha256": actual_sha256, "deleted": False,
+            "permission": {"requires_confirmation": True, "risk_level": "high",
+                           "reasons": ["Deleting a file is irreversible in this tool.", *decision.reasons]},
+        }
+    if not expected_sha256:
+        raise ValueError("Approved deletion requires the previewed file hash")
+    target.unlink()
+    return {"path": str(target), "sha256": actual_sha256, "deleted": True}
 
 LEADING_ACTION_WORDS = (
     "请帮我把",

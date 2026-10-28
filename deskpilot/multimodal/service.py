@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from ..core.config import DATA_DIR, ROOT_DIR, _load_dotenv
+from ..release.profile import release_mode
 from .asset_store import AssetStore
 from .image_processor import SUPPORTED_FORMATS
 from .ingestion import MultimodalIngestionService
@@ -24,7 +25,8 @@ class MultimodalService:
 
     def __init__(self, data_root: Path | None = None) -> None:
         # Provider 在首次加载模型前必须看到缓存目录配置，防止大型权重回落到系统盘。
-        _load_dotenv(ROOT_DIR / ".env")
+        if not release_mode():
+            _load_dotenv(ROOT_DIR / ".env")
         root = (data_root or DATA_DIR).resolve()
         self.assets = AssetStore(root / "workspace" / "assets")
         self.vector_store = MultimodalVectorStore(root / "index" / "multimodal_catalog.sqlite3")
@@ -275,7 +277,10 @@ class MultimodalService:
 
     def _ensure_cloud_ready(self) -> None:
         if not self.vision_llm.allow_cloud:
-            raise PermissionError("云端图片上传未启用，请在 .env 设置 ALLOW_CLOUD_IMAGE_UPLOAD=true")
+            from ..release.profile import release_mode
+
+            hint = "请在桌面设置中启用云端图片上传并重启" if release_mode() else "请在 .env 设置 ALLOW_CLOUD_IMAGE_UPLOAD=true"
+            raise PermissionError(f"云端图片上传未启用，{hint}")
         if not self.vision_llm.available:
             raise RuntimeError("视觉模型不可用，请检查 VISION_PROVIDER、VISION_MODEL 和 API Key")
 

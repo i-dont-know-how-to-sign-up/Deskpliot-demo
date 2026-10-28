@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+import os
 from pathlib import Path
 from typing import Any, Callable
 
@@ -11,6 +13,7 @@ from .file_tools import (
     build_organization_plan,
     build_supported_file_index,
     classify_folder,
+    delete_file,
     read_document,
     scan_folder,
     resolve_document_path,
@@ -106,12 +109,16 @@ class ToolRegistry:
 
     def list_tools(self, category: str | None = None) -> list[dict[str, Any]]:
         tools = list(self._tools.values())
+        if os.getenv("DESKPILOT_RELEASE_MODE") == "1":
+            tools = [tool for tool in tools if tool.name not in {"shell.execute_command", "code.execute_python"}]
         if category:
             tools = [tool for tool in tools if tool.category == category]
         return [tool.to_dict() for tool in sorted(tools, key=lambda tool: tool.name)]
 
     def list_tool_summaries(self, category: str | None = None) -> list[dict[str, Any]]:
         tools = list(self._tools.values())
+        if os.getenv("DESKPILOT_RELEASE_MODE") == "1":
+            tools = [tool for tool in tools if tool.name not in {"shell.execute_command", "code.execute_python"}]
         if category:
             tools = [tool for tool in tools if tool.category == category]
         return [tool.to_summary_dict() for tool in sorted(tools, key=lambda tool: tool.name)]
@@ -243,6 +250,8 @@ class ToolRegistry:
     @staticmethod
     def _exception_code(exc: Exception) -> str:
         from ..tasks.retry import ErrorCategory, classify_error
+        if isinstance(exc, PermissionError):
+            return "PERMISSION_DENIED"
         category = classify_error(exc)
         if category == ErrorCategory.UNKNOWN_SIDE_EFFECT:
             return "SIDE_EFFECT_UNKNOWN"
@@ -252,8 +261,6 @@ class ToolRegistry:
             return "TRANSIENT_ERROR"
         if isinstance(exc, FileNotFoundError):
             return "FILE_NOT_FOUND"
-        if isinstance(exc, PermissionError):
-            return "PERMISSION_DENIED"
         message = str(exc).casefold()
         if "protected system" in message or "受保护" in message:
             return "PROTECTED_PATH"
@@ -684,6 +691,21 @@ def build_default_tool_registry(
     )
     registry.register(
         ToolSpec(
+            name="files.delete_file",
+            category="files",
+            description="Delete one existing regular file only after explicit human approval. Never use Shell for file deletion.",
+            parameters=[
+                ToolParameter("path", "string", True, "Exact file path"),
+                ToolParameter("expected_sha256", "string", False, "Server-bound preview hash", ""),
+            ],
+            handler=lambda path, expected_sha256="": delete_file(
+                path, expected_sha256=str(expected_sha256), safe_roots=write_safe_roots),
+            approval_handler=lambda path, expected_sha256="": delete_file(
+                path, expected_sha256=str(expected_sha256), confirm=True, safe_roots=write_safe_roots),
+        )
+    )
+    registry.register(
+        ToolSpec(
             name="files.write_markdown",
             category="files",
             description="Write a Markdown file. Existing files require overwrite=true; risky paths require app approval.",
@@ -830,6 +852,15 @@ def build_default_tool_registry(
             description="返回当前前台窗口标题，用于低风险桌面观察。",
             parameters=[],
             handler=lambda: get_active_window_title(),
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="system.current_time",
+            category="system",
+            description="Return the current local system date, time, and timezone without Shell or network access.",
+            parameters=[],
+            handler=lambda: {"local_time": datetime.now().astimezone().isoformat(timespec="seconds")},
         )
     )
     registry.register(

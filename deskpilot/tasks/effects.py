@@ -15,7 +15,7 @@ def _database(control: Any):
 
 def begin_effect(control: Any, name: str, arguments: dict[str, Any]) -> str:
     path = _database(control)
-    side_effect = name.startswith(("files.write", "email.send", "email.save_draft", "code.execute", "shell.execute", "files.apply_move"))
+    side_effect = name.startswith(("files.write", "files.delete", "email.send", "email.save_draft", "code.execute", "shell.execute", "files.apply_move"))
     if path is None or not side_effect:
         return ""
     ids = control.attribution()

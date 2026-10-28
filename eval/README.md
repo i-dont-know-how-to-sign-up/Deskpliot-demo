@@ -123,11 +123,35 @@ D:\broagent\.conda\deskpilot-py311\python.exe -m eval.run_reranker_ablation `
 
 报告输出 Hit Rate、Recall、MRR、平均/P95 检索延迟、Token 和模型磁盘占用。磁盘有限时，可先用 `--providers rrf,lexical` 运行零额外模型版本。
 
-## 工程可靠性专项
+## RAGAS 文档 RAG 评测
+
+在项目环境中安装可选依赖：`python -m pip install -r requirements-ragas.txt`。需要 `.env` 中可用的 LLM 和 Embedding API Key；脚本强制关闭本地 fallback，模型/网络失败不会生成伪分。小样本与完整集命令：
+
+```powershell
+.\.conda\deskpilot-py311\python.exe -m eval.run_ragas_eval --count 2
+.\.conda\deskpilot-py311\python.exe -m eval.run_ragas_eval
+```
+
+默认使用 `eval/dataset/ragas_cases.jsonl` 的 8 条人工编写并核对参考答案的合成故障任务。每条包含 `id/subset/query/reference/corpus/top_k/relevant_sources`；`corpus` 必须是仓库内已存在的相对路径。`--count N` 取前 N 条，`--dataset` 可换扩展集，`--report` 可指定报告路径。另有 `--prepare-only` 只生成真实检索和回答样本，不产生 RAGAS 分数。
+
+本机 `多模态/` 下 4 篇真实论文对应的 24 条扩展用例见 [`README_ragas.md`](dataset/README_ragas.md)。PDF 原文未提交到仓库，其他机器没有这些文件时不要运行该集合。运行本地论文集前三条，或合并两个集合共 32 条：
+
+```powershell
+.\.conda\deskpilot-py311\python.exe -m eval.run_ragas_eval --dataset eval/dataset/ragas_multimodal_local.jsonl --count 3 --report eval/reports/ragas_papers_smoke.md
+.\.conda\deskpilot-py311\python.exe -m eval.run_ragas_eval --dataset eval/dataset/ragas_cases.jsonl --dataset eval/dataset/ragas_multimodal_local.jsonl --report eval/reports/ragas_combined.md
+```
+
+同一组 `corpus` 在一次运行中复用索引，减少 PDF 重复解析与 Embedding 请求；不同语料组仍分别建索引。`--dataset` 可重复指定，`--count` 在合并后取前 N 条。
+
+流程为逐例隔离建索引、调用 DeskPilot 的混合检索和 lexical 精排、用项目 LLM 据证据生成回答，随后 RAGAS 0.2.15 基于问题、实际检索片段、回答与参考答案计算 `faithfulness`（回答事实受证据支持）、`answer_relevancy`（回答针对问题）、`context_precision`（相关片段排名）和 `context_recall`（证据覆盖参考答案）。另计来源 Recall 作为确定性辅助指标；不把它冒充 RAGAS 分数。输出 `eval/reports/ragas_latest.md` 和同名 `.jsonl`，逐例保留上下文、答案、trace、错误和耗时。任何缺失/NaN 指标都显示 `N/A`，有效样本数单列。报告含原文，私人语料请使用受控输出目录。
+
+这是隔离的文档 RAG 管线评测，不含桌面 UI、意图路由、多 Agent、工具副作用，也不是 RAGAS 官方公开榜单分数；小样本、合成语料及 LLM Judge 波动意味着只能用于本项目回归。RAGAS/LangChain 仅用于评测侧，未接入主产品实现。
 
 ## Jev 决策与 Judge 对照
 
 可选 Jev 通过 OpenRouter `alpha.decisions.create` 对应的 `/api/alpha/decisions` 端点调用 `typesafe/jev-1.13`。入口仅为路由前置门控、普通文档 RAG 候选证据门控；Judge 是独立评测脚本，不参与线上最终回答或网页检索流程。`JEV_MODE=off/shadow/gated`，本地文档正文默认禁止外发；配置和数据构成见 [Jev 数据说明](dataset/README_jev.md)。
+
+`JEV_PROVIDER=netlify` 时，Jev 评测入口会使用 `NETLIFY_JEV_ENDPOINT` 和 `NETLIFY_JEV_TOKEN` 调用自建 Netlify Function；`openrouter` 仍为默认值。先验证 Function 的 typed answers 契约与鉴权，再运行付费评测。该桥接的 SDK/网关行为尚未在真实站点验证，不能把模拟传输测试当作模型质量或延迟对照。
 
 ```powershell
 python -m eval.compare_jev
@@ -150,3 +174,17 @@ P2 后默认专项数据集为 68 条（原 P0/P1 60 条 + P2 8 条）。执行 
 ## Jev 对照
 
 `python -m eval.compare_jev` 对固定 36 条 API 用例做 off/gated 成对运行；报告同时给出 Jev 实际跳过原 Router 的次数与 RAG 证据过滤数，零干预时不可解读为有效模型对照。`python -m eval.run_jev_judge --judge both --count 8` 对标注证据做五档数值相关性、忠实度评分，结果为 0–1，报告 MAE/RMSE，非正式 RAGAS 指标。详见 [Jev 数据说明](dataset/README_jev.md)。
+
+## P2 私有 API 与版本轮换
+
+`dataset/p2_api_cases.jsonl` 含 12 条无外部副作用的 HTTP 合约用例：原有 8 条覆盖幂等重放、跨主体任务隔离、会话延续、产物、Token、SSE 和配额；新增 4 条覆盖沙箱默认关闭、独立 `execute` scope、输入路径穿越拒绝和沙箱任务幂等。它们由 `eval.run_p2_api_eval` 使用内存 ASGI 客户端和隔离 SQLite 运行，不调用真实 LLM/邮箱或 Docker。并发竞态、审批重放/附件篡改、过期 Token 等逆向用例在 `tests/test_p2_api_adversarial.py`；Docker 参数和真实越权用例在 `tests/test_p2_docker_sandbox.py`。数据集通过不代表 OS 沙箱通过。
+
+```powershell
+.\.conda\deskpilot-py311\python.exe -m eval.run_p2_api_eval --mode offline --project-version 0.9.0-beta.2
+.\.conda\deskpilot-py311\python.exe -m pytest -q tests/test_p2_api_contract.py tests/test_p2_api_adversarial.py
+.\.conda\deskpilot-py311\python.exe -m eval.release_validation --artifact D:\broagent\dist\NEW_BUILD\DeskPilot\DeskPilot.exe --run-offline
+```
+
+固定用例用于跨版本同题比较；`release_validation` 按上轮 manifest 优先换题，并在报告中记录所选 ID、数据 SHA、EXE 哈希与是否重复。它运行的是源码评测，打包后的 UI/API/worker 仍须用独立 profile 单独冒烟。真实文本 API/VLM 项默认 `not_run`，不能并入离线通过率；私有 API 尚未通过容器/VM 越权测试，不对公网开放。
+
+真实 Docker 越权测试须显式设 `DESKPILOT_RUN_DOCKER_SECURITY_TESTS=1` 并准备本地 Python 镜像；启用后 daemon 或镜像不可用会**失败**，不算跳过。命令、威胁边界与固定镜像方式见 [私有 API 说明](../deskpilot/api/README.md)。

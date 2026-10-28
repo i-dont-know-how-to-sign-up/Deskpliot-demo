@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
-DATA_DIR = ROOT_DIR / "data"
+DATA_DIR = Path(os.getenv("DESKPILOT_DATA_DIR") or ROOT_DIR / "data").expanduser().resolve()
 INDEX_DIR = DATA_DIR / "index"
 WORKSPACE_DIR = DATA_DIR / "workspace"
 REPORTS_DIR = WORKSPACE_DIR / "reports"
@@ -32,9 +32,14 @@ def _load_dotenv(path: Path) -> None:
 
 
 def _env_value(*names: str, default: str = "") -> str:
+    from ..release.secrets import secret_value
+
     for name in names:
         value = os.getenv(name)
         if value is not None and value.strip() != "":
+            return value
+        value = secret_value(name)
+        if value:
             return value
     return default
 
@@ -76,7 +81,10 @@ def ensure_dirs() -> None:
 
 
 def load_config() -> ModelConfig:
-    _load_dotenv(ROOT_DIR / ".env")
+    from ..release.profile import release_mode
+
+    if not release_mode():
+        _load_dotenv(ROOT_DIR / ".env")
     allow_fallback = _env_value("ALLOW_LOCAL_FALLBACK", default="true").lower() in {
         "1",
         "true",

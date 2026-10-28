@@ -22,14 +22,16 @@ class MemoryPolicy:
         pending_action: dict[str, Any] | None = None,
     ) -> tuple[bool, str]:
         if pending_action:
-            return True, "pending_side_effect"
+            return False, "pending_approval_not_memory"
         names = {str(getattr(step, "name", "")) for step in (steps or [])}
-        if names.intersection(self._MEMORY_STEPS):
-            return True, "tool_or_artifact"
+        if re.match(r"^\s*我是(?:一名|一个|一位|名|个|位)?[^，,。？！?\n]{2,60}(?:[，,。？！?\n]|$)", user_message):
+            return True, "explicit_user_state"
         if self._PERSONAL_SIGNAL.search(user_message):
             return True, "explicit_user_state"
+        if names.intersection(self._MEMORY_STEPS):
+            return True, "tool_or_artifact"
         if grounded and names.intersection({"retrieve_evidence", "read_local_documents", "web_search"}):
-            return True, "grounded_result"
+            return False, "indexed_evidence_not_memory"
         return False, "low_value_direct_turn"
 
     def default_expires_at(self, scope: str, memory_type: str, tags: list[str] | None = None) -> str | None:

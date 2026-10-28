@@ -17,6 +17,7 @@ from ..tasks.control import TaskControlError, get_execution_control
 
 _STAGE: ContextVar[str] = ContextVar("jev_stage", default="Jev")
 _MODES = {"off", "shadow", "gated"}
+_PROVIDERS = {"openrouter", "netlify"}
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,7 @@ class JevConfig:
     max_passages: int = 8
     max_passage_chars: int = 1600
     allow_document_text: bool = False
+    provider: str = "openrouter"
 
     @classmethod
     def from_env(cls) -> "JevConfig":
@@ -39,6 +41,9 @@ class JevConfig:
         mode = os.getenv("JEV_MODE", "off").strip().lower()
         if mode not in _MODES:
             raise ValueError("JEV_MODE must be off, shadow or gated")
+        provider = os.getenv("JEV_PROVIDER", "openrouter").strip().lower()
+        if provider not in _PROVIDERS:
+            raise ValueError("JEV_PROVIDER must be openrouter or netlify")
 
         def number(name: str, default: float, minimum: float, maximum: float) -> float:
             try:
@@ -48,9 +53,11 @@ class JevConfig:
 
         return cls(
             mode=mode,
-            api_key=os.getenv("OPENROUTER_API_KEY", "").strip(),
-            model=os.getenv("JEV_MODEL", "typesafe/jev-1.13").strip(),
-            endpoint=os.getenv("JEV_ENDPOINT", "https://openrouter.ai/api/alpha/decisions").strip(),
+            api_key=os.getenv("NETLIFY_JEV_TOKEN" if provider == "netlify" else "OPENROUTER_API_KEY", "").strip(),
+            model=(os.getenv("JEV_MODEL", "typesafe/jev-1.13").strip() if provider == "openrouter"
+                   else "netlify/systemOne"),
+            endpoint=(os.getenv("NETLIFY_JEV_ENDPOINT", "") if provider == "netlify" else
+                      os.getenv("JEV_ENDPOINT", "https://openrouter.ai/api/alpha/decisions")).strip(),
             timeout_seconds=number("JEV_TIMEOUT_SECONDS", 8.0, 1.0, 30.0),
             route_confidence=number("JEV_ROUTE_CONFIDENCE", 0.92, 0.5, 1.0),
             route_veto_probability=number("JEV_ROUTE_VETO_PROBABILITY", 0.2, 0.0, 0.5),
@@ -59,11 +66,25 @@ class JevConfig:
             max_passage_chars=int(number("JEV_MAX_PASSAGE_CHARS", 1600, 200, 3000)),
             allow_document_text=os.getenv("JEV_ALLOW_DOCUMENT_TEXT", "false").strip().lower() in
             {"1", "true", "yes", "on"},
+            provider=provider,
         )
+
+    @property
+    def credential_name(self) -> str:
+        return "NETLIFY_JEV_TOKEN" if self.provider == "netlify" else "OPENROUTER_API_KEY"
+
+    def validate_transport(self) -> None:
+        if self.provider not in _PROVIDERS:
+            raise ValueError("JEV_PROVIDER must be openrouter or netlify")
+        if not self.api_key:
+            raise RuntimeError(f"{self.credential_name} is not configured")
+        if not self.endpoint.startswith("https://"):
+            name = "NETLIFY_JEV_ENDPOINT" if self.provider == "netlify" else "JEV_ENDPOINT"
+            raise ValueError(f"{name} must use HTTPS")
 
 
 class JevClient:
-    """OpenRouter alpha Decisions transport; input text is never written to usage logs."""
+    """Typed Jev decisions transport; input text is never written to usage logs."""
 
     def __init__(self, config: JevConfig | None = None) -> None:
         self.config = config or JevConfig.from_env()
@@ -81,11 +102,10 @@ class JevClient:
             _STAGE.reset(token)
 
     def judge(self, state: dict[str, Any] | str, questions: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-        if not self.config.api_key:
-            raise RuntimeError("OPENROUTER_API_KEY is not configured")
-        if not self.config.endpoint.startswith("https://"):
-            raise ValueError("JEV_ENDPOINT must use HTTPS")
-        payload = {"model": self.config.model, "state": state, "questions": questions}
+        self.config.validate_transport()
+        payload = {"state": state, "questions": questions}
+        if self.config.provider == "openrouter":
+            payload["model"] = self.config.model
         control = get_execution_control()
         attempt = control.record_attempt("jev_decision") if control is not None else None
         started = time.perf_counter()
@@ -117,6 +137,7 @@ class JevClient:
             prompt = int(usage.get("input_tokens", 0)) if reported else 0
             completion = int(usage.get("output_tokens", 0)) if reported else 0
             event = {"stage": _STAGE.get(), "kind": "decision", "model": self.config.model,
+                     "provider": self.config.provider,
                      "prompt_tokens": prompt, "completion_tokens": completion,
                      "total_tokens": prompt + completion, "latency_ms": round((time.perf_counter() - started) * 1000, 3),
                      "success": not error, "usage_reported": reported, "error": error[:180]}
@@ -145,7 +166,8 @@ class JevClient:
             with urllib.request.urlopen(request, timeout=timeout) as stream:
                 return json.load(stream)
         except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"OpenRouter Jev HTTP {exc.code}") from exc
+            provider = "Netlify Jev" if self.config.provider == "netlify" else "OpenRouter Jev"
+            raise RuntimeError(f"{provider} HTTP {exc.code}") from exc
 
 
 def noul(answers: dict[str, dict[str, Any]], name: str) -> float:

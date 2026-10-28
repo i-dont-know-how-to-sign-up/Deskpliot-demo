@@ -39,10 +39,15 @@ class MemoryTurnManager:
         )
         new_memories = []
         if should_extract:
-            candidates = self.extractor.extract(
-                user_message=user_message, assistant_message=assistant_message,
-                session_id=session_id, source_message_ids=source_message_ids, grounded=grounded,
-            )
+            if reason == "tool_or_artifact":
+                candidates = self.extractor.extract_artifacts(
+                    user_message, assistant_message, session_id, source_message_ids,
+                )
+            else:
+                candidates = self.extractor.extract(
+                    user_message=user_message, assistant_message=assistant_message,
+                    session_id=session_id, source_message_ids=source_message_ids, grounded=grounded,
+                )
             for item in candidates:
                 memory = self.store.add_memory(**item)
                 if memory:

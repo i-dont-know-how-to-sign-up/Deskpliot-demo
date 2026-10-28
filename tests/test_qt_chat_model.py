@@ -66,6 +66,9 @@ def test_resumed_task_reloads_persisted_transcript_instead_of_overwriting(monkey
     bridge = DeskPilotBridge.__new__(DeskPilotBridge)
     QObject.__init__(bridge)
     bridge.current_session_id = "session"
+    bridge._stream_timer = SimpleNamespace(stop=lambda: None)
+    bridge._stream_buffer = ""
+    bridge._stream_closed = False
     calls = []
     for name in ("refreshTasks", "_load_session_messages", "_end_operation"):
         monkeypatch.setattr(bridge, name, lambda name=name: calls.append(name))

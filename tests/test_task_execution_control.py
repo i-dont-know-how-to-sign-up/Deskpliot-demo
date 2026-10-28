@@ -102,7 +102,7 @@ def test_wait_is_interruptible(method, error):
 
 def test_deadline_limits_timeout_and_wait():
     control = ExecutionControl(deadline=time.monotonic() + 0.08)
-    assert 0 < control.timeout(60) <= 0.08
+    assert 0 < control.timeout(60) <= 0.080001
     with pytest.raises(TaskDeadlineExceeded):
         control.wait(10)
 

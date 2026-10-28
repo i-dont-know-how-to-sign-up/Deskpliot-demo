@@ -81,12 +81,21 @@ def chunk_document_with_metadata(
     chunks: list[Chunk] = []
     nodes: list[SentenceNode] = []
     semantic_distances: list[float] = []
+    prepared_groups = [
+        (order, group, sentences)
+        for order, group in enumerate(_parent_groups(blocks, config), start=1)
+        if (sentences := _sentences_for_group(group))
+    ]
+    semantic_vectors: list[list[float]] = []
+    if strategy == "semantic":
+        all_sentences = [sentence for _, _, sentences in prepared_groups for sentence in sentences]
+        semantic_vectors = (embed_sentences or _local_embed)(all_sentences)
+        if len(semantic_vectors) != len(all_sentences):
+            raise ValueError("Semantic sentence embeddings do not match sentence count")
+    vector_offset = 0
 
     # boundary_key 保证句子窗口和 overlap 不跨页面、标题、表格等结构边界。
-    for parent_order, group in enumerate(_parent_groups(blocks, config), start=1):
-        sentences = _sentences_for_group(group)
-        if not sentences:
-            continue
+    for parent_order, group, sentences in prepared_groups:
         parent_id = f"{document.doc_id}_parent_{parent_order:04d}"
         parent_metadata = _block_metadata(group[0])
         parent_text = "\n\n".join(block.text for block in group if block.text.strip())
@@ -108,7 +117,8 @@ def chunk_document_with_metadata(
             nodes.append(node)
 
         if strategy == "semantic":
-            embeddings = (embed_sentences or _local_embed)(sentences)
+            embeddings = semantic_vectors[vector_offset:vector_offset + len(sentences)]
+            vector_offset += len(sentences)
             segments, distances = _semantic_segments(sentences, embeddings, config)
             semantic_distances.extend(distances)
         else:

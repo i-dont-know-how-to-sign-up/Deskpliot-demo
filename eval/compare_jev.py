@@ -70,6 +70,7 @@ def compare(off: list[dict[str, Any]], gated: list[dict[str, Any]]) -> dict[str,
                  and gated_by_id[case_id]["status"] != "passed"]
     return {"rows": rows, "regressed_case_ids": regressed,
             "case_ids": list(off_by_id), "jev_model": JevConfig.from_env().model,
+            "jev_provider": JevConfig.from_env().provider,
             "interventions": intervention_counts(gated)}
 
 
@@ -101,8 +102,12 @@ def main() -> int:
     if not args.off_run:
         config = load_config()
         jev = JevConfig.from_env()
-        if not config.llm_api_key or not config.embedding_api_key or not jev.api_key:
-            parser.error("Set LLM, embedding and OPENROUTER_API_KEY in .env before running paid API comparison")
+        if not config.llm_api_key or not config.embedding_api_key:
+            parser.error("Set LLM and embedding credentials in .env before running paid API comparison")
+        try:
+            jev.validate_transport()
+        except (ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
     directory = args.output_dir or Path("eval/runs") / ("jev_compare_" + datetime.now().astimezone().strftime("%Y%m%dT%H%M%S%z"))
     directory.mkdir(parents=True, exist_ok=True)
     off_path = args.off_run or directory / "off.jsonl"
@@ -125,7 +130,7 @@ def main() -> int:
     (directory / "comparison.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     interventions = summary["interventions"]
     lines = ["# Jev 与原路由对照", "", f"- 套件：`{SUITE}`（36 条，相同用例顺序）",
-             f"- Jev：`{summary['jev_model']}`；模式：off vs gated",
+             f"- Jev：`{summary['jev_model']}`，provider：`{summary['jev_provider']}`；模式：off vs gated",
              f"- Jev 决策调用：{summary['jev_calls']} 次，成功 {summary['jev_successes']} 次，失败 {summary['jev_errors']} 次。",
              f"- Jev Router 调用 {summary['jev_router_calls']} 次；实际跳过原 Router {interventions['router_shortcuts']} 次；回退 {interventions['router_fallbacks']} 次。",
              f"- Jev RAG 调用 {summary['jev_rag_calls']} 次；实际过滤证据片段 {interventions['rag_evidence_filtered']} 条。",

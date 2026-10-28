@@ -307,6 +307,7 @@ def test_execution_tools_require_confirmation_and_block_dangerous_commands(base:
 
     blocked = registry.call_approved("shell.execute_command", command="git reset --hard")
     assert not blocked.ok
+    assert blocked.error_code == "PERMISSION_DENIED"
 
     decision = assess_command("Remove-Item -Recurse C:/Temp/demo")
     assert decision.blocked

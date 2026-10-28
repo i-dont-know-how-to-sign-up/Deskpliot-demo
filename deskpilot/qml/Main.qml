@@ -4,6 +4,8 @@ import QtQuick.Layouts
 
 ApplicationWindow {
     id: window
+    property string emailSettingsError: ""
+    property string visionSettingsError: ""
     visible: true
     width: 1440
     height: 900
@@ -42,7 +44,13 @@ ApplicationWindow {
     Connections {
         target: deskPilot
         function onErrorRaised(message) {
-            errorText.text = message
+            errorText.text = message || "操作失败，请查看诊断信息。"
+            if (settingsDialog.visible) {
+                if (errorText.text.indexOf("视觉模型") >= 0)
+                    visionSettingsError = errorText.text
+                else
+                    emailSettingsError = errorText.text
+            }
             errorDialog.open()
         }
     }
@@ -208,6 +216,7 @@ ApplicationWindow {
                 Item { Layout.fillWidth: true }
                 Rectangle { implicitWidth: 9; implicitHeight: 9; radius: 4.5; color: deskPilot.status.indexOf("正在") === 0 ? theme.cyan : theme.purple }
                 Label { text: deskPilot.status; color: theme.muted; font.pixelSize: 12 }
+                SmallButton { text: "设置"; visible: deskPilot.releaseMode; onClicked: settingsDialog.open() }
             }
 
             PanelFrame {
@@ -627,12 +636,174 @@ ApplicationWindow {
     }
 
     Dialog {
+        id: settingsDialog
+        modal: true
+        onOpened: { window.emailSettingsError = ""; window.visionSettingsError = "" }
+        title: "DeskPilot 设置"
+        anchors.centerIn: parent
+        width: 560
+        height: 540
+        standardButtons: Dialog.Close
+        contentItem: ScrollView {
+            clip: true
+            ColumnLayout {
+                width: settingsDialog.availableWidth
+                spacing: 12
+                Label { text: "数据目录"; color: theme.muted; font.pixelSize: 12 }
+                TextField { text: deskPilot.releaseInfo.home || ""; readOnly: true; selectByMouse: true; Layout.fillWidth: true }
+                Label { text: "模型"; color: theme.muted; font.pixelSize: 12 }
+                TextField { id: releaseModel; text: deskPilot.releaseInfo.model || ""; Layout.fillWidth: true; Accessible.name: "模型名称" }
+                Label { text: "更换 API Key（留空则保持原值）"; color: theme.muted; font.pixelSize: 12 }
+                TextField { id: releaseKey; echoMode: TextInput.Password; Layout.fillWidth: true; Accessible.name: "模型 API Key" }
+                CheckBox { id: releaseCloud; text: "允许选中的图片上传到云端模型"; checked: deskPilot.releaseInfo.cloudImages || false }
+                RowLayout {
+                    SmallButton { text: "保存设置"; onClicked: { deskPilot.saveReleaseSettings(releaseModel.text, releaseKey.text, releaseCloud.checked); releaseKey.clear() } }
+                    Label { text: "设置变更重启后生效"; color: theme.muted; font.pixelSize: 11 }
+                }
+                Label { text: "视觉模型"; color: theme.muted; font.pixelSize: 12 }
+                TextField {
+                    id: releaseVisionModel
+                    text: deskPilot.releaseInfo.visionModel || "qwen-vl-max-latest"
+                    Layout.fillWidth: true
+                    Accessible.name: "视觉模型名称"
+                }
+                TextField {
+                    id: releaseVisionBaseUrl
+                    text: deskPilot.releaseInfo.visionBaseUrl || "https://dashscope.aliyuncs.com/compatible-mode/v1"
+                    Layout.fillWidth: true
+                    Accessible.name: "视觉模型 API 基础地址"
+                }
+                TextField {
+                    id: releaseVisionKey
+                    echoMode: TextInput.Password
+                    placeholderText: "视觉模型 API Key（留空保持原值）"
+                    Layout.fillWidth: true
+                    Accessible.name: "视觉模型 API Key"
+                }
+                SmallButton {
+                    text: "保存视觉模型设置"
+                    onClicked: {
+                        window.visionSettingsError = ""
+                        if (deskPilot.saveVisionSettings(releaseVisionModel.text, releaseVisionBaseUrl.text, releaseVisionKey.text))
+                            releaseVisionKey.clear()
+                    }
+                }
+                Label {
+                    visible: window.visionSettingsError.length > 0
+                    text: window.visionSettingsError
+                    color: theme.danger
+                    wrapMode: Text.Wrap
+                    Layout.fillWidth: true
+                    Accessible.name: "视觉模型设置错误"
+                }
+                Label { text: "邮箱"; color: theme.muted; font.pixelSize: 12 }
+                Label {
+                    visible: deskPilot.releaseInfo.vaultError || false
+                    text: "当前 Windows 用户无法解密已保存的凭据。请确认重置后重新输入模型 Key 和邮箱授权码。"
+                    color: theme.danger
+                    wrapMode: Text.Wrap
+                    Layout.fillWidth: true
+                }
+                ComboBox {
+                    id: releaseEmailProvider
+                    Layout.fillWidth: true
+                    model: ["mock", "qq", "163", "outlook"]
+                    Component.onCompleted: currentIndex = Math.max(0, model.indexOf(deskPilot.releaseInfo.emailProvider || "mock"))
+                    Accessible.name: "邮箱服务商"
+                }
+                TextField {
+                    id: releaseEmailUsername
+                    text: deskPilot.releaseInfo.emailUsername || ""
+                    placeholderText: "邮箱地址"
+                    Layout.fillWidth: true
+                    Accessible.name: "邮箱地址"
+                }
+                TextField {
+                    id: releaseEmailPassword
+                    echoMode: TextInput.Password
+                    placeholderText: "客户端授权码（留空保持原值）"
+                    Layout.fillWidth: true
+                    Accessible.name: "邮箱客户端授权码"
+                }
+                SmallButton {
+                    text: "保存邮箱设置"
+                    onClicked: {
+                        window.emailSettingsError = ""
+                        if (deskPilot.saveEmailSettings(releaseEmailProvider.currentText, releaseEmailUsername.text, releaseEmailPassword.text))
+                            releaseEmailPassword.clear()
+                    }
+                }
+                Label {
+                    visible: window.emailSettingsError.length > 0
+                    text: window.emailSettingsError
+                    color: theme.danger
+                    wrapMode: Text.Wrap
+                    Layout.fillWidth: true
+                    Accessible.name: "邮箱设置错误"
+                }
+                SmallButton {
+                    text: "重置本机凭据"
+                    ToolTip.visible: resetHover.hovered
+                    ToolTip.text: "仅用于当前 Windows 用户无法解密旧凭据时"
+                    HoverHandler { id: resetHover }
+                    onClicked: resetCredentialsDialog.open()
+                }
+                CheckBox {
+                    text: "登录后启动后台任务 worker"
+                    checked: deskPilot.releaseInfo.autostart || false
+                    onClicked: deskPilot.setWorkerAutostart(checked)
+                }
+                SmallButton { text: "导出诊断信息"; onClicked: deskPilot.exportDiagnostics() }
+                Label { text: "反馈（仅保存在本机，不自动上传）"; color: theme.muted; font.pixelSize: 12 }
+                TextArea {
+                    id: feedbackText
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 80
+                    wrapMode: TextEdit.Wrap
+                    placeholderText: "描述遇到的问题；请勿填写密码或私人正文"
+                }
+                SmallButton { text: "保存反馈"; enabled: feedbackText.text.trim().length > 0; onClicked: { deskPilot.saveFeedback(feedbackText.text); feedbackText.clear() } }
+            }
+        }
+    }
+
+    Dialog {
+        id: resetCredentialsDialog
+        modal: true
+        title: "重置本机凭据"
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        anchors.centerIn: parent
+        width: Math.min(480, window.width - 32)
+        background: Rectangle { color: theme.surface; border.color: theme.border; radius: 8 }
+        contentItem: Label {
+            text: "旧加密文件会保留；重置后需重新输入模型 API Key 和邮箱授权码。确认继续？"
+            color: theme.text
+            wrapMode: Text.Wrap
+            padding: 14
+        }
+        onAccepted: deskPilot.resetReleaseCredentials()
+    }
+
+    Dialog {
         id: errorDialog
+        objectName: "errorDialog"
         modal: true
         title: "操作失败"
         standardButtons: Dialog.Ok
         anchors.centerIn: parent
-        width: 480
-        contentItem: Label { id: errorText; color: theme.text; wrapMode: Text.Wrap; padding: 14 }
+        width: Math.min(520, window.width - 32)
+        height: 220
+        background: Rectangle { color: theme.surface; border.color: theme.border; radius: 8 }
+        contentItem: TextArea {
+            id: errorText
+            objectName: "errorText"
+            readOnly: true
+            selectByMouse: true
+            wrapMode: TextEdit.Wrap
+            color: theme.text
+            background: Rectangle { color: "transparent" }
+            padding: 14
+            implicitHeight: Math.min(220, Math.max(72, contentHeight + 28))
+        }
     }
 }

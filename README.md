@@ -262,6 +262,12 @@ PADDLE_PDX_CACHE_HOME=D:\broagent\.cache\paddlex
 
 模型缓存目录、`.env` 和运行时索引均已排除在 Git 之外，不应提交。
 
+### Windows 桌面 Beta（P0/P1）
+
+已有便携目录和 Inno Setup 用户级安装器的构建脚本。发布模式将数据放在用户配置目录，首次启动配置模型 Key 与授权工作区；Key 存入 Windows DPAPI，备份采用口令加密且仅恢复到新目录。桌面设置提供邮箱配置、诊断导出、本地反馈和可选后台 worker 登录自启动。**基础包默认禁用任意 Python/Shell 执行**；它没有系统沙箱，不应处理无人值守的高风险操作。
+
+在干净的 Windows Python 3.11 构建环境中安装 `requirements-desktop.lock`，运行 `packaging/build_windows.ps1 -Installer`。构建/备份/干净机器验收与已知限制见 [release/README.md](deskpilot/release/README.md)。安装包的生成不等于生产上线；同配置 API/VLM 基线、真实邮箱及独立机器升级/回滚仍需验收。
+
 ## 配置
 
 复制配置模板：
@@ -321,12 +327,15 @@ RAG_MMR_LAMBDA=0.72
 
 ```env
 JEV_MODE=off
+JEV_PROVIDER=openrouter
 OPENROUTER_API_KEY=
 JEV_MODEL=typesafe/jev-1.13
 JEV_ALLOW_DOCUMENT_TEXT=false
 ```
 
-默认不调用 Jev。可先设 `shadow` 对照观察，再在同一数据集上测试 `gated`；只有高置信的无副作用直接回答可跳过原 Router，其他请求仍走现有链路。RAG 片段发送到 OpenRouter 前，必须自行评估文档敏感性并显式设置 `JEV_ALLOW_DOCUMENT_TEXT=true`。完整阈值、超时和候选上限见 `.env.example`；这两个门控不是权限审批，也不代替结果引用校验。
+默认不调用 Jev。可先设 `shadow` 对照观察，再在同一数据集上测试 `gated`；只有高置信的无副作用直接回答可跳过原 Router，其他请求仍走现有链路。RAG 片段发送到外部 Jev 服务前，必须自行评估文档敏感性并显式设置 `JEV_ALLOW_DOCUMENT_TEXT=true`。完整阈值、超时和候选上限见 `.env.example`；这两个门控不是权限审批，也不代替结果引用校验。
+
+若 OpenRouter 的 Jev 因地区限制返回 403，可选用 Netlify Function 桥接：将 `netlify/functions/jev.mjs` 部署到自己的 Netlify 站点，在站点环境变量设置随机的 `NETLIFY_JEV_BRIDGE_TOKEN`；本地 `.env` 设置 `JEV_PROVIDER=netlify`、`NETLIFY_JEV_ENDPOINT=https://<your-site>.netlify.app/api/jev` 和相同的 `NETLIFY_JEV_TOKEN`。桥接令牌用于保护公开 Function，不是 TypeSafe API Key；不要提交任何令牌。Function 按用户提供的 `@typesafe-ai/sdk` `systemOne` 示例编写，未通过官方文档或真实站点验证 SDK/网关的自动注入行为，部署后应先用少量 `shadow` 用例确认返回 typed answers，再考虑 `gated`。Netlify 模式由 SDK 的 `systemOne` 选择模型，`JEV_MODEL` 仅用于 OpenRouter；报告里的 `netlify/systemOne` 不是经验证的模型 ID。若 Netlify 侧仍受上游地域或模型权限限制，不会自动回退 OpenRouter。项目当前 `package.json` 使用 SDK 的 `latest` 标签作为待验证占位，实际部署前请确认包存在并锁定可用版本。这里使用的是**自建 Function 桥接**，并非已证实存在的 Netlify 原生 Jev decisions HTTP 端点。
 
 ### 多模态配置
 

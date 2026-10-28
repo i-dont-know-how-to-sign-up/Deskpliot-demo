@@ -115,6 +115,19 @@ def test_offline_fallback_routes_explicit_web_command() -> None:
     assert decision.tool_name == "web.research"
 
 
+def test_offline_fallback_sends_destructive_command_to_policy() -> None:
+    tools = [{"name": "shell.execute_command", "parameters": []}]
+    router = IntentRouter(FakeClient(""))
+
+    decision = router.route("执行 rm -rf C:\\temp。", tools)
+    discussion = router.route("请解释为什么执行 rm -rf 是危险的。", tools)
+
+    assert decision.mode == "tool_call"
+    assert decision.tool_name == "shell.execute_command"
+    assert decision.arguments["command"] == r"rm -rf C:\temp"
+    assert discussion.mode == "direct_answer"
+
+
 def test_offline_fallback_extracts_named_local_document() -> None:
     tools = [{"name": "files.read_document", "parameters": []}]
 

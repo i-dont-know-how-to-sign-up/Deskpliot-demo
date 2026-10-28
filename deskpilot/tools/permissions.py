@@ -170,6 +170,10 @@ def assess_file_move(
 
 def assess_python_code(code: str) -> PermissionDecision:
     """阻断明显危险的 Python 语法；该检查是加固层，不是进程沙箱。"""
+    if os.getenv("DESKPILOT_RELEASE_MODE") == "1":
+        return PermissionDecision(False, False, True, BLOCKED, [
+            "Arbitrary Python execution is disabled in the desktop beta until an OS sandbox is validated."
+        ])
     try:
         tree = ast.parse(str(code))
     except SyntaxError as exc:
@@ -225,9 +229,18 @@ def assess_python_code(code: str) -> PermissionDecision:
     ])
 
 
+def is_blocked_command_syntax(command: str | list[str] | tuple[str, ...]) -> bool:
+    command_text = _command_to_text(command)
+    return bool(_blocked_command_reason(command_text) or _blocked_readonly_command_option_reason(command_text))
+
+
 def assess_command(
     command: str | list[str] | tuple[str, ...], operation: str = "execute", cwd: str | Path | None = None
 ) -> PermissionDecision:
+    if os.getenv("DESKPILOT_RELEASE_MODE") == "1":
+        return PermissionDecision(False, False, True, BLOCKED, [
+            "Shell execution is disabled in the desktop beta until an OS sandbox is validated."
+        ])
     command_text = _command_to_text(command)
     blocked_reason = _blocked_command_reason(command_text)
     if not blocked_reason:
@@ -395,7 +408,10 @@ def safe_roots(additional_safe_roots: list[str | Path] | None = None) -> list[Pa
     roots: list[Path] = []
     if raw.strip():
         roots.extend(_resolve(item) for item in raw.split(";") if item.strip())
-    roots.extend([ROOT_DIR, WORKSPACE_DIR])
+    if os.getenv("DESKPILOT_RELEASE_MODE") == "1":
+        roots.append(WORKSPACE_DIR)
+    else:
+        roots.extend([ROOT_DIR, WORKSPACE_DIR])
     if additional_safe_roots:
         roots.extend(_resolve(root) for root in additional_safe_roots)
     deduped: list[Path] = []

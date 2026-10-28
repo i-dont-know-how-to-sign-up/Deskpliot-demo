@@ -1,0 +1,13 @@
+# Direct dependencies for the basic Windows desktop build. Generate the pinned
+# transitive constraints with packaging/freeze_desktop.py in a clean Python 3.11 environment.
+PySide6
+PyMuPDF
+pypdf
+Pillow
+requests
+playwright
+mcp
+pywin32; platform_system == "Windows"
+PyInstaller; platform_system == "Windows"
+cryptography
+fastapi

@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from .core.agent import DocumentQAAgent
-from .core.config import ROOT_DIR, ensure_dirs
+from .core.config import ROOT_DIR, WORKSPACE_DIR, ensure_dirs
+from .release.profile import release_mode
 from .rag.vector_index import DocumentIndex
 
 try:
@@ -100,11 +101,13 @@ class DeskPilotBridge(QObject):
     contextChanged = Signal()
     tasksChanged = Signal()
     pendingAttachmentsChanged = Signal()
+    releaseInfoChanged = Signal()
     confirmRequested = Signal(str, str, str)
     errorRaised = Signal(str)
     _resultReady = Signal(object)
     _streamEvent = Signal(object)
     _indexReady = Signal(str)
+    _indexProgress = Signal(str)
     _errorReady = Signal(str)
     _taskResultReady = Signal(str, object)
     _taskErrorReady = Signal(str, str)
@@ -127,14 +130,18 @@ class DeskPilotBridge(QObject):
         self._busy = False
         self._context = ""
         self._live_stream_received = False
+        self._stream_buffer = ""
+        self._stream_closed = False
         self._pending_action: dict[str, Any] | None = None
         self._pending_attachments: list[dict[str, Any]] = []
         self._tasks: list[dict[str, Any]] = []
         self._visible_task_id = ""
+        self._release_info: dict[str, Any] = {}
         # 所有后台任务都通过 signal 回到 Qt 主线程，再更新 QML 属性。
         self._resultReady.connect(self._start_stream)
         self._streamEvent.connect(self._handle_stream_event)
         self._indexReady.connect(self._index_finished)
+        self._indexProgress.connect(self._index_progress)
         self._errorReady.connect(self._background_failed)
         self._taskResultReady.connect(self._handle_task_result)
         self._taskErrorReady.connect(self._handle_task_error)
@@ -146,8 +153,13 @@ class DeskPilotBridge(QObject):
         self._task_timer.setInterval(750)
         self._task_timer.timeout.connect(self.refreshTasks)
         self._task_timer.start()
+        self._stream_timer = QTimer(self)
+        self._stream_timer.setSingleShot(True)
+        self._stream_timer.setInterval(40)
+        self._stream_timer.timeout.connect(self._flush_stream)
         self._refresh_all()
         self._load_session_messages()
+        self._refresh_release_info()
 
     def _get(self, name: str) -> Any:
         return getattr(self, f"_{name}")
@@ -165,6 +177,185 @@ class DeskPilotBridge(QObject):
     pendingAttachments = Property(
         "QVariantList", lambda self: self._pending_attachments, notify=pendingAttachmentsChanged
     )
+    releaseMode = Property(bool, lambda self: release_mode(), constant=True)
+    releaseInfo = Property("QVariantMap", lambda self: getattr(self, "_release_info", {}), notify=releaseInfoChanged)
+
+    def _refresh_release_info(self) -> None:
+        if not release_mode():
+            return
+        from .release.profile import profile_home, read_settings
+        from .release.autostart import autostart_enabled
+        from .release.secrets import SecretStore
+
+        home = profile_home()
+        settings = read_settings(home)
+        vault_error = False
+        try:
+            vault = SecretStore(home / "secrets.dpapi")
+            if vault.path.exists():
+                vault.get("DASHSCOPE_API_KEY")
+        except (ImportError, OSError, RuntimeError, ValueError):
+            vault_error = True
+        self._release_info = {
+            "home": str(home),
+            "model": settings.get("QWEN_MODEL", "qwen3.7-plus"),
+            "visionModel": settings.get("VISION_MODEL", "qwen-vl-max-latest"),
+            "visionBaseUrl": settings.get("VISION_BASE_URL", settings.get("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")),
+            "cloudImages": settings.get("ALLOW_CLOUD_IMAGE_UPLOAD", "false") == "true",
+            "autostart": autostart_enabled() if sys.platform == "win32" else False,
+            "emailProvider": settings.get("EMAIL_PROVIDER", "mock"),
+            "emailUsername": settings.get("EMAIL_USERNAME", ""),
+            "vaultError": vault_error,
+        }
+        self.releaseInfoChanged.emit()
+
+    @Slot(str, str, bool)
+    def saveReleaseSettings(self, model: str, api_key: str, cloud_images: bool) -> None:
+        if not release_mode() or self._busy:
+            return
+        from .release.profile import profile_home, read_settings, save_settings
+        from .release.secrets import SecretStore
+
+        model = model.strip()
+        if not model:
+            self.errorRaised.emit("模型名称不能为空。")
+            return
+        try:
+            home = profile_home()
+            settings = read_settings(home)
+            settings.update({"QWEN_MODEL": model, "ALLOW_CLOUD_IMAGE_UPLOAD": "true" if cloud_images else "false"})
+            if api_key.strip():
+                SecretStore(home / "secrets.dpapi").set("DASHSCOPE_API_KEY", api_key.strip())
+            save_settings(settings, home)
+            self._refresh_release_info()
+            self._set_status("设置已保存；重启后生效")
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.errorRaised.emit(str(exc))
+
+    @Slot(bool)
+    def setWorkerAutostart(self, enabled: bool) -> None:
+        if not release_mode():
+            return
+        from .release.autostart import set_autostart
+
+        try:
+            set_autostart(enabled)
+            self._refresh_release_info()
+            self._set_status("后台 worker 登录自启动已更新")
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.errorRaised.emit(str(exc))
+
+    @Slot(str, str, str, result=bool)
+    def saveVisionSettings(self, model: str, base_url: str, api_key: str) -> bool:
+        if not release_mode():
+            self.errorRaised.emit("视觉模型设置仅在发布模式中可用。")
+            return False
+        if self._busy:
+            self.errorRaised.emit("当前任务仍在运行，请等待任务完成后再保存视觉模型设置。")
+            return False
+        from urllib.parse import urlsplit
+        from .release.profile import profile_home, read_settings, save_settings
+        from .release.secrets import SecretStore
+
+        model = model.strip()
+        base_url = base_url.strip().rstrip("/")
+        parsed = urlsplit(base_url)
+        if not model or not base_url or parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            self.errorRaised.emit("请填写视觉模型名称和 HTTPS API 基础地址，地址不能包含账号、查询参数或片段。")
+            return False
+        try:
+            home = profile_home()
+            settings = read_settings(home)
+            settings.update({"VISION_MODEL": model, "VISION_BASE_URL": base_url})
+            if api_key.strip():
+                SecretStore(home / "secrets.dpapi").set("VISION_API_KEY", api_key.strip())
+            save_settings(settings, home)
+            self._refresh_release_info()
+            self._set_status("视觉模型设置已保存；重启后生效")
+            return True
+        except (ImportError, OSError, RuntimeError, ValueError) as exc:
+            self.errorRaised.emit(f"视觉模型设置保存失败：{exc}")
+            return False
+
+    @Slot(str, str, str, result=bool)
+    def saveEmailSettings(self, provider: str, username: str, password: str) -> bool:
+        if not release_mode():
+            self.errorRaised.emit("邮箱设置仅在发布模式中可用。")
+            return False
+        if self._busy:
+            self.errorRaised.emit("当前任务仍在运行，请等待任务完成后再保存邮箱设置。")
+            return False
+        from .release.profile import profile_home, read_settings, save_settings
+        from .release.secrets import SecretStore
+
+        provider = provider.strip().lower()
+        if provider not in {"mock", "qq", "163", "outlook"}:
+            self.errorRaised.emit("不支持的邮箱服务商。")
+            return False
+        if provider != "mock" and (not username.strip() or "@" not in username):
+            self.errorRaised.emit("请填写有效的邮箱地址。")
+            return False
+        try:
+            home = profile_home()
+            settings = read_settings(home)
+            account = username.strip()
+            if provider != "mock" and not password.strip():
+                saved_password = SecretStore(home / "secrets.dpapi").get("EMAIL_PASSWORD")
+                if not saved_password or settings.get("EMAIL_PROVIDER") != provider or settings.get("EMAIL_USERNAME") != account:
+                    raise ValueError("新邮箱账号必须填写客户端授权码；留空仅适用于原邮箱账号不变且已有可读取的授权码。")
+            settings.update({"EMAIL_PROVIDER": provider, "EMAIL_USERNAME": account})
+            if password.strip():
+                SecretStore(home / "secrets.dpapi").set("EMAIL_PASSWORD", password.strip())
+            save_settings(settings, home)
+            self._refresh_release_info()
+            self._set_status("邮箱设置已保存；重启后生效")
+            return True
+        except Exception as exc:
+            detail = str(exc) or type(exc).__name__
+            self._set_status("邮箱设置保存失败")
+            self.errorRaised.emit(f"邮箱设置保存失败：{detail}")
+            return False
+
+    @Slot()
+    def resetReleaseCredentials(self) -> None:
+        if not release_mode() or self._busy:
+            return
+        from .release.profile import profile_home
+        from .release.secrets import SecretStore
+
+        try:
+            previous = SecretStore(profile_home() / "secrets.dpapi").reset()
+            detail = f"；旧文件保留为 {previous.name}" if previous else ""
+            self._set_status("凭据已重置，需重新填写模型 Key 和邮箱授权码" + detail)
+        except Exception as exc:
+            self.errorRaised.emit(str(exc) or type(exc).__name__)
+
+    @Slot()
+    def exportDiagnostics(self) -> None:
+        if not release_mode():
+            return
+        from .release.diagnostics import export_diagnostics
+        from .release.profile import profile_home
+
+        path, _ = QFileDialog.getSaveFileName(None, "导出诊断信息", str(profile_home() / "diagnostics.json"), "JSON (*.json)")
+        if path:
+            try:
+                export_diagnostics(Path(path))
+                self._set_status("诊断信息已导出")
+            except (OSError, RuntimeError, ValueError) as exc:
+                self.errorRaised.emit(str(exc))
+
+    @Slot(str)
+    def saveFeedback(self, description: str) -> None:
+        if not release_mode():
+            return
+        from .release.feedback import save_local_feedback
+
+        try:
+            save_local_feedback(description)
+            self._set_status("反馈已保存在本机，未自动上传")
+        except (OSError, ValueError) as exc:
+            self.errorRaised.emit(str(exc))
 
     def _set_status(self, value: str) -> None:
         self._status = value
@@ -185,6 +376,8 @@ class DeskPilotBridge(QObject):
             self.busyChanged.emit()
 
     def _background_failed(self, message: str) -> None:
+        if self._messages and self._messages[-1].get("role") == "assistant":
+            self._update_last_message(f"操作失败：{message}")
         self._end_operation()
         self._set_status("操作失败")
         self.errorRaised.emit(message)
@@ -292,6 +485,8 @@ class DeskPilotBridge(QObject):
 
     def _start_stream(self, result: Any) -> None:
         """收束真实流式结果；不再对完整回答做二次打字机动画。"""
+        self._flush_stream()
+        self._stream_closed = True
         self.current_session_id = result.session_id or self.current_session_id
         final_text = str(getattr(result, "answer", getattr(result, "report", "")))
         self._update_last_message(final_text)
@@ -310,14 +505,17 @@ class DeskPilotBridge(QObject):
         event_type = str(event.get("type", ""))
         stage = str(event.get("stage", "Model"))
         if event_type == "token":
+            if self._stream_closed:
+                return
             delta = str(event.get("text", ""))
             if not delta:
                 return
             if not self._live_stream_received:
                 self._live_stream_received = True
                 self._update_last_message("")
-            current = self._messages[-1].get("content", "") if self._messages else ""
-            self._update_last_message(current + delta)
+            self._stream_buffer += delta
+            if not self._stream_timer.isActive():
+                self._stream_timer.start()
             self._set_status(f"正在生成 / {stage}")
             return
         if event_type == "model_start":
@@ -327,6 +525,13 @@ class DeskPilotBridge(QObject):
             ok = event.get("ok") is True
             detail = "模型调用完成。" if ok else f"模型调用失败：{event.get('error', '')}"
             self._upsert_runtime_step(stage, "success" if ok else "failed", detail)
+
+    def _flush_stream(self) -> None:
+        if not self._stream_buffer:
+            return
+        current = self._messages[-1].get("content", "") if self._messages else ""
+        self._update_last_message(current + self._stream_buffer)
+        self._stream_buffer = ""
 
     def _upsert_runtime_step(self, stage: str, status: str, detail: str) -> None:
         name = f"model:{stage}"
@@ -371,6 +576,9 @@ class DeskPilotBridge(QObject):
         self._steps = []
         self._evidences = []
         self._live_stream_received = False
+        self._stream_closed = False
+        self._stream_buffer = ""
+        self._stream_timer.stop()
         self.stepsChanged.emit()
         self.evidencesChanged.emit()
         self._set_messages(self._messages + [
@@ -389,6 +597,9 @@ class DeskPilotBridge(QObject):
             self._errorReady.emit(str(exc))
 
     def _handle_task_result(self, task_id: str, result: Any) -> None:
+        self._stream_timer.stop()
+        self._stream_buffer = ""
+        self._stream_closed = True
         self.refreshTasks()
         if isinstance(result, list):
             self._index_finished(f"多模态入库完成：{len(result)} 页/图片，复用 {sum(bool(item.get('checkpoint_reused')) for item in result)} 个检查点")
@@ -405,10 +616,23 @@ class DeskPilotBridge(QObject):
         self._end_operation()
 
     def _handle_task_error(self, task_id: str, error: str) -> None:
+        self._stream_timer.stop()
+        self._stream_buffer = ""
+        self._stream_closed = True
         self.refreshTasks()
-        self._end_operation()
         task = self.agent.task_ledger.store.get_task(task_id)
         state = task["status"] if task else "failed"
+        if task and task.get("session_id") == self.current_session_id and state not in {"paused", "cancelled"}:
+            answer = f"任务失败：{error or '请在 Tasks 中查看失败原因。'}"
+            messages = self.agent.session_store.read_messages(self.current_session_id)
+            if messages and messages[-1].role == "user":
+                self.agent.session_store.append_message(
+                    self.current_session_id, "assistant", answer,
+                    metadata={"steps": [{"name": "task_error", "status": "failed", "detail": error}],
+                              "task_id": task_id},
+                )
+            self._load_session_messages()
+        self._end_operation()
         self._set_status({"paused": "任务已暂停", "cancelled": "任务已取消"}.get(state, "任务失败，请查看 Tasks"))
         if state not in {"paused", "cancelled"}:
             self.errorRaised.emit(error)
@@ -640,7 +864,7 @@ class DeskPilotBridge(QObject):
         if not self._begin_operation("正在建立索引"):
             return
         path, _ = QFileDialog.getOpenFileName(
-            None, "选择文档或图片", str(ROOT_DIR),
+            None, "选择文档或图片", str(WORKSPACE_DIR if release_mode() else ROOT_DIR),
             "Documents and images (*.pdf *.docx *.pptx *.xlsx *.csv *.md *.txt *.png *.jpg *.jpeg *.webp);;All files (*)"
         )
         if path:
@@ -652,7 +876,7 @@ class DeskPilotBridge(QObject):
     def chooseIndexFolder(self) -> None:
         if not self._begin_operation("正在建立索引"):
             return
-        path = QFileDialog.getExistingDirectory(None, "选择文件夹", str(ROOT_DIR))
+        path = QFileDialog.getExistingDirectory(None, "选择文件夹", str(WORKSPACE_DIR if release_mode() else ROOT_DIR))
         if path:
             threading.Thread(target=self._index_folder, args=(Path(path),), daemon=True).start()
         else:
@@ -676,7 +900,7 @@ class DeskPilotBridge(QObject):
         if self._busy:
             return
         paths, _ = QFileDialog.getOpenFileNames(
-            None, "选择图片", str(ROOT_DIR), "Images (*.png *.jpg *.jpeg *.webp)"
+            None, "选择图片", str(WORKSPACE_DIR if release_mode() else ROOT_DIR), "Images (*.png *.jpg *.jpeg *.webp)"
         )
         if not paths:
             return
@@ -745,11 +969,19 @@ class DeskPilotBridge(QObject):
 
     def _index_folder(self, path: Path) -> None:
         try:
-            results = self.index.add_folder(path)
+            results = self.index.add_folder(path, progress=lambda done, total, file, trace:
+                self._indexProgress.emit(
+                    f"索引 {done}/{total} · {file.name} · {trace.get('duration_ms', 0)} ms"
+                ))
             detail = "\n".join(f"{document.title}: {count} 个片段" for document, count in results)
             self._indexReady.emit(detail or "没有找到支持的文档。")
         except Exception as exc:
             self._errorReady.emit(str(exc))
+
+    def _index_progress(self, detail: str) -> None:
+        self._set_status(detail)
+        self._steps = [{"name": "index_documents", "status": "running", "detail": detail}]
+        self.stepsChanged.emit()
 
     def _index_finished(self, detail: str) -> None:
         self._end_operation()
@@ -807,7 +1039,7 @@ class DeskPilotBridge(QObject):
 def main() -> int:
     # 原生 Windows Style 不支持自定义控件背景，统一使用可定制的 Fusion。
     QQuickStyle.setStyle("Fusion")
-    app = QApplication(sys.argv)
+    app = QApplication.instance() or QApplication(sys.argv)
     # Windows 中文办公场景优先使用系统常见字体，避免默认字体缺字显示方框。
     app.setFont(QFont("Microsoft YaHei UI", 10))
     engine = QQmlApplicationEngine()
@@ -818,6 +1050,8 @@ def main() -> int:
     engine.load(QUrl.fromLocalFile(str(qml_path)))
     if not engine.rootObjects():
         return 1
+    if "--smoke-ui" in sys.argv:
+        QTimer.singleShot(200, app.quit)
     return app.exec()
 
 

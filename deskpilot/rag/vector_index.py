@@ -7,6 +7,7 @@ import re
 import sys
 from pathlib import Path
 from time import perf_counter
+from typing import Callable
 
 from .catalog import RagCatalog
 from .chunker import CHUNKER_VERSION, ChunkingConfig, chunk_document_with_metadata
@@ -56,7 +57,7 @@ class DocumentIndex:
             "chunks": {chunk_id: chunk.to_dict() for chunk_id, chunk in self.chunks.items()},
         }
         temporary = self.index_file.with_suffix(self.index_file.suffix + ".tmp")
-        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
         temporary.replace(self.index_file)
 
     def clear(self) -> None:
@@ -88,11 +89,13 @@ class DocumentIndex:
             return self.documents[unchanged_id], count
 
         self._embedding_space = configured_space
+        chunking_started = perf_counter()
         result = chunk_document_with_metadata(
             document,
             config=self.chunking_config,
             embed_sentences=self._embed_cached,
         )
+        chunking_ms = round((perf_counter() - chunking_started) * 1000, 3)
         parsed_chunks = result.chunks
         chunks = [chunk for chunk in parsed_chunks if not is_probably_garbled(chunk.text)]
         skipped = len(parsed_chunks) - len(chunks)
@@ -106,7 +109,9 @@ class DocumentIndex:
             "chunking_stats": result.stats,
             "embedding_space": self._embedding_space,
         })
+        embedding_started = perf_counter()
         embeddings = self._embed_cached([chunk.text for chunk in chunks]) if chunks else []
+        embedding_ms = round((perf_counter() - embedding_started) * 1000, 3)
         document.metadata["embedding_space"] = self._embedding_space
         for chunk, embedding in zip(chunks, embeddings):
             chunk.embedding = embedding
@@ -129,6 +134,7 @@ class DocumentIndex:
         self.documents[document.doc_id] = document
         for chunk in chunks:
             self.chunks[chunk.chunk_id] = chunk
+        commit_started = perf_counter()
         self.catalog.commit_document(
             document,
             chunks,
@@ -138,7 +144,10 @@ class DocumentIndex:
             chunker_version=CHUNKER_VERSION,
             embedding_space=self._embedding_space,
         )
+        catalog_ms = round((perf_counter() - commit_started) * 1000, 3)
+        save_started = perf_counter()
         self.save()
+        save_ms = round((perf_counter() - save_started) * 1000, 3)
         self.last_index_trace = {
             "status": "indexed",
             "doc_id": document.doc_id,
@@ -148,14 +157,23 @@ class DocumentIndex:
             "chunks": len(chunks),
             "skipped_low_quality": skipped,
             "embedding_space": self._embedding_space,
+            "chunking_ms": chunking_ms,
+            "embedding_ms": embedding_ms,
+            "catalog_ms": catalog_ms,
+            "save_ms": save_ms,
             "duration_ms": round((perf_counter() - started) * 1000, 3),
         }
         return document, len(chunks)
 
-    def add_folder(self, folder: Path) -> list[tuple[Document, int]]:
+    def add_folder(self, folder: Path,
+                   progress: Callable[[int, int, Path, dict[str, object]], None] | None = None
+                   ) -> list[tuple[Document, int]]:
         results: list[tuple[Document, int]] = []
-        for path in scan_supported_files(folder):
+        paths = list(scan_supported_files(folder))
+        for number, path in enumerate(paths, start=1):
             results.append(self.add_file(path))
+            if progress is not None:
+                progress(number, len(paths), path, dict(self.last_index_trace))
         return results
 
     def search(self, query: str, top_k: int = 5) -> list[Evidence]:
@@ -281,6 +299,18 @@ class DocumentIndex:
             alias_match = any(alias in query_tokens for alias in aliases)
             if exact_phrase or compact_variant or alias_match:
                 matches.add(doc_id)
+        if len(matches) > 1:
+            for short_id in list(matches):
+                short_title = re.sub(r"[^a-z0-9]+", " ", Path(self.documents[short_id].title).stem.casefold()).strip()
+                for long_id in matches:
+                    if long_id == short_id:
+                        continue
+                    long_title = re.sub(r"[^a-z0-9]+", " ", Path(self.documents[long_id].title).stem.casefold()).strip()
+                    if long_title.startswith(short_title + " "):
+                        remainder = padded_query.replace(f" {long_title} ", " ")
+                        if f" {short_title} " not in remainder:
+                            matches.discard(short_id)
+                            break
         return matches
 
     # 保留内部兼容入口，避免已有扩展代码因方法改名失效。
@@ -293,7 +323,9 @@ class DocumentIndex:
         for chunk in self.chunks.values():
             grouped.setdefault(chunk.doc_id, []).append(chunk)
         starts: dict[str, int] = {}
-        pattern = re.compile(r"(?i)\b(?:references|bibliography)\b\s*(?:\[\d+\]|$)|参考文献")
+        pattern = re.compile(
+            r"(?i)\b(?:references|bibliography)\b\s*(?:\[\d+\]|$|[A-Z][A-Za-z-]+,\s+[A-Z]\.)|参考文献"
+        )
         for doc_id, chunks in grouped.items():
             ordered = sorted(chunks, key=lambda item: item.position)
             midpoint = ordered[len(ordered) // 2].position

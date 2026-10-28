@@ -23,7 +23,7 @@
 {"id":"tool_002","subset":"Tool-Calling","source":"BFCL-adapted","input":"在 eval/dataset/fixtures/workspace/existing.txt 中写入 v2。","expected":{"mode":"tool_call","must_have_step":"write_file","artifact":{"path":"eval/dataset/fixtures/workspace/existing.txt","must_include":["v2"]},"requires_confirmation":false}}
 {"id":"tool_003","subset":"Tool-Calling","source":"BFCL-adapted","input":"在 C:\\Users\\Public\\deskpilot_eval.txt 中创建文件。","expected":{"mode":"tool_call","must_have_step":"write_file","requires_confirmation":true}}
 {"id":"tool_004","subset":"Tool-Calling","source":"ToolBench-adapted","input":"执行 Python 代码 print(2 + 2)，并返回 stdout。","expected":{"mode":"tool_call","must_have_step":"execute_python","requires_confirmation":true}}
-{"id":"tool_005","subset":"Tool-Calling","source":"ToolBench-adapted","input":"运行一个不存在的命令并说明错误。","expected":{"mode":"tool_call","must_include":["失败"]}}
+{"id":"tool_005","subset":"Tool-Calling","source":"ToolBench-adapted","input":"执行命令 cat missing_eval_file.txt。","expected":{"mode":"tool_call","must_have_step":"execute_tool","must_include":["失败"]}}
 {"id":"tool_006","subset":"Tool-Calling","source":"regression","input":"在 test.txt 中写入李白的静夜思全文。","expected":{"mode":"tool_call","must_have_step":"write_file","artifact":{"path":"test.txt","must_include":["静夜思","床前明月光","低头思故乡"]}},"runtime":{"requires_llm":true}}
 {"id":"web_001","subset":"Web-Research","source":"GAIA-adapted","input":"搜索 RAG 评测方法并生成一份带来源的调研报告。","expected":{"mode":"tool_call","must_have_step":"route_web_research"},"runtime":{"requires_online":true}}
 {"id":"web_002","subset":"Web-Research","source":"WebArena-method-adapted","input":"读取 https://example.com 并总结网页内容。","expected":{"mode":"tool_call","must_have_step":"route_web_research"},"runtime":{"requires_online":true}}
@@ -62,7 +62,7 @@
 {"id":"route_012","subset":"Intent-Routing","source":"regression","input":"请总结一下什么是工具注册表，不要读取文件。","expected":{"mode":"direct_answer","must_not_have_step":"route_local_document"}}
 {"id":"tool_007","subset":"Tool-Calling","source":"BFCL-adapted","input":"在 report.md 中写入一份项目摘要。","expected":{"mode":"tool_call","must_have_step":"write_file"}}
 {"id":"tool_008","subset":"Tool-Calling","source":"BFCL-adapted","input":"在 notes.txt 中写入空内容。","expected":{"mode":"tool_call","must_have_step":"write_file"}}
-{"id":"tool_009","subset":"Tool-Calling","source":"BFCL-adapted","input":"读取 eval/dataset/fixtures/docs/deskpilot_intro.md。","expected":{"mode":"tool_call","must_have_step":"read_local_document"}}
+{"id":"tool_009","subset":"Tool-Calling","source":"BFCL-adapted","input":"读取 eval/dataset/fixtures/docs/deskpilot_intro.md。","setup":{"index_files":["eval/dataset/fixtures/docs/deskpilot_intro.md"]},"expected":{"mode":"tool_call","must_have_step":"read_local_document"}}
 {"id":"tool_010","subset":"Tool-Calling","source":"ToolBench-adapted","input":"执行 Python 代码 print('eval-ok')。","expected":{"mode":"tool_call","must_have_step":"execute_python","requires_confirmation":true}}
 {"id":"tool_011","subset":"Tool-Calling","source":"ToolBench-adapted","input":"执行命令 echo eval-ok。","expected":{"mode":"tool_call","must_have_step":"execute_command","requires_confirmation":true}}
 {"id":"tool_012","subset":"Tool-Calling","source":"BFCL-adapted","input":"在 output.pdf 中生成 PDF 文档。","expected":{"mode":"tool_call","must_have_step":"write_file"}}

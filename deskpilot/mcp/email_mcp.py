@@ -536,7 +536,9 @@ class EmailMCPService:
             "outlook": ("outlook.office365.com", "smtp.office365.com"),
         }
         imap_host, smtp_host = preset.get(provider, (os.getenv("EMAIL_IMAP_HOST", ""), os.getenv("EMAIL_SMTP_HOST", "")))
-        required = {"EMAIL_USERNAME": os.getenv("EMAIL_USERNAME"), "EMAIL_PASSWORD": os.getenv("EMAIL_PASSWORD"), "EMAIL_IMAP_HOST": imap_host, "EMAIL_SMTP_HOST": smtp_host}
+        from ..release.secrets import secret_value
+
+        required = {"EMAIL_USERNAME": os.getenv("EMAIL_USERNAME"), "EMAIL_PASSWORD": secret_value("EMAIL_PASSWORD"), "EMAIL_IMAP_HOST": imap_host, "EMAIL_SMTP_HOST": smtp_host}
         missing = [key for key, value in required.items() if not value]
         if missing:
             raise RuntimeError(f"Missing email configuration: {', '.join(missing)}")

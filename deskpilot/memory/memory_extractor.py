@@ -22,6 +22,9 @@ class MemoryExtractor:
         *,
         grounded: bool = False,
     ) -> list[dict]:
+        self_fact = self._extract_self_description(user_message, session_id, source_message_ids)
+        if self_fact:
+            return [self_fact]
         llm_items = self._extract_with_llm(user_message, assistant_message, grounded=grounded)
         if llm_items:
             items = [
@@ -35,6 +38,27 @@ class MemoryExtractor:
             ]
             return [self._apply_grounding_policy(item, grounded=grounded) for item in items]
         return self._extract_with_rules(user_message, assistant_message, session_id, source_message_ids)
+
+    def _extract_self_description(self, user_message: str, session_id: str,
+                                  source_message_ids: list[str]) -> dict | None:
+        text = fix_mojibake(user_message).strip()
+        if self._is_sensitive(text) or self._should_not_remember(text):
+            return None
+        match = re.match(r"^我是(?:一名|一个|一位|名|个|位)?(?P<identity>[^，,。？！?\n]{2,60})(?:[，,。？！?\n]|$)", text)
+        if not match:
+            return None
+        identity = match.group("identity").strip()
+        return self._make_item(
+            "user", "fact", f"用户自述身份或职业：{identity}", 0.88,
+            ["self_report", "topic:user_role"], session_id, source_message_ids,
+        )
+
+    def extract_artifacts(self, user_message: str, assistant_message: str,
+                          session_id: str, source_message_ids: list[str]) -> list[dict]:
+        """Persist completed artifact references without a second LLM request."""
+        return [item for item in self._extract_with_rules(
+            user_message, assistant_message, session_id, source_message_ids,
+        ) if item.get("memory_type") == "artifact"]
 
     def _extract_with_llm(self, user_message: str, assistant_message: str, *, grounded: bool) -> list[dict]:
         prompt = (
@@ -145,7 +169,10 @@ class MemoryExtractor:
                 )
             )
 
-        path_matches = re.findall(r"[\w./\\:-]+\.md|[\w./\\:-]+\.py|data[/\\][\w./\\-]+", assistant_message)
+        path_matches = re.findall(
+            r"[\w./\\:-]+\.(?:md|txt|docx|pdf|py)|data[/\\][\w./\\-]+", assistant_message,
+            flags=re.IGNORECASE,
+        )
         for path in path_matches[:3]:
             items.append(
                 self._make_item(

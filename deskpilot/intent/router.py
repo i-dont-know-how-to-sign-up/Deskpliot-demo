@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import platform
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any
@@ -11,6 +12,7 @@ from ..core.api_clients import OpenAICompatibleClient
 from ..core.json_utils import parse_json_value
 from ..decision.jev import JevClient, noul
 from ..tasks.control import TaskControlError
+from ..tools.permissions import is_blocked_command_syntax
 from ..tools.tool_registry import ToolRegistry
 from .schemas import IntentDecision
 from .validator import SlotValidator
@@ -30,6 +32,7 @@ class IntentRouter:
         memory_context: str = "",
         index_hint: list[dict[str, Any]] | None = None,
     ) -> IntentDecision:
+        self.last_route_duration_ms = 0.0
         # 路由提示只使用摘要；工具被选中后，再从注册表加载完整 schema 做槽位校验。
         tool_summaries = tools.list_tool_summaries() if isinstance(tools, ToolRegistry) else self._summarize_tools(tools)
         full_tool_specs = self._normalize_tools(tools)
@@ -38,6 +41,7 @@ class IntentRouter:
             return shortcut
         # 第一步先判断问题该直接回答，还是需要调用工具或继续追问。
         prompt = self._build_prompt(question, tool_summaries, memory_context, index_hint or [])
+        started = time.perf_counter()
         with self._client_stage("Router", stream=True):
             response = self.client.chat(
                 [
@@ -46,6 +50,7 @@ class IntentRouter:
                 ],
                 temperature=0.0,
             )
+        self.last_route_duration_ms = round((time.perf_counter() - started) * 1000, 1)
         decision = self._parse_response(response)
         if decision is None:
             # 模型输出无法解析时，退回到保守规则，保证路由器不会直接失效。
@@ -334,7 +339,7 @@ class IntentRouter:
     def _build_prompt(self, question: str, tools: list[dict[str, Any]], memory_context: str,
                       index_hint: list[dict[str, Any]] | None = None) -> str:
         # 把当前可用工具和会话记忆一起喂给模型，减少误选工具和误填参数。
-        tool_catalog = json.dumps(tools, ensure_ascii=False, indent=2)
+        tool_catalog = json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
         return (
             "Choose direct_answer for simple questions, tool_call for one independent tool action, "
             "or plan_task for tasks requiring dependent steps (e.g. research then compose and send, "
@@ -364,6 +369,8 @@ class IntentRouter:
             "Set requires_file_output=true whenever the user requests an actual file saved to disk, even if "
             "they did not specify a filename. A retrieved answer alone never fulfills such a request.\n"
             "For tool_call only, pick exactly one tool from the provided catalog and fill its slots from the user input.\n"
+            "For the current local date or time use system.current_time. For deletion of one existing file use "
+            "files.delete_file; it always requires human approval. Never use Shell for either task.\n"
             "For a textual question that asks for an answer based on the multimodal index, choose "
             "knowledge.answer_multimodal. Choose knowledge.search_multimodal only when the user wants raw evidence "
             "or provides image_path for image-to-image retrieval. Choose knowledge.index_image only for ingestion.\n"
@@ -396,8 +403,9 @@ class IntentRouter:
             "When mode is direct_answer, answer the user's question in this same call and put the final user-facing "
             "Chinese answer in direct_response. Do not mention routing, tools, context packets, or internal policy. "
             "For every other mode direct_response must be an empty string.\n"
-            "Output a single JSON object only with keys:\n"
-            '{"mode":"direct_answer|tool_call|clarify|plan_task","reason":"...","direct_response":"final answer or empty","tool_name":"...","arguments":{},"missing_slots":[],"confidence":0.0,"needs_workspace_files":false,"needs_index_catalog":false,"requires_file_output":false,"explicit_local_retrieval":false,"explicit_web_retrieval":false,"requires_fresh_information":false,"required_tools":[],"requires_reflection":false,"knowledge_scope":"general|local_index|workspace|web"}\n\n'
+            "Output a single JSON object only. Keep reason to one short sentence. Emit mode and direct_response first "
+            "so direct answers can stream before the remaining routing metadata. Keys:\n"
+            '{"mode":"direct_answer|tool_call|clarify|plan_task","direct_response":"final answer or empty","reason":"...","tool_name":"...","arguments":{},"missing_slots":[],"confidence":0.0,"needs_workspace_files":false,"needs_index_catalog":false,"requires_file_output":false,"explicit_local_retrieval":false,"explicit_web_retrieval":false,"requires_fresh_information":false,"required_tools":[],"requires_reflection":false,"knowledge_scope":"general|local_index|workspace|web"}\n\n'
             f"Runtime context (contains the current task and selected memory):\n{memory_context or question}\n\n"
             f"Runtime operating system: {platform.system()} ({platform.platform()}). "
             "For shell.execute_command, generate syntax for this operating system and prefer one simple command.\n"
@@ -460,6 +468,12 @@ class IntentRouter:
         # 兜底只处理可确定解析的命令结构。它不是第二套关键词意图分类器；
         # 语义问答、假设描述和复杂规划必须留给 LLM/API 模式。
         lowered = question.lower()
+        if re.fullmatch(r"\s*(?:请问|请告诉我)?(?:今天|现在)(?:是)?(?:几月几日|几号|什么日期|几点|什么时间)[？?。\s]*", question):
+            tool = self._find_tool(tools, "system.current_time")
+            if tool:
+                return IntentDecision(mode="tool_call", tool_name="system.current_time",
+                                      reason="读取本地系统时间", arguments={}, confidence=0.9,
+                                      raw_response=response)
         if any(item.get("strong_match") is True for item in (index_hint or [])):
             tool = self._find_tool(tools, "knowledge.search")
             if tool:
@@ -500,6 +514,20 @@ class IntentRouter:
                     confidence=0.75,
                     raw_response=response,
                 )
+        # Even offline, send explicit destructive commands through the shared
+        # command policy so they cannot fall through to a direct answer.
+        bare_command = re.fullmatch(r"\s*(?:执行|运行)\s+(.+?)\s*[。.]?\s*", question, flags=re.IGNORECASE | re.DOTALL)
+        if bare_command:
+            command = bare_command.group(1).strip().rstrip("。.")
+            if is_blocked_command_syntax(command):
+                tool = self._find_tool(tools, "shell.execute_command")
+                if tool:
+                    return IntentDecision(
+                        mode="tool_call", reason="Explicit command requires policy enforcement.",
+                        tool_name="shell.execute_command",
+                        arguments={"command": command, "timeout_seconds": 10},
+                        confidence=0.75, raw_response=response,
+                    )
         command_match = re.search(
             r"(?:执行|运行)\s*(?:命令|command)\s*[：:]?\s*(.+)$",
             question,
@@ -522,19 +550,14 @@ class IntentRouter:
             flags=re.IGNORECASE,
         )
         if delete_match:
-            tool = self._find_tool(tools, "shell.execute_command")
+            tool = self._find_tool(tools, "files.delete_file")
             if tool:
-                target = delete_match.group(1).strip()
-                command = (
-                    f"Remove-Item -LiteralPath '{target.replace(chr(39), chr(39) * 2)}'"
-                    if platform.system() == "Windows"
-                    else f"rm -- '{target.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'"
-                )
+                target = delete_match.group(1).strip().removeprefix("这个文件").removeprefix("该文件").strip().strip('"\'`“”‘’')
                 return IntentDecision(
                     mode="tool_call",
-                    reason="离线 fallback 解析到明确的删除命令；是否阻断由终端权限策略决定。",
-                    tool_name="shell.execute_command",
-                    arguments={"command": command, "timeout_seconds": 10},
+                    reason="离线 fallback 解析到单文件删除请求；交由文件权限和审批处理。",
+                    tool_name="files.delete_file",
+                    arguments={"path": target},
                     confidence=0.75,
                     raw_response=response,
                 )

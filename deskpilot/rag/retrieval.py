@@ -262,7 +262,8 @@ class HybridRetriever:
         error = ""
         try:
             reranker = build_reranker(requested)
-            scores = reranker.rerank(request.original_query, [RerankDocument(
+            rerank_query = " ".join(dict.fromkeys((request.original_query, *request.queries[:2])))
+            scores = reranker.rerank(rerank_query, [RerankDocument(
                 chunk_id=item.chunk.chunk_id,
                 text=item.chunk.text,
                 title=documents.get(item.chunk.doc_id).title if documents.get(item.chunk.doc_id) else "",

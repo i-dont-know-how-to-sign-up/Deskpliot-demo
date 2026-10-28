@@ -126,8 +126,13 @@ def main() -> int:
     config = load_config()
     jev = JevClient() if args.judge in {"jev", "both"} else None
     llm = OpenAICompatibleClient(config) if args.judge in {"llm", "both"} else None
-    if jev and not jev.config.api_key or llm and not config.llm_api_key:
-        parser.error("Configure OPENROUTER_API_KEY for Jev and DASHSCOPE_API_KEY/LLM_API_KEY for LLM")
+    if llm and not config.llm_api_key:
+        parser.error("Configure DASHSCOPE_API_KEY/LLM_API_KEY for LLM")
+    if jev:
+        try:
+            jev.config.validate_transport()
+        except (ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
     results = [run(cases, name, jev, llm)
                for name in (("jev", "llm") if args.judge == "both" else (args.judge,))]
     args.output.parent.mkdir(parents=True, exist_ok=True)

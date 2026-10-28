@@ -9,12 +9,13 @@ import sys
 import threading
 import time
 from contextlib import ExitStack
+from datetime import datetime, timedelta
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
 
 from .api_clients import OpenAICompatibleClient
 from .approval import PendingActionStore
-from .config import LOG_DIR, load_config
+from .config import LOG_DIR, WORKSPACE_DIR, load_config
 from .contracts import StepStatus, ToolNames
 from .encoding_utils import fix_mojibake
 from .handlers import DirectAnswerHandler
@@ -89,7 +90,13 @@ class DocumentQAAgent:
         self.visual_memory = VisualMemoryManager(self.memory_store, self.multimodal)
         self._operation_lock = threading.RLock()
         self._turn_usage_start = self.usage_tracker.snapshot(self._combined_usage())
-        self.workspace_root = Path.cwd().resolve()
+        from ..release.profile import release_mode
+
+        if release_mode():
+            configured_roots = [item.strip() for item in os.getenv("TOOL_SAFE_ROOTS", "").split(";") if item.strip()]
+            self.workspace_root = Path(configured_roots[0]).expanduser().resolve() if configured_roots else WORKSPACE_DIR
+        else:
+            self.workspace_root = Path.cwd().resolve()
         # Ledger 跟随索引所在的数据目录，测试/评测使用临时索引时不会污染项目工作区。
         self.task_ledger = TaskLedger(Path(self.index.index_file).parent / "task_ledger.json")
         from ..mcp.email_mcp import EmailMCPService
@@ -263,6 +270,17 @@ class DocumentQAAgent:
                     memory_context="视觉记忆仅保存文本事实与受控资产引用。",
                 )
             capability = self.multimodal.stats()
+            if not self.multimodal.vision_llm.allow_cloud:
+                answer = "尚未允许将图片发送到云端视觉模型。请在设置中启用云端图片上传并重启后再试；本轮没有上传图片。"
+                steps = [AgentStep("vision_permission", StepStatus.SKIPPED, "云端图片上传未获授权，未调用视觉模型。")]
+                self.session_store.append_message(
+                    session.session_id, "assistant", answer,
+                    metadata={"steps": [step.__dict__ for step in steps], "reply_to": user_message.message_id},
+                )
+                return AnswerResult(
+                    answer=answer, evidences=[], steps=steps, used_llm=False,
+                    session_id=session.session_id, memory_context="图片附件未上传。",
+                )
             if sensitive and capability.get("sensitive_image_policy") == "confirm":
                 permission = self.multimodal.sensitive_permission(sensitive)
                 pending = self.pending_actions.create(session.session_id, {
@@ -308,6 +326,17 @@ class DocumentQAAgent:
                         "type": "model_end", "stage": "Vision Answer", "kind": "vision",
                         "ok": False, "error": str(exc),
                     })
+                if isinstance(exc, RuntimeError) and "视觉模型请求被拒绝（HTTP " in str(exc):
+                    answer = str(exc)
+                    steps = [AgentStep("vision_answer", StepStatus.FAILED, answer)]
+                    self.session_store.append_message(
+                        session.session_id, "assistant", answer,
+                        metadata={"steps": [step.__dict__ for step in steps], "reply_to": user_message.message_id},
+                    )
+                    return AnswerResult(
+                        answer=answer, evidences=[], steps=steps, used_llm=False,
+                        session_id=session.session_id, memory_context="视觉模型拒绝请求；未生成图片描述。",
+                    )
                 raise
             if event_callback:
                 event_callback({"type": "model_end", "stage": "Vision Answer", "kind": "vision", "ok": True})
@@ -511,6 +540,10 @@ class DocumentQAAgent:
         decision = self.intent_router.route(
             question, self.tool_registry, router_context.text, index_hint=index_hint
         )
+        steps.append(AgentStep(
+            "router_timing", "success",
+            f"LLM routing: {getattr(self.intent_router, 'last_route_duration_ms', 0.0):.1f} ms",
+        ))
         jev_trace = self.intent_router.last_jev_decision
         if jev_trace.get("mode") != "off":
             steps.append(AgentStep("jev_router", "success" if "fallback" not in jev_trace else "failed",
@@ -822,6 +855,21 @@ class DocumentQAAgent:
     ) -> AnswerResult:
         # Router 生成的 tool query 可能为了某个对象擅自加入专属术语。P1 始终保留
         # 用户原问题，并让 Query Analyzer 只为复杂任务增加互补查询，避免单路改写覆盖原意。
+        named_question = self.query_analyzer._strip_retrieval_instruction(question)
+        named_match = re.search(
+            r"^(?P<title>[^，,。？！?:：]{3,80}?(?:文档|报告|指南|手册|方案|说明))"
+            r"(?:包含|包括|讲了|介绍了|有哪些内容|是什么)", named_question,
+        )
+        if named_match:
+            target = named_match.group("title").strip()
+            if not any(target.casefold() in Path(doc.title).stem.casefold()
+                       for doc in self.index.documents.values()):
+                steps.append(AgentStep("index_document_check", "failed", f"索引中没有名为 {target} 的文档。"))
+                return self._finalize_answer(
+                    answer=f"当前索引中没有名为“{target}”的文档，不能用其他论文代替回答。请先将该文档加入索引。",
+                    evidences=[], steps=steps, used_llm=False, session_id=session_id,
+                    user_message_id=user_message_id, question=question, memory_context=memory_context,
+                )
         original_title_doc_ids = self.index.matching_title_doc_ids(question)
         balanced_document_search = len(original_title_doc_ids) >= 2
         complex_retrieval = balanced_document_search or collection
@@ -1586,6 +1634,10 @@ class DocumentQAAgent:
             request["content"] = content
         if "overwrite" not in request:
             request["overwrite"] = self._should_overwrite_for_file_write(question)
+        if request.get("path"):
+            path = Path(str(request["path"]).strip().strip('"'))
+            if not path.is_absolute() and not re.match(r"^[A-Za-z]:[\\/]", str(path)):
+                request["path"] = str((self.workspace_root / path).resolve(strict=False))
         return request
 
     def _answer_web_search_request(
@@ -1598,8 +1650,12 @@ class DocumentQAAgent:
         user_message_id: str,
         memory_context: AssembledContext,
     ) -> AnswerResult:
-        steps.append(AgentStep("route_web_search", "success", f"意图路由到网页搜索：{query}"))
-        result = self.tool_registry.call("web.search", query=query, limit=limit)
+        forecast_day = None
+        if "明天" in question and "天气" in question:
+            forecast_day = datetime.now().astimezone().date() + timedelta(days=1)
+        search_query = f"{query} {forecast_day.isoformat()}" if forecast_day else query
+        steps.append(AgentStep("route_web_search", "success", f"意图路由到网页搜索：{search_query}"))
+        result = self.tool_registry.call("web.search", query=search_query, limit=limit)
         if not result.ok:
             steps.append(AgentStep("web_search", "failed", result.error or "网页搜索失败"))
             return self._finalize_answer(
@@ -1615,19 +1671,27 @@ class DocumentQAAgent:
 
         output = result.output or []
         lines = [f"网页搜索结果：{query}", ""]
+        shown = 0
         if isinstance(output, list):
-            for idx, item in enumerate(output[:limit], start=1):
+            for item in output[:limit]:
                 title = str(item.get("title", "")).strip()
                 url = str(item.get("url", "")).strip()
                 snippet = str(item.get("snippet", "")).strip()
-                lines.append(f"{idx}. {title}")
+                if forecast_day and not self._snippet_mentions_date(title + " " + snippet, forecast_day):
+                    continue
+                shown += 1
+                lines.append(f"{shown}. {title}")
                 if url:
                     lines.append(f"   来源：{url}")
                 if snippet:
                     lines.append(f"   {snippet}")
         else:
             lines.append(str(output))
-        steps.append(AgentStep("web_search", "success", f"已返回 {min(len(output), limit) if isinstance(output, list) else 1} 条搜索结果"))
+        if forecast_day:
+            lines.append("\n搜索摘要不是已核实的天气预报；请打开来源核对目标日期、预报更新时间和具体数据。")
+            if not shown:
+                lines.insert(2, f"没有检索到明确对应 {forecast_day.isoformat()} 的天气摘要，不能根据过期结果推断预报。")
+        steps.append(AgentStep("web_search", "success", f"已返回 {shown if isinstance(output, list) else 1} 条可展示结果"))
         return self._finalize_answer(
             answer="\n".join(lines).strip(),
             evidences=[],
@@ -1638,6 +1702,15 @@ class DocumentQAAgent:
             question=question,
             memory_context=memory_context,
         )
+
+    @staticmethod
+    def _snippet_mentions_date(text: str, target) -> bool:
+        month, day = target.month, target.day
+        patterns = (
+            rf"(?<!\d){target.year}[-/年]0?{month}[-/月]0?{day}(?:日)?(?!\d)",
+            rf"(?<!\d)0?{month}[-/月]0?{day}(?:日)?(?!\d)",
+        )
+        return any(re.search(pattern, text) for pattern in patterns)
 
     def _answer_execution_from_intent(
         self,
@@ -1736,6 +1809,11 @@ class DocumentQAAgent:
     ) -> AnswerResult:
         # confirm 不属于模型权限。即使旧 Router 或恶意模型返回该字段，也在工具边界前丢弃。
         safe_arguments = {key: value for key, value in arguments.items() if key != "confirm"}
+        if tool_name == "files.delete_file" and safe_arguments.get("path"):
+            target = Path(str(safe_arguments["path"]).strip().strip('"'))
+            if not target.is_absolute() and not re.match(r"^[A-Za-z]:[\\/]", str(target)):
+                target = self.workspace_root / target
+            safe_arguments = {"path": str(target)}
         # 纯文本多模态问答需要“检索 + VLM 综合”契约。search_multimodal 是供
         # 以图搜图和证据审计使用的底层工具，不应把原始证据列表直接当最终回答。
         if (
@@ -1784,8 +1862,12 @@ class DocumentQAAgent:
         # 失败时不能把 output 伪装成空字典，否则用户会误以为工具成功但没有数据。
         if not ok:
             steps.append(AgentStep("tool_result", "failed", error))
+            blocked_command = (
+                tool_name == "shell.execute_command"
+                and getattr(tool_result, "error_code", "") == "PERMISSION_DENIED"
+            )
             return self._finalize_answer(
-                answer=f"工具执行失败：{tool_name}\n\n原因：{error}",
+                answer=(f"命令已被安全策略阻断：{error}" if blocked_command else f"工具执行失败：{tool_name}\n\n原因：{error}"),
                 evidences=[],
                 steps=steps,
                 used_llm=False,
@@ -1815,7 +1897,11 @@ class DocumentQAAgent:
                     description += "\n附件：\n" + "\n".join(attachment_lines)
                 pending_action = {
                     "tool_name": tool_name,
-                    "kwargs": dict(call_arguments or {}),
+                    "kwargs": {
+                        **dict(call_arguments or {}),
+                        **({"expected_sha256": str(payload.get("sha256", ""))}
+                           if tool_name == "files.delete_file" else {}),
+                    },
                     "description": description,
                     "risk_level": permission.get("risk_level", "high"),
                     "reasons": permission.get("reasons", []),
@@ -1850,13 +1936,23 @@ class DocumentQAAgent:
                     lines.append(f"   {snippet}")
             answer = "\n".join(lines)
         elif isinstance(payload, dict):
-            if tool_name == "email.list_messages" and isinstance(payload.get("messages"), list):
+            if tool_name == "system.current_time":
+                answer = f"当前本地日期和时间：{payload.get('local_time', '')}"
+            elif tool_name == "files.delete_file" and payload.get("deleted"):
+                answer = f"已删除文件：{payload.get('path', '')}"
+            elif tool_name == "files.delete_file" and pending_action:
+                answer = f"删除文件需要人工确认：{payload.get('path', '')}"
+            elif tool_name == "email.list_messages" and isinstance(payload.get("messages"), list):
                 # 邮件列表只展示用户真正关心的标题和正文，隐藏内部 UID、线程和协议字段。
+                subject_only = "标题" in question and not any(word in question for word in ("正文", "内容", "摘要"))
                 message_lines: list[str] = [f"最近找到 {payload.get('count', len(payload['messages']))} 封邮件："]
                 for index, item in enumerate(payload["messages"], start=1):
                     if not isinstance(item, dict):
                         continue
                     subject = str(item.get("subject", "（无标题）")).strip() or "（无标题）"
+                    if subject_only:
+                        message_lines.append(f"{index}. 标题：{subject}")
+                        continue
                     body = str(item.get("body", "")).strip() or "（无正文）"
                     if len(body) > 1200:
                         body = body[:1200].rstrip() + "\n[正文预览已截断，可继续要求读取该邮件全文]"
@@ -2316,11 +2412,13 @@ class DocumentQAAgent:
         execution_success = bool(output.get("executed")) and result.status == "success" and output.get("returncode") == 0
         move_success = tool_name == "files.apply_move" and bool(output.get("confirmed"))
         vision_success = bool(output.get("answered")) and bool(output.get("answer"))
-        if output.get("written") or email_success or send_success or execution_success or move_success or vision_success:
+        if output.get("written") or output.get("deleted") or email_success or send_success or execution_success or move_success or vision_success:
             path = str(output.get("path", kwargs.get("path", "")))
             size = output.get("size", 0)
             steps.append(AgentStep("execute_approved_action", "success", f"已执行工具：{tool_name}"))
-            if email_success:
+            if output.get("deleted"):
+                answer = f"已确认并删除文件：{path}"
+            elif email_success:
                 answer = f"已确认并保存邮件草稿，草稿箱：{output.get('mailbox', 'Drafts')}。"
             elif send_success:
                 copy_status = "已同步到已发送文件夹。" if output.get("sent_copy_saved") else "邮件已发送，但已发送副本未能同步。"
@@ -3460,7 +3558,8 @@ class DocumentQAAgent:
         for marker in ("内容是", "内容为", "内容：", "内容:", "写入内容", "写入", "写到"):
             position = question.find(marker)
             if position >= 0:
-                return question[position + len(marker) :].strip()
+                content = question[position + len(marker) :].strip()
+                return re.sub(r"^(?:一句|一行|一段)(?=[A-Za-z])", "", content)
         return ""
 
     def _materialize_file_write_content(self, question: str, target_path: str, requested_content: str) -> tuple[str, bool, str]:
@@ -4126,6 +4225,8 @@ class DocumentQAAgent:
     def _is_citation_exempt_line(self, line: str) -> bool:
         """识别标题和组织句；这些文本不承载独立事实，不要求单独引用。"""
         if line in {"引用来源：", "参考来源："} or line.startswith("```"):
+            return True
+        if re.match(r"^以上仅(?:基于|列出|根据)", line) and re.search(r"(?:无法确认|不能据此|证据不足|不代表全部)", line):
             return True
         if re.fullmatch(r"\*\*[^*]+\*\*", line):
             return True

@@ -37,6 +37,7 @@ class QueryAnalyzer:
         index_version: str = "",
         complex_task: bool = False,
     ) -> QueryAnalysis:
+        question = self._strip_retrieval_instruction(question)
         key = hashlib.sha256(
             f"{question}\n{recent_context[:1200]}\n{index_version}\n{complex_task}".encode("utf-8")
         ).hexdigest()
@@ -53,6 +54,16 @@ class QueryAnalyzer:
                 result = parsed
         self._cache[key] = result
         return result
+
+    @staticmethod
+    def _strip_retrieval_instruction(question: str) -> str:
+        """Keep the information need, not the user's instruction to consult an index."""
+        cleaned = re.sub(
+            r"^(?:请)?(?:根据|基于).{0,25}?(?:索引|知识库|文档)(?:中|里|的)?\s*"
+            r"(?:回答|检索(?:并回答)?)\s*[：:，,]?\s*",
+            "", question.strip(), count=1,
+        )
+        return cleaned or question.strip()
 
     def generate_hyde(self, analysis: QueryAnalysis) -> str | None:
         enabled = os.getenv("RAG_HYDE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
